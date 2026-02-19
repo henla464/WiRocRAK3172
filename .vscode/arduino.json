@@ -1,0 +1,6 @@
+{
+    "configuration": "debug=l0,supportat=1,supportlora=3,supportAS923=2,supportAU915=2,supportCN470=2,supportCN779=2,supportEU433=2,supportEU868=2,supportKR920=2,supportIN865=2,supportUS915=2,supportRU864=2,supportLA915=2",
+    "board": "rak_rui_wiroc:stm32:WisDuoRAK3172TBoard",
+    "sketch": "WiRocRAK3172.ino",
+    "port": "/dev/ttyUSB1"
+}
