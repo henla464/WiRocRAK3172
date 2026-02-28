@@ -6,11 +6,11 @@
  */
 
 #include "MessageQueue.h"
-
+#include "app.h"
 
 
 struct MessageQueue incomingMessageQueue = { .MessageQueue_front = -1, .MessageQueue_rear = -1 };
-
+struct LoraMessage lastMessage;
 // Check if the queue is full
 uint8_t MessageQueue_getNoOfItems(struct MessageQueue * queue)
 {
@@ -50,6 +50,21 @@ bool MessageQueue_isEmpty(struct MessageQueue * queue)
 	return false;
 }
 
+bool MessageQueue_isSameMessage(struct LoraMessage * msg1, volatile struct LoraMessage * msg2)
+{
+	if (msg1->BufferSize != msg2->BufferSize)
+	{
+		return false;
+	}
+	for (uint8_t i; i < msg1->BufferSize; i++)
+	{
+		if (msg1->Buffer[i] != msg2->Buffer[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
 uint8_t MessageQueue_enQueue(struct MessageQueue * queue, LoraMeessage_t * msg)
 {
 	if (MessageQueue_isFull(queue))
@@ -58,13 +73,19 @@ uint8_t MessageQueue_enQueue(struct MessageQueue * queue, LoraMeessage_t * msg)
 	}
 	else
 	{
+		if (MessageQueue_isSameMessage(msg, &lastMessage))
+		{
+			// Same message as last received
+			return SAMEMESSAGE;
+		}
 		if (queue->MessageQueue_front == -1)
 		{
 			queue->MessageQueue_front = 0;
 		}
 		queue->MessageQueue_rear = (queue->MessageQueue_rear + 1) % MESSAGEQUEUE_SIZE;
 		queue->MessageQueue_items[queue->MessageQueue_rear] = *msg;
-		//IRQLineHandler_SetPunchesExist();
+		lastMessage = *msg;
+		digitalWrite(LORA_IRQ, HIGH);
 		return ENQUEUESUCCESS;
 	}
 }
@@ -81,7 +102,7 @@ bool MessageQueue_deQueue(struct MessageQueue * queue, LoraMeessage_t * msg)
 		if (queue->MessageQueue_front == queue->MessageQueue_rear) {
 			queue->MessageQueue_front = -1;
 			queue->MessageQueue_rear = -1;
-			//IRQLineHandler_ClearPunchesExist();
+			digitalWrite(LORA_IRQ, LOW);
 		}
 		else
 		{
@@ -115,7 +136,7 @@ bool MessageQueue_pop(struct MessageQueue * queue)
 		if (queue->MessageQueue_front == queue->MessageQueue_rear) {
 			queue->MessageQueue_front = -1;
 			queue->MessageQueue_rear = -1;
-			//IRQLineHandler_ClearPunchesExist();
+			digitalWrite(LORA_IRQ, LOW);
 		}
 		else
 		{

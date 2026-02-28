@@ -5,6 +5,9 @@
 #include "service_runtimeConfig.h"
 #include "service_lora_p2p.h"
 #include "MessageQueue.h"
+extern "C" {
+#include "sha3.h"
+}
 
 /** Custom flash parameters */
 #define AT_PRINTF(sPort, ...)              \
@@ -23,6 +26,8 @@ int receive_handler(SERIAL_PORT port, char *cmd, stParam *param);
 void send_cb(void);
 void cad_cb(bool detect);
 void receive_cb(rui_lora_p2p_recv_t recv_data_pkg);
+
+unsigned long start_send;
 
 
 bool init_status_at(void)
@@ -121,6 +126,9 @@ int status_handler(SERIAL_PORT port, char *cmd, stParam *param)
 }
 
 
+bool drf1268dsCompatMode = true;
+bool sendAck = true;
+
 /**
  * @brief Configures the P2P parameters of the device
  * Including lowDataRateOptimization, crc and payload length.
@@ -166,6 +174,8 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 			atcmd_printf("%d:", runtimeConfigP2P.low_data_rate_optimize);
 			atcmd_printf("%d:", runtimeConfigP2P.crc_on);
             atcmd_printf("%d:", runtimeConfigP2P.rxgain);
+            atcmd_printf("%d:", runtimeConfigP2P.drf1268dscompatmode);
+            atcmd_printf("%d:", runtimeConfigP2P.sendack);
 			atcmd_printf("%u", runtimeConfigP2P.payload_len);
         }
         else
@@ -180,18 +190,22 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 			atcmd_printf("%d:", service_lora_p2p_get_low_datarate_optimize());
 			atcmd_printf("%d:", service_lora_p2p_get_crcon());
             atcmd_printf("%d:", service_lora_p2p_get_rxgain());
+            atcmd_printf("%d:", service_lora_p2p_get_drf1268dscompatmode());
+            atcmd_printf("%d:", service_lora_p2p_get_sendack());
 			atcmd_printf("%u", service_lora_p2p_get_payloadlen());
         }
         return AT_NO_STATUS;
     }
-    else if (param->argc == 10 || (param->argc == 11 && !strcmp(param->argv[10],"0")))
+    else if (param->argc == 12 || (param->argc == 13 && !strcmp(param->argv[12],"0")))
     {
         uint32_t frequency,spreading_factor,bandwidth,coding_rate,preamble_length,
-			txpower, low_data_rate_optimize, crc_on, rxgain, payload_len;
-		bool b_crc_on, b_rxgain, b_low_data_rate_optimize;
+			txpower, low_data_rate_optimize, crc_on, rxgain, drf1268dscompatmode,
+            sendack, payload_len;
+		bool b_crc_on, b_rxgain, b_low_data_rate_optimize, b_drf1268dscompatmode, b_sendack;
         uint32_t o_frequency,o_spreading_factor,o_bandwidth,o_coding_rate,
 			o_preamble_length,o_txpower;
-		bool o_low_data_rate_optimize, o_crc_on, o_rxgain, o_fix_length_payload;
+		bool o_low_data_rate_optimize, o_crc_on, o_rxgain, o_drf1268dscompatmode, 
+            o_sendack, o_fix_length_payload;
 		uint8_t o_payload_len;
         uint8_t udrv_code;
 
@@ -206,6 +220,8 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		o_crc_on = service_lora_p2p_get_crcon();
         o_rxgain = service_lora_p2p_get_rxgain();
 		o_payload_len = service_lora_p2p_get_payloadlen();
+        o_drf1268dscompatmode = service_lora_p2p_get_drf1268dscompatmode();
+        o_sendack = service_lora_p2p_get_sendack();
 		o_fix_length_payload = service_lora_p2p_get_fix_length_payload();
 
         // Exchange parameters
@@ -227,7 +243,11 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
             return AT_PARAM_ERROR;
         if (0 != at_check_digital_uint32_t(param->argv[8], &rxgain))
             return AT_PARAM_ERROR;
-		if (0 != at_check_digital_uint32_t(param->argv[9], &payload_len))
+        if (0 != at_check_digital_uint32_t(param->argv[9], &drf1268dscompatmode))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[10], &sendack))
+            return AT_PARAM_ERROR;
+		if (0 != at_check_digital_uint32_t(param->argv[11], &payload_len))
             return AT_PARAM_ERROR;
 
 
@@ -237,7 +257,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         if ( spreading_factor < 5 || spreading_factor > 12)
             return AT_PARAM_ERROR;
 
-        if (coding_rate > 3)
+        if (coding_rate > 4)
             return AT_PARAM_ERROR;
 
         if(preamble_length< 5 || preamble_length > 65535)
@@ -246,21 +266,12 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         if (txpower < 5 || txpower > 22)
             return AT_PARAM_ERROR;
 
-		if (crc_on > 0)
-			b_crc_on = true;
-		else
-			b_crc_on = false;
-        
-        if (rxgain > 0)
-			b_rxgain = true;
-		else
-			b_rxgain = false;
+		b_low_data_rate_optimize = low_data_rate_optimize != 0;
+		b_crc_on = crc_on != 0;
+		b_rxgain = rxgain != 0;
+        b_drf1268dscompatmode = drf1268dscompatmode != 0;
+        b_sendack = sendack != 0;
 		
-		if (low_data_rate_optimize > 0)
-			b_low_data_rate_optimize = true;
-		else			
-			b_low_data_rate_optimize = false;	
-
 		if (payload_len > 255)
             return AT_PARAM_ERROR;
 
@@ -295,6 +306,12 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         udrv_code = service_lora_p2p_set_rxgain(b_rxgain);
         if( udrv_code != UDRV_RETURN_OK)
             goto STEP_ATP2P_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_set_drf1268dscompatmode(b_drf1268dscompatmode);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_set_sendack(b_sendack);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
 		udrv_code = service_lora_p2p_set_payloadlen(payload_len);
         if( udrv_code != UDRV_RETURN_OK)
             goto STEP_ATP2P_CHECK_ERROR_CODE;
@@ -317,6 +334,8 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		service_lora_p2p_set_low_datarate_optimize(o_low_data_rate_optimize);
 		service_lora_p2p_set_crcon(o_crc_on);
         service_lora_p2p_set_rxgain(o_rxgain);
+        service_lora_p2p_set_drf1268dscompatmode(o_drf1268dscompatmode);
+        service_lora_p2p_set_sendack(o_sendack);
 		service_lora_p2p_set_payloadlen((uint8_t)o_payload_len);
 		service_lora_p2p_set_fix_length_payload(o_fix_length_payload);
 		
@@ -324,11 +343,13 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         //Check and return error code
         return at_error_code_form_udrv(udrv_code);
     }
-    else if (param->argc == 11 && !strcmp(param->argv[10],"1")) { //for runtime setting
+    else if (param->argc == 13 && !strcmp(param->argv[12],"1")) { //for runtime setting
         uint32_t frequency,spreading_factor,bandwidth,coding_rate,preamble_length,
-			txpower, low_data_rate_optimize, crc_on, rxgain, payload_len;
+			txpower, low_data_rate_optimize, crc_on, rxgain, drf1268dscompatmode,
+            sendack, payload_len;
         uint32_t o_frequency,o_spreading_factor,o_bandwidth,o_coding_rate,o_preamble_length,o_txpower;
-		bool o_low_data_rate_optimize, o_crc_on, o_rxgain, o_fix_length_payload;
+		bool o_low_data_rate_optimize, o_crc_on, o_rxgain, o_drf1268dscompatmode, 
+            o_sendack, o_fix_length_payload;
 		uint8_t o_payload_len;
         uint8_t udrv_code;
         bool o_useRuntimeConfig = get_useRuntimeConfigP2P();
@@ -351,6 +372,8 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 			o_low_data_rate_optimize = runtimeConfigP2P.low_data_rate_optimize;
 			o_crc_on = runtimeConfigP2P.crc_on;
             o_rxgain = runtimeConfigP2P.rxgain;
+            o_drf1268dscompatmode = runtimeConfigP2P.drf1268dscompatmode;
+            o_sendack = runtimeConfigP2P.sendack;
 			o_payload_len = runtimeConfigP2P.payload_len;
 			o_fix_length_payload = runtimeConfigP2P.fix_length_payload;
         }
@@ -364,6 +387,8 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 			o_low_data_rate_optimize = service_lora_p2p_get_low_datarate_optimize();
 			o_crc_on = service_lora_p2p_get_crcon();
             o_rxgain = service_lora_p2p_get_rxgain();
+            o_drf1268dscompatmode = service_lora_p2p_get_drf1268dscompatmode();
+            o_sendack = service_lora_p2p_get_sendack();
 			o_payload_len = service_lora_p2p_get_payloadlen();
 			o_fix_length_payload = service_lora_p2p_get_fix_length_payload();
         }
@@ -386,6 +411,10 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		if (0 != at_check_digital_uint32_t(param->argv[7], &crc_on))
             return AT_PARAM_ERROR;
 		if (0 != at_check_digital_uint32_t(param->argv[8], &rxgain))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[9], &drf1268dscompatmode))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[10], &sendack))
             return AT_PARAM_ERROR;
 		if (0 != at_check_digital_uint32_t(param->argv[9], &payload_len))
             return AT_PARAM_ERROR;	
@@ -440,6 +469,8 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		runtimeConfigP2P.low_data_rate_optimize = low_data_rate_optimize != 0;
 		runtimeConfigP2P.crc_on = crc_on != 0;
         runtimeConfigP2P.rxgain = rxgain != 0;
+        runtimeConfigP2P.drf1268dscompatmode = drf1268dsCompatMode != 0;
+        runtimeConfigP2P.sendack = sendack != 0;
 		runtimeConfigP2P.payload_len = (uint8_t)payload_len;
 		runtimeConfigP2P.fix_length_payload = payload_len > 0;
 
@@ -464,6 +495,8 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 			service_lora_p2p_set_low_datarate_optimize(o_low_data_rate_optimize);
 			service_lora_p2p_set_crcon(o_crc_on);
             service_lora_p2p_set_rxgain(o_rxgain);
+            service_lora_p2p_set_drf1268dscompatmode(o_drf1268dscompatmode);
+            service_lora_p2p_set_sendack(o_sendack);
 			service_lora_p2p_set_payloadlen(o_payload_len);
 			service_lora_p2p_set_fix_length_payload(o_fix_length_payload);
         }
@@ -479,22 +512,39 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 
 // SEND //
 void send_cb(void) {
+    unsigned long elapsed = millis() - start_send;
+    Serial.printf("Send done: %d\r\n", elapsed);
+        
 	// Finished sending, turn off red led
+    digitalWrite(LED_RED_TRANSMIT, HIGH);
+    // indicate radio is not sending
+    digitalWrite(LORA_AUX, HIGH);
+}
+
+void turn_off_both_led(void *)
+{
+    digitalWrite(LED_BLUE_RECEIVE, HIGH);
     digitalWrite(LED_RED_TRANSMIT, HIGH);
 }
 
 void cad_cb(bool detect) {
 	if(detect)
     {
+        unsigned long elapsed = millis() - start_send;
+        Serial.printf("Send to cad done: %d\r\n", elapsed);
+        // indicate radio is not sending
+        digitalWrite(LORA_AUX, HIGH);
+
         digitalWrite(LED_BLUE_RECEIVE, LOW);
 		digitalWrite(LED_RED_TRANSMIT, LOW);
-        delay(100); // todo: if keeping this then set timer to not delay response
-        digitalWrite(LED_BLUE_RECEIVE, HIGH);
-        digitalWrite(LED_RED_TRANSMIT, HIGH);
+        api.system.timer.create(RAK_TIMER_1, turn_off_both_led, RAK_TIMER_ONESHOT);
+	    // Trigger to turn of receive led 
+	    api.system.timer.start(RAK_TIMER_1, 200, NULL);
     }
 	else
+    {
 		digitalWrite(LED_RED_TRANSMIT, LOW);
-    
+    }
 }
 
 /**
@@ -509,6 +559,8 @@ void cad_cb(bool detect) {
  */
 int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
+    start_send = millis();
+
     if (param->argc == 1 && !strcmp(param->argv[0], "?"))
     {
         return AT_PARAM_ERROR;
@@ -516,12 +568,15 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
     else if (param->argc == 1)
     {
         digitalWrite(LED_RED_TRANSMIT, LOW);
+        digitalWrite(LORA_AUX, LOW);
         uint32_t datalen;
         uint8_t lora_data[256];
         
         datalen = strlen(param->argv[0]);
         if (0 != at_check_hex_param(param->argv[0], datalen, lora_data))
             return AT_PARAM_ERROR;
+        // indicate radio is sending
+        digitalWrite(LORA_AUX, LOW);
         bool sentOK = api.lora.psend(datalen / 2, lora_data);
         if (sentOK) {
             return AT_OK;
@@ -536,32 +591,222 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
 }
 
 // RECEIVE
+void shake128_2byte(uint8_t out[2], const uint8_t *msg, size_t len)
+{
+    sha3_ctx_t ctx;
+
+    shake128_init(&ctx);
+    shake_update(&ctx, msg, len);
+    shake_xof(&ctx);
+    shake_out(&ctx, out, 2);
+}
+
 void turn_off_receive_led(void *)
 {
     digitalWrite(LED_BLUE_RECEIVE, HIGH);
 }
 
+unsigned long time_received; 
+bool send_ack(bool drf1268dsCompatMode, uint8_t channelNumber, uint8_t calculatedHash[2])
+{
+    uint8_t ackMsg[8];
+    uint8_t *startAck;
+    if (drf1268dsCompatMode) {
+        ackMsg[0] = channelNumber;
+        startAck = ackMsg+1;
+    } else
+    {
+        startAck = ackMsg;
+    }
+
+    *startAck = 0x85;
+    *(startAck+1) = calculatedHash[0];
+    *(startAck+2) = calculatedHash[1];
+    *(startAck+3) = calculatedHash[0];
+    *(startAck+4) = calculatedHash[1];
+    *(startAck+5) = calculatedHash[0];
+    *(startAck+6) = calculatedHash[1];
+
+    unsigned long elapsed_since_received = millis() - time_received;
+    Serial.printf("Received - ack sent by rak: %d\r\n", elapsed_since_received);
+    digitalWrite(LED_RED_TRANSMIT, LOW);
+    // indicate radio is sending
+    digitalWrite(LORA_AUX, LOW);
+    bool ackSentOK = api.lora.psend(drf1268dsCompatMode ? 8:7, ackMsg);
+    return ackSentOK;
+}
+
+
 void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
     // Drop packets that are too large
+    digitalWrite(LED_BLUE_RECEIVE, LOW);
     if (recv_data_pkg.BufferSize > sizeof(LoraMeessage_t::Buffer)) {
         return;
     }
+    if (recv_data_pkg.BufferSize < 2) {
+        return;
+    }
+    time_received = millis();
+    Serial.printf("Received status: %d\r\n", recv_data_pkg.Status);
 
-    digitalWrite(LED_BLUE_RECEIVE, LOW);
+    
     LoraMeessage_t theMessage;
     theMessage.BufferSize = recv_data_pkg.BufferSize;
     memcpy(theMessage.Buffer, recv_data_pkg.Buffer, recv_data_pkg.BufferSize);
     theMessage.Rssi = recv_data_pkg.Rssi;
     theMessage.Snr = recv_data_pkg.Snr;
     theMessage.Status = recv_data_pkg.Status;
-	MessageQueue_enQueue(&incomingMessageQueue, &theMessage);
+	
+    unsigned long elapsed_since_start_send = millis() - start_send;
+    Serial.printf("Message received. Time since last send: %d\r\n", elapsed_since_start_send);
+    
+    uint8_t noOfBytesToRemoveFromStart = drf1268dsCompatMode ? 1:0;
+    uint8_t header = theMessage.Buffer[noOfBytesToRemoveFromStart];
+    bool ackRequested = header & 0x80;
+    bool repeaterRequested = header & 0x20;
+    bool ackSentOK = false;
+    if (sendAck && ackRequested && !repeaterRequested)
+    {
+        LoraMeessage_t deInterleavedMsg;
+        if (
+                (theMessage.BufferSize == 15 + noOfBytesToRemoveFromStart) &&
+                ((theMessage.Buffer[noOfBytesToRemoveFromStart] & 0x1F) == MSG_TYPE_PUNCH)
+            )             
+        {
+            Serial.printf("Punch received\r\n");
+            deInterleavedMsg.Buffer[0] = theMessage.Buffer[0+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[1] = theMessage.Buffer[4+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[2] = theMessage.Buffer[8+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[3] = theMessage.Buffer[2+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[4] = theMessage.Buffer[3+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[5] = theMessage.Buffer[5+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[6] = theMessage.Buffer[11+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[7] = theMessage.Buffer[6+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[8] = theMessage.Buffer[7+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[9] = theMessage.Buffer[9+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[10] = theMessage.Buffer[10+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[11] = theMessage.Buffer[12+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[12] = theMessage.Buffer[13+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[13] = theMessage.Buffer[14+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[14] = theMessage.Buffer[1+noOfBytesToRemoveFromStart];
 
+            uint8_t calculatedHash[2];
+            shake128_2byte(calculatedHash, deInterleavedMsg.Buffer+1, 12);
+
+            Serial.printf("Calculated hash: %02X",calculatedHash[0]);
+            Serial.printf("%02X",calculatedHash[1]);
+            Serial.printf("  Received hash %02X",deInterleavedMsg.Buffer[13]);
+            Serial.printf("%02X\r\n",deInterleavedMsg.Buffer[14]);
+
+            if ((calculatedHash[0] ==  deInterleavedMsg.Buffer[13]) &&
+                (calculatedHash[1] ==  deInterleavedMsg.Buffer[14]))
+            {
+                // Hash matches! Send ack
+                uint8_t channelNumber = theMessage.Buffer[0]; // only valid, and only used when drf1268dsCompatMode = true
+                ackSentOK = send_ack(drf1268dsCompatMode, channelNumber, calculatedHash);
+                /*
+                uint8_t ackMsg[7+noOfBytesToRemoveFromStart];
+                if (drf1268dsCompatMode) {
+                    ackMsg[0] = theMessage.Buffer[0];
+                }
+                ackMsg[0+noOfBytesToRemoveFromStart] = 0x85;
+                ackMsg[1+noOfBytesToRemoveFromStart] = calculatedHash[0];
+                ackMsg[2+noOfBytesToRemoveFromStart] = calculatedHash[1];
+                ackMsg[3+noOfBytesToRemoveFromStart] = calculatedHash[0];
+                ackMsg[4+noOfBytesToRemoveFromStart] = calculatedHash[1];
+                ackMsg[5+noOfBytesToRemoveFromStart] = calculatedHash[0];
+                ackMsg[6+noOfBytesToRemoveFromStart] = calculatedHash[1];
+
+                unsigned long elapsed_since_received = millis() - time_received;
+                Serial.printf("Received - ack sent by rak: %d\r\n", elapsed_since_received);
+                digitalWrite(LED_RED_TRANSMIT, LOW);
+                // indicate radio is sending
+                digitalWrite(LORA_AUX, LOW);
+                ackSentOK = api.lora.psend(7+noOfBytesToRemoveFromStart, ackMsg);
+                */
+            }
+        }
+        if (
+                (theMessage.BufferSize == 27 + noOfBytesToRemoveFromStart) &&
+                ((theMessage.Buffer[noOfBytesToRemoveFromStart] & 0x1F) == MSG_TYPE_PUNCH_DOUBLE)
+            )             
+        {
+            Serial.printf("Punch double received\r\n");
+            deInterleavedMsg.Buffer[0] = theMessage.Buffer[0+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[1] = theMessage.Buffer[5+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[2] = theMessage.Buffer[10+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[3] = theMessage.Buffer[2+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[4] = theMessage.Buffer[3+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[5] = theMessage.Buffer[4+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[6] = theMessage.Buffer[14+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[7] = theMessage.Buffer[6+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[8] = theMessage.Buffer[7+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[9] = theMessage.Buffer[18+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[10] = theMessage.Buffer[22+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[11] = theMessage.Buffer[8+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[12] = theMessage.Buffer[9+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[13] = theMessage.Buffer[11+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[14] = theMessage.Buffer[25+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[15] = theMessage.Buffer[12+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[16] = theMessage.Buffer[13+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[17] = theMessage.Buffer[15+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[18] = theMessage.Buffer[16+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[19] = theMessage.Buffer[17+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[20] = theMessage.Buffer[19+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[21] = theMessage.Buffer[20+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[22] = theMessage.Buffer[21+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[23] = theMessage.Buffer[23+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[24] = theMessage.Buffer[24+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[25] = theMessage.Buffer[1+noOfBytesToRemoveFromStart];
+            deInterleavedMsg.Buffer[26] = theMessage.Buffer[26+noOfBytesToRemoveFromStart];
+            
+            uint8_t calculatedHash[2];
+            shake128_2byte(calculatedHash, deInterleavedMsg.Buffer+1, 24);
+
+            Serial.printf("Calculated hash: %02X",calculatedHash[0]);
+            Serial.printf("%02X",calculatedHash[1]);
+            Serial.printf("  Received hash %02X",deInterleavedMsg.Buffer[25]);
+            Serial.printf("%02X\r\n",deInterleavedMsg.Buffer[26]);
+
+            if ((calculatedHash[0] ==  deInterleavedMsg.Buffer[25]) &&
+                (calculatedHash[1] ==  deInterleavedMsg.Buffer[26]))
+            {
+                // Hash matches! Send ack
+                uint8_t channelNumber = theMessage.Buffer[0]; // only valid, and only used when drf1268dsCompatMode = true
+                ackSentOK = send_ack(drf1268dsCompatMode, channelNumber, calculatedHash);
+                /*
+                uint8_t ackMsg[7+noOfBytesToRemoveFromStart];
+                if (drf1268dsCompatMode) {
+                    ackMsg[0] = theMessage.Buffer[0];
+                }
+                ackMsg[0+noOfBytesToRemoveFromStart] = 0x85;
+                ackMsg[1+noOfBytesToRemoveFromStart] = calculatedHash[0];
+                ackMsg[2+noOfBytesToRemoveFromStart] = calculatedHash[1];
+                ackMsg[3+noOfBytesToRemoveFromStart] = calculatedHash[0];
+                ackMsg[4+noOfBytesToRemoveFromStart] = calculatedHash[1];
+                ackMsg[5+noOfBytesToRemoveFromStart] = calculatedHash[0];
+                ackMsg[6+noOfBytesToRemoveFromStart] = calculatedHash[1];
+
+                unsigned long elapsed_since_received = millis() - time_received;
+                Serial.printf("Received - to ack sent by rak: %d\r\n", elapsed_since_received);
+                digitalWrite(LED_RED_TRANSMIT, LOW);
+                // indicate radio is sending
+                digitalWrite(LORA_AUX, LOW);
+                ackSentOK = api.lora.psend(7+noOfBytesToRemoveFromStart, ackMsg);
+                */
+            }
+        }
+        uint8_t status = theMessage.Status;
+        if (ackSentOK) {
+            theMessage.Status |= 0x80; // set bit 7 to indicate ack already sent
+        }
+    }
+    MessageQueue_enQueue(&incomingMessageQueue, &theMessage);
+        
     api.system.timer.create(RAK_TIMER_0, turn_off_receive_led, RAK_TIMER_ONESHOT);
 	// Trigger to turn of receive led 
-	api.system.timer.start(RAK_TIMER_0, 500, NULL);
+	api.system.timer.start(RAK_TIMER_0, 150, NULL);
 }
-
- 
 
 static void p2p_printf_hex(uint8_t *pdata, uint16_t len)
 {       
@@ -593,8 +838,6 @@ int receive_handler(SERIAL_PORT port, char *cmd, stParam *param)
     {
         serialX = &Serial;
     }
-    AT_PRINTF(serialX, "argc %d", param->argc);
-    AT_PRINTF(serialX, "arcv %s", param->argv[0]);
     */
     if (param->argc == 0 
         ||
