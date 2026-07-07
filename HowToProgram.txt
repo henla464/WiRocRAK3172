@@ -1,0 +1,7 @@
+If you need to reflash the hexfile (bootloader etc)
+Ensure the RAK has power and that boot0 is set high
+No other communication with it on either port,
+shut down WiRocPython and any other serial port connection
+
+
+~/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin$ ./STM32_Programmer_CLI -c port=/dev/ttyUSB0 br=115200 p=even -ob rdp=0xAA -e all -w "/home/henla464/Downloads/RAK3172-T_latest_final (1).hex" -v

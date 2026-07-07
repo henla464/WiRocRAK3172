@@ -659,6 +659,7 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
 	
     unsigned long elapsed_since_start_send = millis() - start_send;
     Serial.printf("Message received. Time since last send: %d\r\n", elapsed_since_start_send);
+    Serial.printf("RSSI: %d SNR: %d\r\n", theMessage.Rssi, theMessage.Snr);
     
     uint8_t noOfBytesToRemoveFromStart = drf1268dsCompatMode ? 1:0;
     uint8_t header = theMessage.Buffer[noOfBytesToRemoveFromStart];
@@ -704,26 +705,6 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
                 // Hash matches! Send ack
                 uint8_t channelNumber = theMessage.Buffer[0]; // only valid, and only used when drf1268dsCompatMode = true
                 ackSentOK = send_ack(drf1268dsCompatMode, channelNumber, calculatedHash);
-                /*
-                uint8_t ackMsg[7+noOfBytesToRemoveFromStart];
-                if (drf1268dsCompatMode) {
-                    ackMsg[0] = theMessage.Buffer[0];
-                }
-                ackMsg[0+noOfBytesToRemoveFromStart] = 0x85;
-                ackMsg[1+noOfBytesToRemoveFromStart] = calculatedHash[0];
-                ackMsg[2+noOfBytesToRemoveFromStart] = calculatedHash[1];
-                ackMsg[3+noOfBytesToRemoveFromStart] = calculatedHash[0];
-                ackMsg[4+noOfBytesToRemoveFromStart] = calculatedHash[1];
-                ackMsg[5+noOfBytesToRemoveFromStart] = calculatedHash[0];
-                ackMsg[6+noOfBytesToRemoveFromStart] = calculatedHash[1];
-
-                unsigned long elapsed_since_received = millis() - time_received;
-                Serial.printf("Received - ack sent by rak: %d\r\n", elapsed_since_received);
-                digitalWrite(LED_RED_TRANSMIT, LOW);
-                // indicate radio is sending
-                digitalWrite(LORA_AUX, LOW);
-                ackSentOK = api.lora.psend(7+noOfBytesToRemoveFromStart, ackMsg);
-                */
             }
         }
         if (
@@ -774,29 +755,9 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
                 // Hash matches! Send ack
                 uint8_t channelNumber = theMessage.Buffer[0]; // only valid, and only used when drf1268dsCompatMode = true
                 ackSentOK = send_ack(drf1268dsCompatMode, channelNumber, calculatedHash);
-                /*
-                uint8_t ackMsg[7+noOfBytesToRemoveFromStart];
-                if (drf1268dsCompatMode) {
-                    ackMsg[0] = theMessage.Buffer[0];
-                }
-                ackMsg[0+noOfBytesToRemoveFromStart] = 0x85;
-                ackMsg[1+noOfBytesToRemoveFromStart] = calculatedHash[0];
-                ackMsg[2+noOfBytesToRemoveFromStart] = calculatedHash[1];
-                ackMsg[3+noOfBytesToRemoveFromStart] = calculatedHash[0];
-                ackMsg[4+noOfBytesToRemoveFromStart] = calculatedHash[1];
-                ackMsg[5+noOfBytesToRemoveFromStart] = calculatedHash[0];
-                ackMsg[6+noOfBytesToRemoveFromStart] = calculatedHash[1];
-
-                unsigned long elapsed_since_received = millis() - time_received;
-                Serial.printf("Received - to ack sent by rak: %d\r\n", elapsed_since_received);
-                digitalWrite(LED_RED_TRANSMIT, LOW);
-                // indicate radio is sending
-                digitalWrite(LORA_AUX, LOW);
-                ackSentOK = api.lora.psend(7+noOfBytesToRemoveFromStart, ackMsg);
-                */
+                
             }
         }
-        uint8_t status = theMessage.Status;
         if (ackSentOK) {
             theMessage.Status |= 0x80; // set bit 7 to indicate ack already sent
         }
