@@ -99,8 +99,16 @@ uint8_t mesh_get_neighbor_count(void);  /* live neighbours                    */
  * (master). Returns false when there is no route / the frame is too large. */
 bool    mesh_send_uplink(const uint8_t *payload, uint8_t len);
 
+/* --- M4 MAC / downlink -------------------------------------------------- */
+#define MESH_LINK_RETRIES        3      /* retransmits before giving up       */
+#define MESH_LINK_ACK_TIMEOUT_MS 1500   /* implicit-ACK wait per attempt      */
+
+/* Master only: flood a payload down to a specific node (0 on failure). */
+bool    mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len);
+
 /* Parse an incoming mesh frame (already gated on mesh_is_enabled() by caller).
- * M1: validates + dedups.  M2: join/assign/table.  M3: beacon + uplink. */
+ * M1: validates + dedups.  M2: join/assign/table.  M3: beacon + uplink.
+ * M4: downlink + implicit link-ACK retries. */
 void    mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr);
 
 /* Enqueue a fully-built mesh frame for transmission (drained by the timer). */

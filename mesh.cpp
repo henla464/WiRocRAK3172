@@ -118,10 +118,23 @@ static uint8_t  s_data_seq;                     /* rotating seq for uplink    */
 static int16_t  s_rx_rssi;                      /* last received radio metrics*/
 static int8_t   s_rx_snr;
 
+/* Last unicast frame awaiting an implicit hop ACK (M4). */
+typedef struct {
+    bool     active;
+    uint8_t  frame[MESH_MAX_FRAME];
+    uint8_t  len;
+    uint8_t  src;                   /* origin address of the awaited frame    */
+    uint8_t  seq;                   /* seq of the awaited frame               */
+    uint8_t  retries;
+    uint32_t next_ms;
+} mesh_pending_t;
+static mesh_pending_t s_pending;
+
 /* Defined in the M3 section below; used by the timer. */
 static void mesh_emit_beacon(void);
 static void mesh_check_parent_staleness(uint32_t now);
 static void mesh_deliver_to_host(const uint8_t *payload, uint8_t len, uint8_t src);
+static void mesh_pending_tick(uint32_t now);
 
 /* Defined in the M2 section below; used by the timer. */
 static bool mesh_send_broadcast(uint8_t type, uint8_t hops,
@@ -158,6 +171,7 @@ static void mesh_state_clear(void)
     s_data_seq       = 0;
     s_rx_rssi        = 0;
     s_rx_snr         = 0;
+    memset(&s_pending, 0, sizeof(s_pending));
 
     mesh_alloc_reset();
     mesh_update_state();
@@ -212,6 +226,7 @@ static void mesh_timer_cb(void *)
         s_beacon_next_ms = now + MESH_BEACON_INTERVAL_MS;
     }
     mesh_check_parent_staleness(now);
+    mesh_pending_tick(now);
 
     if (mesh_is_master()) {
         /* Periodically flood the occupied bitmap so nodes can reconcile. */
@@ -415,6 +430,9 @@ static uint8_t mesh_build_frame(uint8_t *out, uint8_t type, uint8_t flags,
 
 /* Broadcast a control frame (dst = NONE) with an auto-incremented seq.
  * `hops` is the beacon hop-count, or the TTL for flooded control frames. */
+static uint8_t mesh_token_hash8(const uint8_t token[MESH_TOKEN_LEN]);
+static void mesh_mark_seen(uint8_t type, uint8_t src, uint8_t seq, const uint8_t *payload);
+
 static bool mesh_send_broadcast(uint8_t type, uint8_t hops,
                                 const uint8_t *payload, uint8_t plen)
 {
@@ -425,6 +443,7 @@ static bool mesh_send_broadcast(uint8_t type, uint8_t hops,
     s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x0F);
     len = mesh_build_frame(frame, type, 0, mesh_get_address(),
                            MESH_ADDR_NONE, hops, seq, payload, plen);
+    mesh_mark_seen(type, mesh_get_address(), seq, payload);
     return mesh_send_frame(frame, len);
 }
 
@@ -437,8 +456,9 @@ static void mesh_relay_flood(const mesh_header_t *h, const uint8_t *payload, uin
     if (h->hops <= 1) {
         return;                         /* TTL exhausted */
     }
-    flen = mesh_build_frame(frame, h->type, h->flags, h->src, MESH_ADDR_NONE,
+    flen = mesh_build_frame(frame, h->type, h->flags, h->src, h->dst,
                             (uint8_t)(h->hops - 1), h->seq, payload, plen);
+    mesh_mark_seen(h->type, h->src, h->seq, payload);
     mesh_send_frame(frame, flen);
 }
 
@@ -451,6 +471,19 @@ static uint8_t mesh_token_hash8(const uint8_t token[MESH_TOKEN_LEN])
         h *= 16777619u;
     }
     return (uint8_t)(h & 0xFF);
+}
+
+/* Record a frame we are about to transmit as "seen", so copies relayed back
+ * to us (floods echo) are ignored and cannot loop. */
+static void mesh_mark_seen(uint8_t type, uint8_t src, uint8_t seq, const uint8_t *payload)
+{
+    if (type == MESH_TYPE_JOIN_REQ) {
+        if (payload != NULL) {
+            (void)mesh_dedup_check(mesh_token_hash8(payload), seq);
+        }
+    } else if (type != MESH_TYPE_BEACON) {
+        (void)mesh_dedup_check(src, seq);
+    }
 }
 
 /* A joining node asks for an address (payload = token, flooded).  The master
@@ -649,11 +682,41 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
     mesh_select_parent();
 }
 
+/* --- M4: implicit link ACK + bounded retries ---------------------------- */
+
+/* Remember a unicast frame so the timer can retransmit it if the next hop
+ * does not visibly forward it (implicit ACK) within the timeout. */
+static void mesh_set_pending(const uint8_t *frame, uint8_t len, uint8_t src, uint8_t seq)
+{
+    memcpy(s_pending.frame, frame, len);
+    s_pending.len     = len;
+    s_pending.src     = src;
+    s_pending.seq     = seq;
+    s_pending.retries = 0;
+    s_pending.active  = true;
+    s_pending.next_ms = millis() + MESH_LINK_ACK_TIMEOUT_MS;
+}
+
+static void mesh_pending_tick(uint32_t now)
+{
+    if (!s_pending.active || (int32_t)(now - s_pending.next_ms) < 0) {
+        return;
+    }
+    if (s_pending.retries >= MESH_LINK_RETRIES) {
+        s_pending.active = false;       /* give up; the app-layer ACK covers it */
+        return;
+    }
+    mesh_send_frame(s_pending.frame, s_pending.len);
+    s_pending.retries++;
+    s_pending.next_ms = now + MESH_LINK_ACK_TIMEOUT_MS;
+}
+
 bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
 {
     uint8_t frame[MESH_MAX_FRAME];
     uint8_t flen;
     uint8_t seq;
+    bool ok;
 
     if (len > MESH_MAX_FRAME - MESH_HEADER_SIZE) {
         return false;
@@ -668,9 +731,14 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
     }
     seq = s_data_seq;
     s_data_seq = (uint8_t)((s_data_seq + 1) & 0x0F);
-    flen = mesh_build_frame(frame, MESH_TYPE_DATA_UPLINK, 0, mesh_get_address(),
-                            s_route.parent_addr, MESH_DEFAULT_TTL, seq, payload, len);
-    return mesh_send_frame(frame, flen);
+    flen = mesh_build_frame(frame, MESH_TYPE_DATA_UPLINK, MESH_FLAG_ACK_REQ,
+                            mesh_get_address(), s_route.parent_addr,
+                            MESH_DEFAULT_TTL, seq, payload, len);
+    ok = mesh_send_frame(frame, flen);
+    if (ok) {
+        mesh_set_pending(frame, flen, mesh_get_address(), seq);
+    }
+    return ok;
 }
 
 static void mesh_deliver_to_host(const uint8_t *payload, uint8_t len, uint8_t src)
@@ -689,6 +757,21 @@ static void mesh_deliver_to_host(const uint8_t *payload, uint8_t len, uint8_t sr
     MessageQueue_enQueue(&incomingMessageQueue, &msg);
 }
 
+/* Explicit link ACK: the master has no next hop to forward to, so it acks the
+ * uplink it just delivered by (origin,seq); relays clear on the same key. */
+static void mesh_send_link_ack(uint8_t acked_src, uint8_t acked_seq)
+{
+    uint8_t frame[MESH_MAX_FRAME];
+    uint8_t payload[2];
+    uint8_t flen;
+
+    payload[0] = acked_src;
+    payload[1] = acked_seq;
+    flen = mesh_build_frame(frame, MESH_TYPE_LINK_ACK, 0, mesh_get_address(),
+                            MESH_ADDR_NONE, 0, 0, payload, 2);
+    mesh_send_frame(frame, flen);
+}
+
 static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     uint8_t frame[MESH_MAX_FRAME];
@@ -696,6 +779,9 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
 
     if (mesh_is_master()) {
         mesh_deliver_to_host(payload, plen, h->src);
+        if (h->flags & MESH_FLAG_ACK_REQ) {
+            mesh_send_link_ack(h->src, h->seq);
+        }
         return;
     }
     if (h->dst != mesh_get_address()) {
@@ -707,7 +793,45 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
     flen = mesh_build_frame(frame, MESH_TYPE_DATA_UPLINK, h->flags, h->src,
                             s_route.parent_addr, (uint8_t)(h->hops - 1), h->seq,
                             payload, plen);
-    mesh_send_frame(frame, flen);
+    if (mesh_send_frame(frame, flen)) {
+        /* Wait for our parent to forward it (implicit ACK); retry otherwise. */
+        mesh_set_pending(frame, flen, h->src, h->seq);
+    }
+}
+
+/* Master: flood a payload down to a specific node. */
+bool mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len)
+{
+    uint8_t frame[MESH_MAX_FRAME];
+    uint8_t flen;
+    uint8_t seq;
+
+    if (!mesh_is_master() || dst < MESH_FIRST_SLAVE_ADDR) {
+        return false;
+    }
+    if (len > MESH_MAX_FRAME - MESH_HEADER_SIZE) {
+        return false;
+    }
+    seq = s_data_seq;
+    s_data_seq = (uint8_t)((s_data_seq + 1) & 0x0F);
+    flen = mesh_build_frame(frame, MESH_TYPE_DATA_DOWNLINK, 0, mesh_get_address(),
+                            dst, MESH_DEFAULT_TTL, seq, payload, len);
+    mesh_mark_seen(MESH_TYPE_DATA_DOWNLINK, mesh_get_address(), seq, payload);
+    return mesh_send_frame(frame, flen);
+}
+
+/* Node: a downlink is flooded; the target delivers it to its host, everyone
+ * else relays it one hop further (bounded by TTL and dedup). */
+static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
+{
+    if (h->dst == mesh_get_address()) {
+        mesh_deliver_to_host(payload, plen, h->src);
+        return;
+    }
+    if (mesh_is_master()) {
+        return;                         /* the master originates downlinks */
+    }
+    mesh_relay_flood(h, payload, plen);
 }
 
 uint8_t mesh_get_parent(void)
@@ -747,6 +871,24 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     payload = buf + MESH_HEADER_SIZE;
     plen    = (uint8_t)(len - MESH_HEADER_SIZE);
 
+    /* Link ACK (checked before dedup): clear our in-flight frame when we hear
+     * it forwarded (same origin+seq, addressed elsewhere) or explicitly acked
+     * by the master, which has no next hop to forward to. */
+    if (s_pending.active) {
+        uint8_t ack_src = 0xFF, ack_seq = 0xFF;
+        if (h.type == MESH_TYPE_DATA_UPLINK) {
+            ack_src = h.src;
+            ack_seq = h.seq;
+        } else if (h.type == MESH_TYPE_LINK_ACK && plen >= 2) {
+            ack_src = payload[0];
+            ack_seq = payload[1];
+        }
+        if (ack_src == s_pending.src && ack_seq == s_pending.seq &&
+            (h.type == MESH_TYPE_LINK_ACK || h.dst != mesh_get_address())) {
+            s_pending.active = false;
+        }
+    }
+
     /* Dedup flooded frames on (src,seq).  JOIN_REQ carries src=0 (unassigned)
      * so it is keyed on a hash of its token instead; beacons are link-local
      * and never deduped. */
@@ -761,14 +903,14 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     }
 
     switch (h.type) {
-    case MESH_TYPE_BEACON:       mesh_rx_beacon(&h, payload, plen);       break;
-    case MESH_TYPE_JOIN_REQ:     mesh_rx_join_req(&h, payload, plen);     break;
-    case MESH_TYPE_ADDR_ASSIGN:  mesh_rx_addr_assign(&h, payload, plen);  break;
-    case MESH_TYPE_ADDR_TABLE:   mesh_rx_addr_table(&h, payload, plen);   break;
-    case MESH_TYPE_DATA_UPLINK:  mesh_rx_data_uplink(&h, payload, plen);  break;
-    case MESH_TYPE_DATA_DOWNLINK:/* M4 */                                 break;
-    case MESH_TYPE_LINK_ACK:     /* M4 */                                 break;
-    case MESH_TYPE_MAP_REQ:      /* later */                              break;
-    default:                                                              break;
+    case MESH_TYPE_BEACON:        mesh_rx_beacon(&h, payload, plen);       break;
+    case MESH_TYPE_JOIN_REQ:      mesh_rx_join_req(&h, payload, plen);     break;
+    case MESH_TYPE_ADDR_ASSIGN:   mesh_rx_addr_assign(&h, payload, plen);  break;
+    case MESH_TYPE_ADDR_TABLE:    mesh_rx_addr_table(&h, payload, plen);   break;
+    case MESH_TYPE_DATA_UPLINK:   mesh_rx_data_uplink(&h, payload, plen);  break;
+    case MESH_TYPE_DATA_DOWNLINK: mesh_rx_data_downlink(&h, payload, plen);break;
+    case MESH_TYPE_LINK_ACK:      /* implicit ACK only (M4) */             break;
+    case MESH_TYPE_MAP_REQ:       /* later */                              break;
+    default:                                                               break;
     }
 }

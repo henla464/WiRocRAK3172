@@ -750,8 +750,8 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
     {
         if (mesh_is_master() && destAddr >= MESH_FIRST_SLAVE_ADDR)
         {
-            // Master sending to a specific node: downlink (M4).
-            sentOK = false;
+            // Master sending to a specific node: flooded downlink.
+            sentOK = mesh_send_downlink(destAddr, lora_data, (uint8_t)(datalen / 2));
         }
         else
         {
