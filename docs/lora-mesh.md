@@ -88,10 +88,13 @@ header: `epoch[2]` (little-endian) + `path cost[1]`.
 ## Join / address assignment
 
 1. A node with no stored address enters **JOINING** and floods
-   `JOIN_REQ{ token[8] }` from the mesh timer (start ~3 s, backing off to 15 s).
-   The `token` is an 8-byte FNV-1a hash of the STM32 hardware id
-   (`api.system.chipId`), stable per board; it is *not* a secret, only used to
-   correlate an assignment back to the requester.
+   `JOIN_REQ{ token[12] }` from the mesh timer (start ~3 s, backing off to 15 s).
+   The `token` is the STM32 **96-bit unique device id** (UID) read straight from the
+   device registers, so it is guaranteed unique per die and needs no hashing. It is
+   *not* a secret, only used to correlate an assignment back to the requester.
+   > Note: `api.system.chipId.get()` must **not** be used for this. In this RUI3
+   > build it returns the compile-time constant `"stm32wle5xx"`, identical on every
+   > board, which would make every node collide on one identity.
 2. The master keeps a RAM-only token->address table, allocates the lowest free
    address in 2-31 and floods `ADDR_ASSIGN{ token, addr }`.
 3. The matching node adopts and **persists** the address (flash), emits

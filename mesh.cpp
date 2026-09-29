@@ -14,6 +14,7 @@
 
 #include <Arduino.h>
 #include <string.h>
+#include "stm32wle5xx.h"        /* UID_BASE: STM32 96-bit unique device id */
 #include "mesh.h"
 #include "mesh_alloc.h"
 #include "mesh_route.h"
@@ -313,20 +314,16 @@ static void mesh_timer_stop(void)
 /* ======================================================================= */
 
 /* Device identity token for address assignment (stable across reboots).
- * Derived from the STM32 hardware id via FNV-1a so it is unique per board and
- * needs no LoRaWAN/EUI support (this build is P2P-only). */
+ * Uses the STM32 96-bit unique device id (UID) read straight from the device
+ * registers: it is guaranteed unique per die, so no hashing is needed.
+ * (api.system.chipId.get() is NOT usable here - in this RUI3 build it returns
+ * the compile-time constant chip_id "stm32wle5xx", identical on every board.) */
 static void mesh_token_load(void)
 {
-    String id = api.system.chipId.get();
-    uint64_t h = 1469598103934665603ULL;    /* FNV-1a 64-bit offset basis */
-    uint8_t i;
+    const volatile uint32_t *uid = (const volatile uint32_t *)UID_BASE;
 
-    for (unsigned k = 0; k < id.length(); k++) {
-        h ^= (uint8_t)id[k];
-        h *= 1099511628211ULL;
-    }
-    for (i = 0; i < MESH_TOKEN_LEN; i++) {
-        s_token[i] = (uint8_t)(h >> (i * 8));
+    for (uint8_t i = 0; i < MESH_TOKEN_LEN; i++) {
+        s_token[i] = (uint8_t)(uid[i >> 2] >> ((i & 3) * 8));
     }
 }
 

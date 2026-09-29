@@ -30,8 +30,9 @@
 
 /* Broadcast is expressed as a message type, not as an address. */
 
-/* Node identity token length (bytes). Derived from the STM32 hardware id. */
-#define MESH_TOKEN_LEN          8
+/* Node identity token length (bytes). Filled from the STM32 96-bit unique
+ * device id (UID); it is guaranteed unique per die, so no hashing is needed. */
+#define MESH_TOKEN_LEN          12
 
 /* --- Join / allocator state --------------------------------------------- */
 /* Join FSM (see "Join / address assignment" in the design). */
