@@ -26,22 +26,25 @@
 /*  Persistent configuration                                              */
 /* ======================================================================= */
 
-/* Persistent layout (4 bytes). */
+/* Persistent layout (6 bytes). */
 struct __attribute__((packed)) mesh_flash_config_t {
-    uint8_t magic;
-    uint8_t version;
-    uint8_t flags;      /* MESH_FLAG_* */
-    uint8_t address;    /* own 5-bit address, MESH_ADDR_NONE when unassigned */
+    uint8_t  magic;
+    uint8_t  version;
+    uint8_t  flags;      /* MESH_FLAG_* */
+    uint8_t  address;    /* own 5-bit address, MESH_ADDR_NONE when unassigned */
+    uint16_t boot_count; /* master boot counter: bumped each boot, used as the
+                          * beacon epoch so nodes detect a master restart */
 };
 
 static mesh_flash_config_t s_cfg;
 
 static void mesh_config_defaults(void)
 {
-    s_cfg.magic   = MESH_FLASH_MAGIC;
-    s_cfg.version = MESH_FLASH_VERSION;
-    s_cfg.flags   = 0;                  /* meshing disabled, not master */
-    s_cfg.address = MESH_ADDR_NONE;
+    s_cfg.magic      = MESH_FLASH_MAGIC;
+    s_cfg.version    = MESH_FLASH_VERSION;
+    s_cfg.flags      = 0;               /* meshing disabled, not master */
+    s_cfg.address    = MESH_ADDR_NONE;
+    s_cfg.boot_count = 0;
 }
 
 static bool mesh_config_load(void)
@@ -130,6 +133,15 @@ typedef struct {
 } mesh_pending_t;
 static mesh_pending_t s_pending;
 
+/* --- M5: recovery / robustness ----------------------------------------- */
+static uint16_t s_boot_epoch;       /* master: this boot's epoch              */
+static uint16_t s_master_epoch;     /* node: last epoch heard (0 = unknown)   */
+static bool     s_epoch_valid;      /* node: s_master_epoch is meaningful      */
+static uint32_t s_claim_next_ms;    /* node: next periodic ADDR_CLAIM         */
+static bool     s_had_parent;       /* node: had a parent on the previous tick*/
+static uint32_t s_boot_ms;          /* master: uptime reference for RECOVER   */
+static uint32_t s_heard_ms[MESH_ADDR_MAX + 1]; /* master: last frame per addr  */
+
 /* Defined in the M3 section below; used by the timer. */
 static void mesh_emit_beacon(void);
 static void mesh_check_parent_staleness(uint32_t now);
@@ -139,6 +151,9 @@ static void mesh_pending_tick(uint32_t now);
 /* Defined in the M2 section below; used by the timer. */
 static bool mesh_send_broadcast(uint8_t type, uint8_t hops,
                                 const uint8_t *payload, uint8_t plen);
+
+/* Defined in the M5 section below; used by the timer. */
+static void mesh_send_claim(void);
 
 /* Recompute the join FSM state from the current role / address. */
 static void mesh_update_state(void)
@@ -172,6 +187,15 @@ static void mesh_state_clear(void)
     s_rx_rssi        = 0;
     s_rx_snr         = 0;
     memset(&s_pending, 0, sizeof(s_pending));
+
+    /* M5 recovery state.  s_boot_epoch is *not* reset here: it is owned by
+     * mesh_apply_role() and must survive an enable/disable cycle. */
+    s_master_epoch   = 0;
+    s_epoch_valid    = false;
+    s_claim_next_ms  = 0;
+    s_had_parent     = false;
+    s_boot_ms        = millis();
+    memset(s_heard_ms, 0, sizeof(s_heard_ms));
 
     mesh_alloc_reset();
     mesh_update_state();
@@ -222,13 +246,26 @@ static void mesh_timer_cb(void *)
     /* Beacons: the master and every routable node advertise periodically so
      * neighbours can pick parents and detect a node going down. */
     if ((int32_t)(now - s_beacon_next_ms) >= 0) {
+        uint32_t interval = MESH_BEACON_INTERVAL_MS;
+        if (mesh_is_master() && (uint32_t)(now - s_boot_ms) < MESH_RECOVER_MS) {
+            interval = MESH_BEACON_FAST_MS; /* beacon fast while recovering */
+        }
         mesh_emit_beacon();
-        s_beacon_next_ms = now + MESH_BEACON_INTERVAL_MS;
+        s_beacon_next_ms = now + interval;
     }
     mesh_check_parent_staleness(now);
     mesh_pending_tick(now);
 
     if (mesh_is_master()) {
+        /* Recycle the address of a node we have not heard from for a long
+         * time (its ADDR_CLAIM also refreshes s_heard_ms, so a live-but-idle
+         * node is never evicted). */
+        for (uint8_t a = MESH_FIRST_SLAVE_ADDR; a <= MESH_ADDR_MAX; a++) {
+            if (mesh_alloc_occupies(a) &&
+                (uint32_t)(now - s_heard_ms[a]) > MESH_EVICT_MS) {
+                mesh_alloc_free(a);
+            }
+        }
         /* Periodically flood the occupied bitmap so nodes can reconcile. */
         if ((int32_t)(now - s_table_next_ms) >= 0) {
             uint8_t bm[4];
@@ -236,21 +273,28 @@ static void mesh_timer_cb(void *)
             mesh_send_broadcast(MESH_TYPE_ADDR_TABLE, MESH_DEFAULT_TTL, bm, 4);
             s_table_next_ms = now + MESH_TABLE_INTERVAL_MS;
         }
-    } else if (s_state == MESH_STATE_JOINING) {
-        /* Ask the master for an address, backing off between attempts. */
-        if ((int32_t)(now - s_join_next_ms) >= 0) {
-            mesh_send_broadcast(MESH_TYPE_JOIN_REQ, MESH_DEFAULT_TTL,
-                                s_token, MESH_TOKEN_LEN);
-            if (s_join_interval_ms < MESH_JOIN_INTERVAL_MAX_MS) {
-                s_join_interval_ms += MESH_JOIN_INTERVAL_MS;
-                if (s_join_interval_ms > MESH_JOIN_INTERVAL_MAX_MS) {
-                    s_join_interval_ms = MESH_JOIN_INTERVAL_MAX_MS;
+    } else {
+        if (s_state == MESH_STATE_JOINING) {
+            /* Ask the master for an address, backing off between attempts. */
+            if ((int32_t)(now - s_join_next_ms) >= 0) {
+                mesh_send_broadcast(MESH_TYPE_JOIN_REQ, MESH_DEFAULT_TTL,
+                                    s_token, MESH_TOKEN_LEN);
+                if (s_join_interval_ms < MESH_JOIN_INTERVAL_MAX_MS) {
+                    s_join_interval_ms += MESH_JOIN_INTERVAL_MS;
+                    if (s_join_interval_ms > MESH_JOIN_INTERVAL_MAX_MS) {
+                        s_join_interval_ms = MESH_JOIN_INTERVAL_MAX_MS;
+                    }
                 }
+                s_join_next_ms = now + s_join_interval_ms;
             }
-            s_join_next_ms = now + s_join_interval_ms;
+        } else if (s_state == MESH_STATE_JOINED &&
+                   mesh_get_address() != MESH_ADDR_NONE &&
+                   (int32_t)(now - s_claim_next_ms) >= 0) {
+            /* Safety net: re-announce our address so a restarted master can
+             * rebuild its RAM-only table (and refresh our liveness). */
+            mesh_send_claim();
         }
     }
-    /* M4: link-ACK retry timers and implicit-ACK handling go here. */
 }
 
 static void mesh_timer_start(void)
@@ -292,6 +336,16 @@ static void mesh_apply_role(void)
     if (mesh_is_master()) {
         if (mesh_get_address() != MESH_MASTER_ADDR) {
             mesh_set_address(MESH_MASTER_ADDR);
+            mesh_config_save();
+        }
+        /* Give this master run a fresh epoch so nodes detect the restart and
+         * re-announce their flash-stored addresses. */
+        if (s_boot_epoch == 0) {
+            s_cfg.boot_count = (uint16_t)(s_cfg.boot_count + 1);
+            if (s_cfg.boot_count == 0) {
+                s_cfg.boot_count = 1;   /* wrap past the "unknown" value */
+            }
+            s_boot_epoch = s_cfg.boot_count;
             mesh_config_save();
         }
     } else if (mesh_get_address() == MESH_MASTER_ADDR) {
@@ -486,6 +540,17 @@ static void mesh_mark_seen(uint8_t type, uint8_t src, uint8_t seq, const uint8_t
     }
 }
 
+/* Flood ADDR_ASSIGN{ token, addr } so the requesting node learns its address. */
+static void mesh_send_addr_assign(const uint8_t token[MESH_TOKEN_LEN], uint8_t addr)
+{
+    uint8_t out[MESH_TOKEN_LEN + 1];
+
+    memcpy(out, token, MESH_TOKEN_LEN);
+    out[MESH_TOKEN_LEN] = (uint8_t)(addr & MESH_ADDR_MASK);
+    mesh_send_broadcast(MESH_TYPE_ADDR_ASSIGN, MESH_DEFAULT_TTL,
+                        out, (uint8_t)(MESH_TOKEN_LEN + 1));
+}
+
 /* A joining node asks for an address (payload = token, flooded).  The master
  * allocates and floods ADDR_ASSIGN; every node relays the request onward. */
 static void mesh_rx_join_req(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
@@ -494,13 +559,13 @@ static void mesh_rx_join_req(const mesh_header_t *h, const uint8_t *payload, uin
         return;
     }
     if (mesh_is_master()) {
-        uint8_t addr = mesh_alloc_assign(payload);
-        if (addr != MESH_ADDR_NONE) {
-            uint8_t out[MESH_TOKEN_LEN + 1];
-            memcpy(out, payload, MESH_TOKEN_LEN);
-            out[MESH_TOKEN_LEN] = addr;
-            mesh_send_broadcast(MESH_TYPE_ADDR_ASSIGN, MESH_DEFAULT_TTL,
-                                out, (uint8_t)(MESH_TOKEN_LEN + 1));
+        /* After a restart the table is empty; give nodes a moment to re-claim
+         * their flash addresses before handing addresses to fresh joiners. */
+        if ((uint32_t)(millis() - s_boot_ms) >= MESH_RECOVER_MS) {
+            uint8_t addr = mesh_alloc_assign(payload);
+            if (addr != MESH_ADDR_NONE) {
+                mesh_send_addr_assign(payload, addr);
+            }
         }
     }
     mesh_relay_flood(h, payload, plen);
@@ -514,13 +579,21 @@ static void mesh_rx_addr_assign(const mesh_header_t *h, const uint8_t *payload, 
     if (plen < MESH_TOKEN_LEN + 1) {
         return;
     }
-    if (!mesh_is_master() && memcmp(payload, s_token, MESH_TOKEN_LEN) == 0) {
-        addr = (uint8_t)(payload[MESH_TOKEN_LEN] & MESH_ADDR_MASK);
-        if (addr >= MESH_FIRST_SLAVE_ADDR) {
-            if (mesh_get_address() != addr) {
-                mesh_set_address(addr);
-                mesh_config_save();
+    addr = (uint8_t)(payload[MESH_TOKEN_LEN] & MESH_ADDR_MASK);
+    if (!mesh_is_master()) {
+        if (memcmp(payload, s_token, MESH_TOKEN_LEN) == 0) {
+            if (addr >= MESH_FIRST_SLAVE_ADDR) {
+                if (mesh_get_address() != addr) {
+                    mesh_set_address(addr);
+                    mesh_config_save();
+                }
+                mesh_update_state();
             }
+        } else if (addr >= MESH_FIRST_SLAVE_ADDR && addr == mesh_get_address()) {
+            /* Our address was handed to a different node: relinquish it and
+             * re-join so no duplicate address can persist (safety net). */
+            mesh_set_address(MESH_ADDR_NONE);
+            mesh_config_save();
             mesh_update_state();
         }
     }
@@ -632,6 +705,7 @@ static void mesh_check_parent_staleness(uint32_t now)
         mesh_neighbor_find(s_route.parent_addr) == NULL) {
         memset(&s_route, 0, sizeof(s_route));   /* parent lost: re-attach */
         s_route.parent_addr = MESH_ADDR_NONE;
+        s_had_parent = false;                   /* claim again when we re-attach */
         mesh_select_parent();
     }
 }
@@ -640,16 +714,45 @@ static void mesh_check_parent_staleness(uint32_t now)
  * parent) advertise, so advertised costs are always meaningful. */
 static void mesh_emit_beacon(void)
 {
-    uint8_t payload[1];
+    uint8_t payload[MESH_BEACON_LEN];
+    uint16_t epoch;
 
     if (mesh_is_master()) {
-        payload[0] = 0;                 /* master: cost 0, hops 0 */
-        mesh_send_broadcast(MESH_TYPE_BEACON, 0, payload, 1);
+        epoch = s_boot_epoch;
+        payload[0] = (uint8_t)(epoch & 0xFF);
+        payload[1] = (uint8_t)(epoch >> 8);
+        payload[2] = 0;                 /* master: cost 0, hops 0 */
+        mesh_send_broadcast(MESH_TYPE_BEACON, 0, payload, MESH_BEACON_LEN);
         return;
     }
     if (s_route.parent_addr != MESH_ADDR_NONE) {
-        payload[0] = s_route.self_cost;
-        mesh_send_broadcast(MESH_TYPE_BEACON, s_route.self_hops, payload, 1);
+        epoch = s_master_epoch;
+        payload[0] = (uint8_t)(epoch & 0xFF);
+        payload[1] = (uint8_t)(epoch >> 8);
+        payload[2] = s_route.self_cost;
+        mesh_send_broadcast(MESH_TYPE_BEACON, s_route.self_hops, payload, MESH_BEACON_LEN);
+    }
+}
+
+/* Track the master's boot epoch.  A change (or the first one seen while we
+ * already hold an address) means the master restarted, so schedule a claim. */
+static void mesh_note_epoch(uint16_t epoch)
+{
+    bool announce = false;
+
+    if (mesh_is_master()) {
+        return;
+    }
+    if (!s_epoch_valid) {
+        s_epoch_valid  = true;
+        s_master_epoch = epoch;
+        announce = (mesh_get_address() != MESH_ADDR_NONE);
+    } else if (epoch != s_master_epoch) {
+        s_master_epoch = epoch;
+        announce = true;
+    }
+    if (announce && mesh_get_address() != MESH_ADDR_NONE) {
+        s_claim_next_ms = 0;            /* re-announce on the next timer tick */
     }
 }
 
@@ -658,10 +761,12 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
     mesh_route_neighbor_t *n;
     int16_t sample;
     uint32_t now = millis();
+    uint16_t epoch;
 
-    if (h->src == mesh_get_address() || plen < 1) {
+    if (h->src == mesh_get_address() || plen < MESH_BEACON_LEN) {
         return;
     }
+    epoch = (uint16_t)(payload[0] | ((uint16_t)payload[1] << 8));
     n = mesh_neighbor_obtain(h->src);
     if (n == NULL) {
         return;
@@ -673,13 +778,22 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
         sample = (int16_t)s_rx_snr * 10;
         n->snr_x10 = (int16_t)((n->snr_x10 * 3 + sample) / 4);  /* EWMA */
     }
-    n->cost      = payload[0];
+    n->cost      = payload[2];
     n->hops      = h->hops;
     n->link_cost = mesh_link_cost(n->snr_x10);
     n->last_ms   = now;
 
     mesh_check_parent_staleness(now);
     mesh_select_parent();
+
+    /* If we re-attached after losing our parent, re-announce our address. */
+    if (!mesh_is_master() && s_route.parent_addr != MESH_ADDR_NONE) {
+        if (!s_had_parent && mesh_get_address() != MESH_ADDR_NONE) {
+            s_claim_next_ms = 0;
+        }
+        s_had_parent = true;
+    }
+    mesh_note_epoch(epoch);
 }
 
 /* --- M4: implicit link ACK + bounded retries ---------------------------- */
@@ -834,6 +948,63 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
     mesh_relay_flood(h, payload, plen);
 }
 
+/* ======================================================================= */
+/*  M5: recovery / robustness                                             */
+/* ======================================================================= */
+
+/* Node: re-announce our flash-stored address so a restarted master can
+ * rebuild its RAM-only table (flooded, best-effort). */
+static void mesh_send_claim(void)
+{
+    uint8_t payload[MESH_TOKEN_LEN + 1];
+
+    if (mesh_is_master() || mesh_get_address() == MESH_ADDR_NONE) {
+        return;
+    }
+    memcpy(payload, s_token, MESH_TOKEN_LEN);
+    payload[MESH_TOKEN_LEN] = mesh_get_address();
+    mesh_send_broadcast(MESH_TYPE_ADDR_CLAIM, MESH_DEFAULT_TTL,
+                        payload, (uint8_t)(MESH_TOKEN_LEN + 1));
+    s_claim_next_ms = millis() + MESH_CLAIM_INTERVAL_MS;
+}
+
+/* Master: rebuild the table from a node's claim.  Adopt the claimed address
+ * when it is free, re-assert our existing assignment when the token is known,
+ * and fall back to a fresh allocation when the address is already taken. */
+static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
+{
+    uint8_t want;
+    uint8_t have;
+
+    if (plen < MESH_TOKEN_LEN + 1) {
+        return;
+    }
+    if (mesh_is_master()) {
+        want = (uint8_t)(payload[MESH_TOKEN_LEN] & MESH_ADDR_MASK);
+        if (want >= MESH_FIRST_SLAVE_ADDR) {
+            have = mesh_alloc_lookup(payload);
+            if (have == want) {
+                /* already known — nothing to do */
+            } else if (have != MESH_ADDR_NONE) {
+                /* token known under another address: re-assert ours */
+                mesh_send_addr_assign(payload, have);
+            } else if (!mesh_alloc_claim(payload, want)) {
+                /* claimed address taken by another node: assign a fresh one */
+                uint8_t na = mesh_alloc_assign(payload);
+                if (na != MESH_ADDR_NONE) {
+                    mesh_send_addr_assign(payload, na);
+                }
+            }
+        }
+    }
+    mesh_relay_flood(h, payload, plen);
+}
+
+uint16_t mesh_get_epoch(void)
+{
+    return mesh_is_master() ? s_boot_epoch : s_master_epoch;
+}
+
 uint8_t mesh_get_parent(void)
 {
     return s_route.parent_addr;
@@ -867,6 +1038,12 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     }
     s_rx_rssi = rssi;
     s_rx_snr  = snr;
+
+    /* Master liveness bookkeeping: refresh the last-heard time for a node as
+     * long as it sends anything (beacon, uplink or claim). */
+    if (mesh_is_master() && h.src >= MESH_FIRST_SLAVE_ADDR && h.src <= MESH_ADDR_MAX) {
+        s_heard_ms[h.src] = millis();
+    }
 
     payload = buf + MESH_HEADER_SIZE;
     plen    = (uint8_t)(len - MESH_HEADER_SIZE);
@@ -910,7 +1087,7 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     case MESH_TYPE_DATA_UPLINK:   mesh_rx_data_uplink(&h, payload, plen);  break;
     case MESH_TYPE_DATA_DOWNLINK: mesh_rx_data_downlink(&h, payload, plen);break;
     case MESH_TYPE_LINK_ACK:      /* implicit ACK only (M4) */             break;
-    case MESH_TYPE_MAP_REQ:       /* later */                              break;
+    case MESH_TYPE_ADDR_CLAIM:    mesh_rx_addr_claim(&h, payload, plen);   break;
     default:                                                               break;
     }
 }

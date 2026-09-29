@@ -45,7 +45,7 @@ typedef enum {
 /* User flash partition: offset + length must stay below 0x7800 on STM32WLE. */
 #define MESH_FLASH_OFFSET       0x0100
 #define MESH_FLASH_MAGIC        0xA5
-#define MESH_FLASH_VERSION      0x01
+#define MESH_FLASH_VERSION      0x02
 
 /* --- Lifecycle ---------------------------------------------------------- */
 /* Load persisted config (or defaults: disabled, not master, unassigned). */
@@ -67,7 +67,7 @@ bool    mesh_config_save(void);
 /* --- M1 plumbing -------------------------------------------------------- */
 #define MESH_TX_QUEUE_SIZE      8       /* queued outgoing mesh frames        */
 #define MESH_MAX_FRAME          64      /* header + path + payload, in bytes  */
-#define MESH_DEDUP_SIZE         16      /* (src,seq) duplicate cache depth    */
+#define MESH_DEDUP_SIZE         32      /* (src,seq) duplicate cache depth    */
 #define MESH_TIMER_PERIOD_MS    200     /* mesh housekeeping period           */
 
 /* --- M2 join / address assignment --------------------------------------- */
@@ -106,9 +106,19 @@ bool    mesh_send_uplink(const uint8_t *payload, uint8_t len);
 /* Master only: flood a payload down to a specific node (0 on failure). */
 bool    mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len);
 
+/* --- M5 recovery / robustness ------------------------------------------- */
+#define MESH_BEACON_LEN          3      /* epoch[2] + path cost[1]            */
+#define MESH_BEACON_FAST_MS      1000   /* master beacon period while recovering */
+#define MESH_CLAIM_INTERVAL_MS   60000  /* node re-announces its address      */
+#define MESH_EVICT_MS            180000 /* master frees a silent node's addr  */
+#define MESH_RECOVER_MS          10000  /* master defers new allocs after boot*/
+
+/* Master boot epoch last heard (0 while unknown). */
+uint16_t mesh_get_epoch(void);
+
 /* Parse an incoming mesh frame (already gated on mesh_is_enabled() by caller).
  * M1: validates + dedups.  M2: join/assign/table.  M3: beacon + uplink.
- * M4: downlink + implicit link-ACK retries. */
+ * M4: downlink + implicit link-ACK retries.  M5: epoch/claim recovery. */
 void    mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr);
 
 /* Enqueue a fully-built mesh frame for transmission (drained by the timer). */

@@ -32,6 +32,12 @@ uint8_t mesh_alloc_lookup(const uint8_t token[MESH_TOKEN_LEN]);
  * address.  Returns MESH_ADDR_NONE when the pool is exhausted. */
 uint8_t mesh_alloc_assign(const uint8_t token[MESH_TOKEN_LEN]);
 
+/* Bind `token` to a specific, currently-free slave address (used when a node
+ * re-claims its flash-stored address after a master restart).  Idempotent when
+ * the token already maps to `addr`.  Returns false when `addr` is out of range,
+ * already held by another token, or the table is full. */
+bool    mesh_alloc_claim(const uint8_t token[MESH_TOKEN_LEN], uint8_t addr);
+
 /* Release the address held by `addr` (used for eviction / recycling). */
 void    mesh_alloc_free(uint8_t addr);
 

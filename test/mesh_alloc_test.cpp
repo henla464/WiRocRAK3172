@@ -96,6 +96,20 @@ int main(void)
     CHECK(mesh_alloc_count() == 0);
     CHECK(!mesh_alloc_occupies(2));
 
+    /* mesh_alloc_claim: adopt a specific address after a master restart. */
+    CHECK(mesh_alloc_claim(tA, 7));                 /* free address: adopt */
+    CHECK(mesh_alloc_lookup(tA) == 7);
+    CHECK(mesh_alloc_claim(tA, 7));                 /* idempotent */
+    CHECK(!mesh_alloc_claim(tA, 9));                /* token already bound  */
+    CHECK(mesh_alloc_lookup(tA) == 7);
+    CHECK(!mesh_alloc_claim(tB, 7));                /* taken by another tok */
+    CHECK(mesh_alloc_lookup(tB) == MESH_ADDR_NONE);
+    CHECK(mesh_alloc_claim(tB, 8));
+    CHECK(mesh_alloc_lookup(tB) == 8);
+    CHECK(!mesh_alloc_claim(tC, MESH_MASTER_ADDR)); /* out of slave range   */
+    CHECK(!mesh_alloc_claim(tC, MESH_ADDR_NONE));
+    CHECK(mesh_alloc_count() == 2);
+
     if (g_failures == 0) {
         std::printf("ALL TESTS PASSED\n");
         return 0;

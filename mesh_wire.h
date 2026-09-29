@@ -38,7 +38,7 @@ typedef enum {
     MESH_TYPE_DATA_UPLINK,
     MESH_TYPE_DATA_DOWNLINK,
     MESH_TYPE_LINK_ACK,
-    MESH_TYPE_MAP_REQ,
+    MESH_TYPE_ADDR_CLAIM,
     MESH_TYPE_COUNT
 } mesh_type_t;
 

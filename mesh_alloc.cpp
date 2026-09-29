@@ -87,6 +87,30 @@ uint8_t mesh_alloc_assign(const uint8_t token[MESH_TOKEN_LEN])
     return MESH_ADDR_NONE;              /* pool exhausted */
 }
 
+bool mesh_alloc_claim(const uint8_t token[MESH_TOKEN_LEN], uint8_t addr)
+{
+    int i;
+
+    if (addr < MESH_FIRST_SLAVE_ADDR || addr > MESH_ADDR_MAX) {
+        return false;
+    }
+    i = mesh_alloc_find(token);
+    if (i >= 0) {
+        return s_entries[i].addr == addr;       /* already ours (idempotent) */
+    }
+    if (mesh_alloc_addr_used(addr)) {
+        return false;                           /* held by another token      */
+    }
+    for (uint8_t k = 0; k < MESH_MAX_SLAVES; k++) {
+        if (s_entries[k].addr == MESH_ADDR_NONE) {
+            memcpy(s_entries[k].token, token, MESH_TOKEN_LEN);
+            s_entries[k].addr = addr;
+            return true;
+        }
+    }
+    return false;                               /* table full */
+}
+
 void mesh_alloc_free(uint8_t addr)
 {
     for (uint8_t i = 0; i < MESH_MAX_SLAVES; i++) {

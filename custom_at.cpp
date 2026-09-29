@@ -200,16 +200,17 @@ int master_handler(SERIAL_PORT port, char *cmd, stParam *param)
 /**
  * @brief Get mesh state. Usage: ATC+MESHMAP=?
  *        Returns
- *        '<enabled>:<is master>:<own address>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>'
+ *        '<enabled>:<is master>:<own address>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neigh>:<epoch>'
  *        where <state> is 0=unassigned 1=joining 2=joined, <alloc> is the number
  *        of addresses the master has allocated, <parent> is the current parent
- *        address (0 = none) and <hops>/<cost> are the route to the master.
+ *        address (0 = none), <hops>/<cost> are the route to the master, <neigh>
+ *        is the live neighbour count and <epoch> is the master boot epoch.
  */
 int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if ((param->argc == 1 && !strcmp(param->argv[0], "?")) || param->argc == 0)
 	{
-		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d", cmd,
+		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d", cmd,
 					 mesh_is_enabled() ? 1 : 0,
 					 mesh_is_master() ? 1 : 0,
 					 mesh_get_address(),
@@ -218,7 +219,9 @@ int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
 					 mesh_master_alloc_count(),
 					 mesh_get_parent(),
 					 mesh_get_hops(),
-					 mesh_get_path_cost());
+					 mesh_get_path_cost(),
+					 mesh_get_neighbor_count(),
+					 mesh_get_epoch());
 		return AT_NO_STATUS;
 	}
 	return AT_PARAM_ERROR;
