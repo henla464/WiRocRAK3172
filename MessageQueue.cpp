@@ -56,7 +56,7 @@ bool MessageQueue_isSameMessage(struct LoraMessage * msg1, volatile struct LoraM
 	{
 		return false;
 	}
-	for (uint8_t i; i < msg1->BufferSize; i++)
+	for (uint8_t i = 0; i < msg1->BufferSize; i++)
 	{
 		if (msg1->Buffer[i] != msg2->Buffer[i]) {
 			return false;
@@ -73,11 +73,13 @@ uint8_t MessageQueue_enQueue(struct MessageQueue * queue, LoraMeessage_t * msg)
 	}
 	else
 	{
-		if (MessageQueue_isSameMessage(msg, &lastMessage))
-		{
+		// If same message is sent twice, then we want to get ack twice.
+		// filtering them away here is confusing.
+		//if (MessageQueue_isSameMessage(msg, &lastMessage))
+		//{
 			// Same message as last received
-			return SAMEMESSAGE;
-		}
+		//	return SAMEMESSAGE;
+		//}
 		if (queue->MessageQueue_front == -1)
 		{
 			queue->MessageQueue_front = 0;

@@ -14,7 +14,6 @@
 #define MESSAGEQUEUE_SIZE 10
 #define QUEUEISFULL 1
 #define ENQUEUESUCCESS 0
-#define SAMEMESSAGE 2
 
 
 typedef struct LoraMessage
@@ -35,7 +34,7 @@ struct MessageQueue {
 
 extern struct MessageQueue incomingMessageQueue;
 
-uint8_t MessageQueue_getNoOfItems();
+uint8_t MessageQueue_getNoOfItems(struct MessageQueue * queue);
 bool MessageQueue_isFull(struct MessageQueue * queue);
 bool MessageQueue_isEmpty(struct MessageQueue * queue);
 bool MessageQueue_isSameMessage(struct LoraMessage * msg1, volatile struct LoraMessage * msg2);

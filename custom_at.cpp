@@ -42,7 +42,7 @@ bool init_config_at(void)
 {
 
 	return api.system.atMode.add((char *)"P2P",
-								 (char *)"Configure in P2P mode. Usage: ATC+P2P=<frequency>:<spreading factor>:<bandwidth>:<coding rate>:<preamble length>:<tx power>:<low data rate optimize>:<crc on>:<rx gain>:<payload length>",
+								 (char *)"Configure in P2P mode. Usage: ATC+P2P=<frequency>:<spreading factor>:<bandwidth>:<coding rate>:<preamble length>:<tx power>:<low data rate optimize>:<crc on>:<rx gain>:<drf1268dscompatmode>:<sendack>:<payload length>",
 								 (char *)"P2P", config_handler,
 								 RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
 }
@@ -125,9 +125,6 @@ int status_handler(SERIAL_PORT port, char *cmd, stParam *param)
 	return AT_OK;
 }
 
-
-bool drf1268dsCompatMode = true;
-bool sendAck = true;
 
 /**
  * @brief Configures the P2P parameters of the device
@@ -416,7 +413,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
             return AT_PARAM_ERROR;
         if (0 != at_check_digital_uint32_t(param->argv[10], &sendack))
             return AT_PARAM_ERROR;
-		if (0 != at_check_digital_uint32_t(param->argv[9], &payload_len))
+		if (0 != at_check_digital_uint32_t(param->argv[11], &payload_len))
             return AT_PARAM_ERROR;	
 
         // Compatible old SPEC for bandwidth
@@ -469,7 +466,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		runtimeConfigP2P.low_data_rate_optimize = low_data_rate_optimize != 0;
 		runtimeConfigP2P.crc_on = crc_on != 0;
         runtimeConfigP2P.rxgain = rxgain != 0;
-        runtimeConfigP2P.drf1268dscompatmode = drf1268dsCompatMode != 0;
+        runtimeConfigP2P.drf1268dscompatmode = drf1268dscompatmode != 0;
         runtimeConfigP2P.sendack = sendack != 0;
 		runtimeConfigP2P.payload_len = (uint8_t)payload_len;
 		runtimeConfigP2P.fix_length_payload = payload_len > 0;
@@ -568,15 +565,18 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
     else if (param->argc == 1)
     {
         digitalWrite(LED_RED_TRANSMIT, LOW);
+        // indicate radio is sending
         digitalWrite(LORA_AUX, LOW);
         uint32_t datalen;
         uint8_t lora_data[256];
         
         datalen = strlen(param->argv[0]);
         if (0 != at_check_hex_param(param->argv[0], datalen, lora_data))
+        {
+            digitalWrite(LORA_AUX, HIGH);
+            digitalWrite(LED_RED_TRANSMIT, HIGH);
             return AT_PARAM_ERROR;
-        // indicate radio is sending
-        digitalWrite(LORA_AUX, LOW);
+        }
         bool sentOK = api.lora.psend(datalen / 2, lora_data);
         if (sentOK) {
             return AT_OK;
@@ -638,12 +638,27 @@ bool send_ack(bool drf1268dsCompatMode, uint8_t channelNumber, uint8_t calculate
 
 
 void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
-    // Drop packets that are too large
+    
     digitalWrite(LED_BLUE_RECEIVE, LOW);
+    // Drop message when queue is full
+    if (MessageQueue_isFull(&incomingMessageQueue))
+    {
+        api.system.timer.create(RAK_TIMER_0, turn_off_receive_led, RAK_TIMER_ONESHOT);
+	    // Trigger to turn of receive led 
+	    api.system.timer.start(RAK_TIMER_0, 150, NULL);
+        return;
+    }
+    // Drop messages that are too large or too small
     if (recv_data_pkg.BufferSize > sizeof(LoraMeessage_t::Buffer)) {
+        api.system.timer.create(RAK_TIMER_0, turn_off_receive_led, RAK_TIMER_ONESHOT);
+	    // Trigger to turn of receive led 
+	    api.system.timer.start(RAK_TIMER_0, 150, NULL);
         return;
     }
     if (recv_data_pkg.BufferSize < 2) {
+        api.system.timer.create(RAK_TIMER_0, turn_off_receive_led, RAK_TIMER_ONESHOT);
+	    // Trigger to turn of receive led 
+	    api.system.timer.start(RAK_TIMER_0, 150, NULL);
         return;
     }
     time_received = millis();
@@ -661,12 +676,12 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
     Serial.printf("Message received. Time since last send: %d\r\n", elapsed_since_start_send);
     Serial.printf("RSSI: %d SNR: %d\r\n", theMessage.Rssi, theMessage.Snr);
     
-    uint8_t noOfBytesToRemoveFromStart = drf1268dsCompatMode ? 1:0;
+    uint8_t noOfBytesToRemoveFromStart = service_lora_p2p_get_drf1268dscompatmode() ? 1:0;
     uint8_t header = theMessage.Buffer[noOfBytesToRemoveFromStart];
     bool ackRequested = header & 0x80;
     bool repeaterRequested = header & 0x20;
     bool ackSentOK = false;
-    if (sendAck && ackRequested && !repeaterRequested)
+    if (service_lora_p2p_get_sendack() && ackRequested && !repeaterRequested)
     {
         LoraMeessage_t deInterleavedMsg;
         if (
@@ -704,7 +719,7 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
             {
                 // Hash matches! Send ack
                 uint8_t channelNumber = theMessage.Buffer[0]; // only valid, and only used when drf1268dsCompatMode = true
-                ackSentOK = send_ack(drf1268dsCompatMode, channelNumber, calculatedHash);
+                ackSentOK = send_ack(service_lora_p2p_get_drf1268dscompatmode(), channelNumber, calculatedHash);
             }
         }
         if (
@@ -754,7 +769,7 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
             {
                 // Hash matches! Send ack
                 uint8_t channelNumber = theMessage.Buffer[0]; // only valid, and only used when drf1268dsCompatMode = true
-                ackSentOK = send_ack(drf1268dsCompatMode, channelNumber, calculatedHash);
+                ackSentOK = send_ack(service_lora_p2p_get_drf1268dscompatmode(), channelNumber, calculatedHash);
                 
             }
         }

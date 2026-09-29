@@ -5,12 +5,30 @@ void setup() {
     Serial1.begin(115200, RAK_AT_MODE);
     Serial.begin(115200, RAK_AT_MODE);
         
+    // Set the syncword to private if it is not already set
+    if (api.lora.syncword.get() != LORA_MAC_PRIVATE_SYNCWORD)
+    {
+        api.lora.syncword.set(LORA_MAC_PRIVATE_SYNCWORD);
+        api.system.reboot();
+    }
+
+    // Set the IQ inversion to 0 if it is not already set
+    if (api.lora.iqInver.get() != 0)
+    {
+        api.lora.iqInver.set(0);
+        api.system.reboot();
+    }
+
     // Set to P2P mode
     if(api.lora.nwm.get() != 0)
     {
         api.lora.nwm.set();
         api.system.reboot();
     }
+
+    //o_drf1268dscompatmode = service_lora_p2p_get_drf1268dscompatmode();
+    //o_sendack = service_lora_p2p_get_sendack();
+
 
     // nothing being sent
     pinMode(LORA_AUX, OUTPUT);
@@ -47,6 +65,8 @@ void setup() {
 	} else {
         Serial.printf("SETUP Custom AT command REC initialized\r\n");
     }
+
+
 
     // Enable RX permanent with TX possible
 	api.lora.precv(65533);
