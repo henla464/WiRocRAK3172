@@ -199,17 +199,21 @@ int master_handler(SERIAL_PORT port, char *cmd, stParam *param)
 
 /**
  * @brief Get mesh state. Usage: ATC+MESHMAP=?
- *        Returns '<enabled>:<is master>:<own address>'.
+ *        Returns '<enabled>:<is master>:<own address>:<txq>:<state>:<alloc>'
+ *        where <state> is 0=unassigned 1=joining 2=joined and <alloc> is the
+ *        number of addresses the master has allocated (0 on slaves).
  */
 int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if ((param->argc == 1 && !strcmp(param->argv[0], "?")) || param->argc == 0)
 	{
-		atcmd_printf("%s=%d:%d:%d:%d", cmd,
+		atcmd_printf("%s=%d:%d:%d:%d:%d:%d", cmd,
 					 mesh_is_enabled() ? 1 : 0,
 					 mesh_is_master() ? 1 : 0,
 					 mesh_get_address(),
-					 mesh_tx_queue_count());
+					 mesh_tx_queue_count(),
+					 (int)mesh_get_state(),
+					 mesh_master_alloc_count());
 		return AT_NO_STATUS;
 	}
 	return AT_PARAM_ERROR;

@@ -30,6 +30,17 @@
 
 /* Broadcast is expressed as a message type, not as an address. */
 
+/* Node identity token length (bytes). Derived from the STM32 hardware id. */
+#define MESH_TOKEN_LEN          8
+
+/* --- Join / allocator state --------------------------------------------- */
+/* Join FSM (see "Join / address assignment" in the design). */
+typedef enum {
+    MESH_STATE_UNASSIGNED = 0,  /* mesh disabled                                   */
+    MESH_STATE_JOINING,         /* enabled, no address yet: broadcasting JOIN_REQ  */
+    MESH_STATE_JOINED           /* has an address (or is the master)               */
+} mesh_state_t;
+
 /* --- Persistent (flash) configuration ----------------------------------- */
 /* User flash partition: offset + length must stay below 0x7800 on STM32WLE. */
 #define MESH_FLASH_OFFSET       0x0100
@@ -59,8 +70,20 @@ bool    mesh_config_save(void);
 #define MESH_DEDUP_SIZE         16      /* (src,seq) duplicate cache depth    */
 #define MESH_TIMER_PERIOD_MS    200     /* mesh housekeeping period           */
 
+/* --- M2 join / address assignment --------------------------------------- */
+#define MESH_JOIN_INTERVAL_MS   3000    /* initial JOIN_REQ period            */
+#define MESH_JOIN_INTERVAL_MAX_MS 15000 /* JOIN_REQ backoff ceiling           */
+#define MESH_TABLE_INTERVAL_MS  10000   /* master ADDR_TABLE flood period     */
+#define MESH_TABLE_MISS_LIMIT   3       /* misses before a node re-joins      */
+
+/* Join state of this node (UNASSIGNED / JOINING / JOINED). */
+mesh_state_t mesh_get_state(void);
+
+/* Number of addresses currently allocated by the master (diagnostics). */
+uint8_t mesh_master_alloc_count(void);
+
 /* Parse an incoming mesh frame (already gated on mesh_is_enabled() by caller).
- * M1: validates + dedups only; routing is added in later milestones. */
+ * M1: validates + dedups.  M2: dispatches join/assign/table control frames. */
 void    mesh_handle_rx(const uint8_t *buf, uint16_t len);
 
 /* Enqueue a fully-built mesh frame for transmission (drained by the timer). */
