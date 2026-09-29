@@ -16,6 +16,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "mesh_wire.h"
 
 /* --- Address space (5 bits, values 0..31) ------------------------------- */
 #define MESH_ADDR_BITS          5
@@ -51,5 +52,21 @@ void    mesh_set_address(uint8_t address);
 
 /* Persist the current configuration to flash. */
 bool    mesh_config_save(void);
+
+/* --- M1 plumbing -------------------------------------------------------- */
+#define MESH_TX_QUEUE_SIZE      4       /* queued outgoing mesh frames        */
+#define MESH_MAX_FRAME          64      /* header + path + payload, in bytes  */
+#define MESH_DEDUP_SIZE         16      /* (src,seq) duplicate cache depth    */
+#define MESH_TIMER_PERIOD_MS    200     /* mesh housekeeping period           */
+
+/* Parse an incoming mesh frame (already gated on mesh_is_enabled() by caller).
+ * M1: validates + dedups only; routing is added in later milestones. */
+void    mesh_handle_rx(const uint8_t *buf, uint16_t len);
+
+/* Enqueue a fully-built mesh frame for transmission (drained by the timer). */
+bool    mesh_send_frame(const uint8_t *frame, uint8_t len);
+
+/* Number of frames currently queued for transmission (diagnostics). */
+uint8_t mesh_tx_queue_count(void);
 
 #endif /* INC_MESH_H_ */

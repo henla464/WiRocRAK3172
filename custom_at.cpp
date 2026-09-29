@@ -205,10 +205,11 @@ int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if ((param->argc == 1 && !strcmp(param->argv[0], "?")) || param->argc == 0)
 	{
-		atcmd_printf("%s=%d:%d:%d", cmd,
+		atcmd_printf("%s=%d:%d:%d:%d", cmd,
 					 mesh_is_enabled() ? 1 : 0,
 					 mesh_is_master() ? 1 : 0,
-					 mesh_get_address());
+					 mesh_get_address(),
+					 mesh_tx_queue_count());
 		return AT_NO_STATUS;
 	}
 	return AT_PARAM_ERROR;
@@ -775,8 +776,19 @@ bool send_ack(bool drf1268dsCompatMode, uint8_t channelNumber, uint8_t calculate
 
 
 void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
-    
+
     digitalWrite(LED_BLUE_RECEIVE, LOW);
+
+    // In mesh mode every on-air frame is a mesh frame: hand it to the mesh
+    // layer (validate + dedup; routing is added in later milestones).
+    if (mesh_is_enabled())
+    {
+        mesh_handle_rx(recv_data_pkg.Buffer, recv_data_pkg.BufferSize);
+        api.system.timer.create(RAK_TIMER_0, turn_off_receive_led, RAK_TIMER_ONESHOT);
+        api.system.timer.start(RAK_TIMER_0, 150, NULL);
+        return;
+    }
+
     // Drop message when queue is full
     if (MessageQueue_isFull(&incomingMessageQueue))
     {
