@@ -23,6 +23,9 @@ int status_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int send_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int config_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int receive_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int mesh_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int master_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param);
 void send_cb(void);
 void cad_cb(bool detect);
 void receive_cb(rui_lora_p2p_recv_t recv_data_pkg);
@@ -66,6 +69,24 @@ bool init_receive_at(void)
                         Returned message 'OK<binary data, rssi, snr, status>' or 'OK<hex data>:rssi:snr:status'. When no data to fetch 'EM' is returned",
 								 (char *)"REC", receive_handler,
 								 RAK_ATCMD_PERM_READ| RAK_ATCMD_PERM_WRITE);
+}
+
+bool init_mesh_at(void)
+{
+	bool ok = true;
+	ok &= api.system.atMode.add((char *)"MESH",
+								(char *)"Enable/disable LoRa mesh mode. Usage: ATC+MESH=<0|1>",
+								(char *)"MESH", mesh_handler,
+								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
+	ok &= api.system.atMode.add((char *)"MASTER",
+								(char *)"Set this node as mesh master/gateway. Usage: ATC+MASTER=<0|1>",
+								(char *)"MASTER", master_handler,
+								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
+	ok &= api.system.atMode.add((char *)"MESHMAP",
+								(char *)"Get mesh state. Usage: ATC+MESHMAP=?",
+								(char *)"MESHMAP", meshmaps_handler,
+								RAK_ATCMD_PERM_READ);
+	return ok;
 }
 
 // STATUS //
@@ -126,6 +147,74 @@ int status_handler(SERIAL_PORT port, char *cmd, stParam *param)
 }
 
 
+// MESH //
+
+/**
+ * @brief Enable/disable mesh mode. Usage: ATC+MESH=<0|1> / ATC+MESH=?
+ */
+int mesh_handler(SERIAL_PORT port, char *cmd, stParam *param)
+{
+	if (param->argc == 1 && !strcmp(param->argv[0], "?"))
+	{
+		atcmd_printf("%s=%d", cmd, mesh_is_enabled() ? 1 : 0);
+		return AT_NO_STATUS;
+	}
+	else if (param->argc == 1)
+	{
+		uint32_t enabled;
+		if (0 != at_check_digital_uint32_t(param->argv[0], &enabled))
+			return AT_PARAM_ERROR;
+		if (enabled > 1)
+			return AT_PARAM_ERROR;
+		mesh_set_enabled(enabled != 0);
+		mesh_config_save();
+		return AT_OK;
+	}
+	return AT_PARAM_ERROR;
+}
+
+/**
+ * @brief Set this node as mesh master/gateway. Usage: ATC+MASTER=<0|1> / ATC+MASTER=?
+ */
+int master_handler(SERIAL_PORT port, char *cmd, stParam *param)
+{
+	if (param->argc == 1 && !strcmp(param->argv[0], "?"))
+	{
+		atcmd_printf("%s=%d", cmd, mesh_is_master() ? 1 : 0);
+		return AT_NO_STATUS;
+	}
+	else if (param->argc == 1)
+	{
+		uint32_t master;
+		if (0 != at_check_digital_uint32_t(param->argv[0], &master))
+			return AT_PARAM_ERROR;
+		if (master > 1)
+			return AT_PARAM_ERROR;
+		mesh_set_master(master != 0);
+		mesh_config_save();
+		return AT_OK;
+	}
+	return AT_PARAM_ERROR;
+}
+
+/**
+ * @brief Get mesh state. Usage: ATC+MESHMAP=?
+ *        Returns '<enabled>:<is master>:<own address>'.
+ */
+int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
+{
+	if ((param->argc == 1 && !strcmp(param->argv[0], "?")) || param->argc == 0)
+	{
+		atcmd_printf("%s=%d:%d:%d", cmd,
+					 mesh_is_enabled() ? 1 : 0,
+					 mesh_is_master() ? 1 : 0,
+					 mesh_get_address());
+		return AT_NO_STATUS;
+	}
+	return AT_PARAM_ERROR;
+}
+
+
 /**
  * @brief Configures the P2P parameters of the device
  * Including lowDataRateOptimization, crc and payload length.
@@ -173,7 +262,9 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
             atcmd_printf("%d:", runtimeConfigP2P.rxgain);
             atcmd_printf("%d:", runtimeConfigP2P.drf1268dscompatmode);
             atcmd_printf("%d:", runtimeConfigP2P.sendack);
-			atcmd_printf("%u", runtimeConfigP2P.payload_len);
+			atcmd_printf("%u:", runtimeConfigP2P.payload_len);
+			atcmd_printf("%d:", mesh_is_enabled() ? 1 : 0);
+			atcmd_printf("%d", mesh_is_master() ? 1 : 0);
         }
         else
 	   	{
@@ -189,11 +280,16 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
             atcmd_printf("%d:", service_lora_p2p_get_rxgain());
             atcmd_printf("%d:", service_lora_p2p_get_drf1268dscompatmode());
             atcmd_printf("%d:", service_lora_p2p_get_sendack());
-			atcmd_printf("%u", service_lora_p2p_get_payloadlen());
+			atcmd_printf("%u:", service_lora_p2p_get_payloadlen());
+			atcmd_printf("%d:", mesh_is_enabled() ? 1 : 0);
+			atcmd_printf("%d", mesh_is_master() ? 1 : 0);
         }
         return AT_NO_STATUS;
     }
-    else if (param->argc == 12 || (param->argc == 13 && !strcmp(param->argv[12],"0")))
+    else if (param->argc == 12
+             || (param->argc == 13 && !strcmp(param->argv[12],"0"))
+             || (param->argc == 14)
+             || (param->argc == 15 && !strcmp(param->argv[14],"0")))
     {
         uint32_t frequency,spreading_factor,bandwidth,coding_rate,preamble_length,
 			txpower, low_data_rate_optimize, crc_on, rxgain, drf1268dscompatmode,
@@ -201,10 +297,13 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		bool b_crc_on, b_rxgain, b_low_data_rate_optimize, b_drf1268dscompatmode, b_sendack;
         uint32_t o_frequency,o_spreading_factor,o_bandwidth,o_coding_rate,
 			o_preamble_length,o_txpower;
-		bool o_low_data_rate_optimize, o_crc_on, o_rxgain, o_drf1268dscompatmode, 
+		bool o_low_data_rate_optimize, o_crc_on, o_rxgain, o_drf1268dscompatmode,
             o_sendack, o_fix_length_payload;
 		uint8_t o_payload_len;
         uint8_t udrv_code;
+        // Optional trailing <mesh>:<master> parameters (argc >= 14)
+        bool haveMeshParams = (param->argc >= 14);
+        uint32_t mesh_enabled = 0, is_master = 0;
 
         // Preserve current p2p parameters
         o_frequency = service_lora_p2p_get_freq();
@@ -247,6 +346,16 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		if (0 != at_check_digital_uint32_t(param->argv[11], &payload_len))
             return AT_PARAM_ERROR;
 
+
+        if (haveMeshParams)
+        {
+            if (0 != at_check_digital_uint32_t(param->argv[12], &mesh_enabled))
+                return AT_PARAM_ERROR;
+            if (0 != at_check_digital_uint32_t(param->argv[13], &is_master))
+                return AT_PARAM_ERROR;
+            if (mesh_enabled > 1 || is_master > 1)
+                return AT_PARAM_ERROR;
+        }
 
         if ((frequency < 150e6) || (frequency > 960e6))
             return AT_PARAM_ERROR;
@@ -316,6 +425,13 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         if( udrv_code != UDRV_RETURN_OK)
             goto STEP_ATP2P_CHECK_ERROR_CODE;
 
+        if (haveMeshParams)
+        {
+            mesh_set_enabled(mesh_enabled != 0);
+            mesh_set_master(is_master != 0);
+            mesh_config_save();
+        }
+
         set_useRuntimeConfigP2P(false);
         api.lora.precv(65533);
         return AT_OK;
@@ -340,7 +456,8 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         //Check and return error code
         return at_error_code_form_udrv(udrv_code);
     }
-    else if (param->argc == 13 && !strcmp(param->argv[12],"1")) { //for runtime setting
+    else if ((param->argc == 13 && !strcmp(param->argv[12],"1"))
+             || (param->argc == 15 && !strcmp(param->argv[14],"1"))) { //for runtime setting
         uint32_t frequency,spreading_factor,bandwidth,coding_rate,preamble_length,
 			txpower, low_data_rate_optimize, crc_on, rxgain, drf1268dscompatmode,
             sendack, payload_len;
@@ -349,6 +466,9 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
             o_sendack, o_fix_length_payload;
 		uint8_t o_payload_len;
         uint8_t udrv_code;
+        // Optional trailing <mesh>:<master> parameters (argc == 15)
+        bool haveMeshParams = (param->argc >= 15);
+        uint32_t mesh_enabled = 0, is_master = 0;
         bool o_useRuntimeConfig = get_useRuntimeConfigP2P();
         runtimeConfigP2P_t runtimeConfigP2P;
 
@@ -416,6 +536,16 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		if (0 != at_check_digital_uint32_t(param->argv[11], &payload_len))
             return AT_PARAM_ERROR;	
 
+        if (haveMeshParams)
+        {
+            if (0 != at_check_digital_uint32_t(param->argv[12], &mesh_enabled))
+                return AT_PARAM_ERROR;
+            if (0 != at_check_digital_uint32_t(param->argv[13], &is_master))
+                return AT_PARAM_ERROR;
+            if (mesh_enabled > 1 || is_master > 1)
+                return AT_PARAM_ERROR;
+        }
+
         // Compatible old SPEC for bandwidth
         if (SERVICE_LORA_P2P == service_lora_p2p_get_nwm()) {
             if( bandwidth == 125 ) {
@@ -473,6 +603,13 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 
         // Can only configure when recieve mode not enabled
         api.lora.precv(0);
+
+        if (haveMeshParams)
+        {
+            mesh_set_enabled(mesh_enabled != 0);
+            mesh_set_master(is_master != 0);
+            mesh_config_save();
+        }
 
         set_runtimeConfigP2P(&runtimeConfigP2P);
         set_useRuntimeConfigP2P(true);

@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include "mesh.h"
 
 #define LED_RED_TRANSMIT PIN_LED1
 #define LED_BLUE_RECEIVE PIN_LED2
@@ -12,3 +13,4 @@ bool init_status_at(void);
 bool init_send_at(void);
 bool init_config_at(void);
 bool init_receive_at(void);
+bool init_mesh_at(void);

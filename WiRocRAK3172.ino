@@ -26,6 +26,9 @@ void setup() {
         api.system.reboot();
     }
 
+    // Initialize the mesh subsystem (loads persisted config; disabled by default)
+    mesh_init();
+
     //o_drf1268dscompatmode = service_lora_p2p_get_drf1268dscompatmode();
     //o_sendack = service_lora_p2p_get_sendack();
 
@@ -64,6 +67,13 @@ void setup() {
 		Serial.printf("SETUP Add custom AT command REC fail\r\n");
 	} else {
         Serial.printf("SETUP Custom AT command REC initialized\r\n");
+    }
+
+    if (!init_mesh_at())
+	{
+		Serial.printf("SETUP Add custom AT command MESH fail\r\n");
+	} else {
+        Serial.printf("SETUP Custom AT command MESH initialized\r\n");
     }
 
 
