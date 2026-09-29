@@ -199,21 +199,26 @@ int master_handler(SERIAL_PORT port, char *cmd, stParam *param)
 
 /**
  * @brief Get mesh state. Usage: ATC+MESHMAP=?
- *        Returns '<enabled>:<is master>:<own address>:<txq>:<state>:<alloc>'
- *        where <state> is 0=unassigned 1=joining 2=joined and <alloc> is the
- *        number of addresses the master has allocated (0 on slaves).
+ *        Returns
+ *        '<enabled>:<is master>:<own address>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>'
+ *        where <state> is 0=unassigned 1=joining 2=joined, <alloc> is the number
+ *        of addresses the master has allocated, <parent> is the current parent
+ *        address (0 = none) and <hops>/<cost> are the route to the master.
  */
 int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if ((param->argc == 1 && !strcmp(param->argv[0], "?")) || param->argc == 0)
 	{
-		atcmd_printf("%s=%d:%d:%d:%d:%d:%d", cmd,
+		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d", cmd,
 					 mesh_is_enabled() ? 1 : 0,
 					 mesh_is_master() ? 1 : 0,
 					 mesh_get_address(),
 					 mesh_tx_queue_count(),
 					 (int)mesh_get_state(),
-					 mesh_master_alloc_count());
+					 mesh_master_alloc_count(),
+					 mesh_get_parent(),
+					 mesh_get_hops(),
+					 mesh_get_path_cost());
 		return AT_NO_STATUS;
 	}
 	return AT_PARAM_ERROR;
@@ -698,37 +703,75 @@ void cad_cb(bool detect) {
  */
 int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
+    uint8_t destAddr = MESH_ADDR_NONE;
+    char *hexParam;
+    char *colon;
+    uint32_t datalen;
+    uint8_t lora_data[256];
+    bool sentOK;
+
     start_send = millis();
 
-    if (param->argc == 1 && !strcmp(param->argv[0], "?"))
+    if (param->argc != 1 || !strcmp(param->argv[0], "?"))
     {
         return AT_PARAM_ERROR;
     }
-    else if (param->argc == 1)
+
+    /* Optional leading destination address: ATC+SEND=<dest>:<hexpayload>.
+     * Without a ':' the whole parameter is the payload and dest defaults to 0
+     * (legacy P2P form, and every non-master mesh node sends toward the master). */
+    hexParam = param->argv[0];
+    colon = strchr(param->argv[0], ':');
+    if (colon != NULL)
     {
-        digitalWrite(LED_RED_TRANSMIT, LOW);
-        // indicate radio is sending
-        digitalWrite(LORA_AUX, LOW);
-        uint32_t datalen;
-        uint8_t lora_data[256];
-        
-        datalen = strlen(param->argv[0]);
-        if (0 != at_check_hex_param(param->argv[0], datalen, lora_data))
+        uint32_t d;
+        *colon = '\0';
+        if (0 != at_check_digital_uint32_t(param->argv[0], &d) || d > MESH_ADDR_MAX)
+        {
+            return AT_PARAM_ERROR;
+        }
+        destAddr = (uint8_t)d;
+        hexParam = colon + 1;
+    }
+
+    digitalWrite(LED_RED_TRANSMIT, LOW);
+    // indicate radio is sending
+    digitalWrite(LORA_AUX, LOW);
+
+    datalen = strlen(hexParam);
+    if (0 != at_check_hex_param(hexParam, datalen, lora_data))
+    {
+        digitalWrite(LORA_AUX, HIGH);
+        digitalWrite(LED_RED_TRANSMIT, HIGH);
+        return AT_PARAM_ERROR;
+    }
+
+    if (mesh_is_enabled())
+    {
+        if (mesh_is_master() && destAddr >= MESH_FIRST_SLAVE_ADDR)
+        {
+            // Master sending to a specific node: downlink (M4).
+            sentOK = false;
+        }
+        else
+        {
+            // Toward the master (non-master), or to the master's own host.
+            sentOK = mesh_send_uplink(lora_data, (uint8_t)(datalen / 2));
+        }
+        if (!sentOK)
         {
             digitalWrite(LORA_AUX, HIGH);
             digitalWrite(LED_RED_TRANSMIT, HIGH);
-            return AT_PARAM_ERROR;
-        }
-        bool sentOK = api.lora.psend(datalen / 2, lora_data);
-        if (sentOK) {
-            return AT_OK;
-        } else {
             return AT_BUSY_ERROR;
         }
+        return AT_OK;
     }
-    else
-    {
-        return AT_PARAM_ERROR;
+
+    sentOK = api.lora.psend(datalen / 2, lora_data);
+    if (sentOK) {
+        return AT_OK;
+    } else {
+        return AT_BUSY_ERROR;
     }
 }
 
@@ -784,10 +827,11 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
     digitalWrite(LED_BLUE_RECEIVE, LOW);
 
     // In mesh mode every on-air frame is a mesh frame: hand it to the mesh
-    // layer (validate + dedup; routing is added in later milestones).
+    // layer (validate, dedup, route, and deliver uplink payloads to the host).
     if (mesh_is_enabled())
     {
-        mesh_handle_rx(recv_data_pkg.Buffer, recv_data_pkg.BufferSize);
+        mesh_handle_rx(recv_data_pkg.Buffer, recv_data_pkg.BufferSize,
+                       recv_data_pkg.Rssi, recv_data_pkg.Snr);
         api.system.timer.create(RAK_TIMER_0, turn_off_receive_led, RAK_TIMER_ONESHOT);
         api.system.timer.start(RAK_TIMER_0, 150, NULL);
         return;
@@ -824,6 +868,7 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
     theMessage.Rssi = recv_data_pkg.Rssi;
     theMessage.Snr = recv_data_pkg.Snr;
     theMessage.Status = recv_data_pkg.Status;
+    theMessage.SourceAddr = 0; // P2P: source address unknown
 	
     unsigned long elapsed_since_start_send = millis() - start_send;
     Serial.printf("Message received. Time since last send: %d\r\n", elapsed_since_start_send);
@@ -989,7 +1034,7 @@ int receive_handler(SERIAL_PORT port, char *cmd, stParam *param)
                 if (hexFormat) {
                     atcmd_printf(":");
                     p2p_printf_hex(msg.Buffer, msg.BufferSize);
-                    atcmd_printf(":%d:%d:%d", msg.Rssi, msg.Snr, msg.Status);
+                    atcmd_printf(":%d:%d:%d:%d", msg.Rssi, msg.Snr, msg.Status, msg.SourceAddr);
                     return AT_NO_STATUS;
                 } else {
                     HardwareSerial* serialX;
@@ -1011,6 +1056,7 @@ int receive_handler(SERIAL_PORT port, char *cmd, stParam *param)
                     serialX->write(rssiLow);
                     serialX->write(msg.Snr);
                     serialX->write(msg.Status);
+                    serialX->write(msg.SourceAddr);
                     return AT_NO_STATUS;
                 }
             }

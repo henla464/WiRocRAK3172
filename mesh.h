@@ -65,7 +65,7 @@ void    mesh_set_address(uint8_t address);
 bool    mesh_config_save(void);
 
 /* --- M1 plumbing -------------------------------------------------------- */
-#define MESH_TX_QUEUE_SIZE      4       /* queued outgoing mesh frames        */
+#define MESH_TX_QUEUE_SIZE      8       /* queued outgoing mesh frames        */
 #define MESH_MAX_FRAME          64      /* header + path + payload, in bytes  */
 #define MESH_DEDUP_SIZE         16      /* (src,seq) duplicate cache depth    */
 #define MESH_TIMER_PERIOD_MS    200     /* mesh housekeeping period           */
@@ -73,8 +73,15 @@ bool    mesh_config_save(void);
 /* --- M2 join / address assignment --------------------------------------- */
 #define MESH_JOIN_INTERVAL_MS   3000    /* initial JOIN_REQ period            */
 #define MESH_JOIN_INTERVAL_MAX_MS 15000 /* JOIN_REQ backoff ceiling           */
-#define MESH_TABLE_INTERVAL_MS  10000   /* master ADDR_TABLE flood period     */
+#define MESH_TABLE_INTERVAL_MS  60000   /* master ADDR_TABLE flood period     */
 #define MESH_TABLE_MISS_LIMIT   3       /* misses before a node re-joins      */
+
+/* --- M3 tree / uplink --------------------------------------------------- */
+#define MESH_BEACON_INTERVAL_MS 5000    /* beacon period (all routable nodes) */
+#define MESH_BEACON_STALE_MS    (3 * MESH_BEACON_INTERVAL_MS) /* parent timeout */
+#define MESH_NEIGHBOR_MAX       8       /* tracked neighbours per node        */
+#define MESH_DEFAULT_TTL        7       /* uplink hop limit (max 7)           */
+#define MESH_PARENT_HYSTERESIS  1       /* cost margin required to switch     */
 
 /* Join state of this node (UNASSIGNED / JOINING / JOINED). */
 mesh_state_t mesh_get_state(void);
@@ -82,9 +89,19 @@ mesh_state_t mesh_get_state(void);
 /* Number of addresses currently allocated by the master (diagnostics). */
 uint8_t mesh_master_alloc_count(void);
 
+/* Routing diagnostics. */
+uint8_t mesh_get_parent(void);          /* current parent address (0 = none)  */
+uint8_t mesh_get_hops(void);            /* hop-count to the master            */
+uint8_t mesh_get_path_cost(void);       /* cost to the master                 */
+uint8_t mesh_get_neighbor_count(void);  /* live neighbours                    */
+
+/* Enqueue a WiRoc payload toward the master (non-master) or to the local host
+ * (master). Returns false when there is no route / the frame is too large. */
+bool    mesh_send_uplink(const uint8_t *payload, uint8_t len);
+
 /* Parse an incoming mesh frame (already gated on mesh_is_enabled() by caller).
- * M1: validates + dedups.  M2: dispatches join/assign/table control frames. */
-void    mesh_handle_rx(const uint8_t *buf, uint16_t len);
+ * M1: validates + dedups.  M2: join/assign/table.  M3: beacon + uplink. */
+void    mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr);
 
 /* Enqueue a fully-built mesh frame for transmission (drained by the timer). */
 bool    mesh_send_frame(const uint8_t *frame, uint8_t len);

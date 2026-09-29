@@ -18,11 +18,12 @@
 
 typedef struct LoraMessage
 {
-    uint8_t BufferSize; 
+    uint8_t BufferSize;
     uint8_t Buffer[30];
     int16_t Rssi;
     int8_t Snr;
     int8_t Status; //0:RxDone; 1:RxTimeout, 2:RxError
+    uint8_t SourceAddr; // mesh source address of the message (0 = unknown / P2P)
 } LoraMeessage_t;
 
 struct MessageQueue {
