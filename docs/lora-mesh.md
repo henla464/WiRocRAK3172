@@ -362,6 +362,7 @@ For the v2 frame sizes (CR 4/5, preamble 8, CRC on), approximate airtimes in ms 
 | ADDR_TABLE | 5 | 41 | 72 | 123 | 246 |
 | JOIN_REQ / ADDR_ASSIGN / ADDR_CLAIM | 9 | 46 | 82 | 164 | 287 |
 | DATA (15 B payload) | 18 | 67 | 113 | 205 | 369 |
+| DATA (7 B payload) | 10 | 52 | 93 | 165 | 289 |
 | DATA (27 B payload) | 30 | 92 | 154 | 287 | 492 |
 
 Two structural facts matter: the **fixed per-frame cost** (preamble + header symbols
@@ -424,6 +425,37 @@ the deepest 14-node tree reaches 18.4%, but that is dominated by the **claim pla
 50 claim-hops per 90 s is ~16% on its own (beacons 2.1%, table 0.3%), so a deep
 14-node SF8 network should be avoided or the claim interval lengthened. Churn adds
 change-triggered `ADDR_TABLE` floods on top of the backstop counted here.
+
+### Punch throughput
+
+A WiRoc *punch* round trip costs: one **uplink** `DATA` (15 B payload -> 18 B frame)
+over `d_avg` hops; one **`LINK_ACK`** (4 B) from the master (relays use the implicit
+ACK, which costs no frame); and one **downlink** ACK `DATA` (7 B payload -> 10 B
+frame) that is *flooded* back, so it is relayed by every non-leaf -- `F`
+transmissions. Fitting exchanges into the time left after the control plane (table
+above), assuming an error-free channel (no retransmits) and one exchange at a time,
+gives the network-wide rate below.
+
+**Punches per minute, network-wide** (15 B up / 7 B down, `LINK_ACK` included).
+
+| topology | slaves | SF5 | SF6 | SF7 | SF8 |
+|---|---|---|---|---|---|
+| **worst case tree**        | 4  | 145 | 81 | 45 | 25 |
+|                           | 9  | 126 | 71 | 38 | 20 |
+|                           | 14 | 121 | 67 | 36 | 18 |
+| **average 1.5 hops**       | 4  | 204 | 114 | 64 | 35 |
+|                           | 9  | 134 | 74 | 41 | 22 |
+|                           | 14 | 107 | 59 | 32 | 17 |
+| **average 2 hops**         | 4  | 174 | 98 | 54 | 30 |
+|                           | 9  | 111 | 62 | 34 | 18 |
+|                           | 14 | 80 | 44 | 24 | 13 |
+
+The **downlink ACK flood dominates** once the tree has many relays: at SF8 the
+11-relay "average 2 hops" tree spends `11 x 289 ms` on that one ACK, so it carries
+*fewer* punches than the 4-relay worst-case tree despite a shorter uplink. A reverse
+source-route (the reserved `HAS_PATH`) would relay the ACK over `d_avg` hops instead
+and restore the expected ordering (more nodes -> more throughput). Retries, busy
+backoff and per-hop implicit-ACK waits make these figures upper bounds.
 
 ## Files
 
