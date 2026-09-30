@@ -1161,49 +1161,116 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
 /*  M5: recovery / robustness                                             */
 /* ======================================================================= */
 
-/* Node: re-announce our flash-stored address so a restarted master can
- * rebuild its RAM-only table (flooded, best-effort).  Our address is already
- * in the header `src`; the payload is just our token. */
+/* Master: apply a node's claim to the RAM-only table.  Adopt the claimed
+ * address when it is free, re-assert our existing assignment when the token is
+ * already known, and fall back to a fresh allocation when the claimed address
+ * is already taken.  Shared by the unicast and flooded claim paths. */
+static void mesh_master_apply_claim(const mesh_header_t *h, const uint8_t *payload)
+{
+    uint8_t want = (uint8_t)(h->src & MESH_ADDR_MASK);  /* node's own address */
+    uint8_t have;
+
+    if (want < MESH_FIRST_SLAVE_ADDR || want > MESH_ADDR_MAX) {
+        return;
+    }
+    have = mesh_alloc_lookup(payload);
+    if (have == want) {
+        /* already known -- nothing to do */
+    } else if (have != MESH_ADDR_NONE) {
+        /* token known under another address: re-assert ours */
+        mesh_send_addr_assign(payload, have);
+    } else if (!mesh_alloc_claim(payload, want)) {
+        /* claimed address taken by another node: assign a fresh one */
+        uint8_t na = mesh_alloc_assign(payload);
+        if (na != MESH_ADDR_NONE) {
+            mesh_send_addr_assign(payload, na);
+        }
+    }
+}
+
+/* Node: re-announce our flash-stored address so a restarted master can rebuild
+ * its RAM-only table.  Our address is already in the header `src`; the payload
+ * is just our token.
+ *
+ * This is a rootward message: it only has to reach the master, so we send it
+ * hop-by-hop toward our parent (same discipline as DATA_UPLINK) rather than
+ * flooding -- the network-wide cost is O(hops) per claim instead of O(N).  When
+ * we have no route yet (just booted, or just lost our parent) we fall back to a
+ * flood so a route-less node is still discoverable.  Best-effort either way: the
+ * claim repeats on the periodic safety net. */
 static void mesh_send_claim(void)
 {
+    uint8_t frame[MESH_MAX_FRAME];
+    uint8_t flen;
+    uint8_t seq;
+
     if (mesh_is_master() || mesh_get_address() == MESH_ADDR_NONE) {
         return;
     }
-    mesh_send_broadcast(MESH_TYPE_ADDR_CLAIM, MESH_DEFAULT_TTL,
-                        s_cfg.token, MESH_TOKEN_LEN);
+    if (s_state != MESH_STATE_JOINED || s_route.parent_addr == MESH_ADDR_NONE) {
+        /* No route: flood so the master can still find us. */
+        mesh_send_broadcast(MESH_TYPE_ADDR_CLAIM, MESH_DEFAULT_TTL,
+                            s_cfg.token, MESH_TOKEN_LEN);
+    } else {
+        /* Rootward unicast to the parent. */
+        seq = s_bcast_seq;
+        s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x1F);
+        flen = mesh_build_frame(frame, MESH_TYPE_ADDR_CLAIM, 0,
+                                mesh_get_address(), s_route.parent_addr,
+                                MESH_DEFAULT_TTL, seq, s_cfg.token, MESH_TOKEN_LEN);
+        mesh_send_frame(frame, flen);
+    }
     s_claim_next_ms = millis() + MESH_CLAIM_INTERVAL_MS;
 }
 
-/* Master: rebuild the table from a node's claim.  Adopt the claimed address
- * when it is free, re-assert our existing assignment when the token is known,
- * and fall back to a fresh allocation when the address is already taken. */
+/* Handle an incoming ADDR_CLAIM.  The master applies it to its table; an
+ * intermediate node forwards a rootward unicast one hop toward its parent (or
+ * converts it to a flood if it has lost its own parent); the flooded fallback
+ * is relayed by everyone. */
 static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
-    uint8_t want;
-    uint8_t have;
+    uint8_t frame[MESH_MAX_FRAME];
+    uint8_t flen;
 
     if (plen < MESH_TOKEN_LEN) {
         return;
     }
-    if (mesh_is_master()) {
-        want = (uint8_t)(h->src & MESH_ADDR_MASK);  /* node's own address */
-        if (want >= MESH_FIRST_SLAVE_ADDR && want <= MESH_ADDR_MAX) {
-            have = mesh_alloc_lookup(payload);
-            if (have == want) {
-                /* already known — nothing to do */
-            } else if (have != MESH_ADDR_NONE) {
-                /* token known under another address: re-assert ours */
-                mesh_send_addr_assign(payload, have);
-            } else if (!mesh_alloc_claim(payload, want)) {
-                /* claimed address taken by another node: assign a fresh one */
-                uint8_t na = mesh_alloc_assign(payload);
-                if (na != MESH_ADDR_NONE) {
-                    mesh_send_addr_assign(payload, na);
-                }
-            }
+
+    /* Flooded fallback (sent by a node that has no route yet): everyone relays
+     * and the master rebuilds. */
+    if (h->dst == MESH_ADDR_NONE) {
+        if (mesh_is_master()) {
+            mesh_master_apply_claim(h, payload);
         }
+        mesh_relay_flood(h, payload, plen);
+        return;
     }
-    mesh_relay_flood(h, payload, plen);
+
+    /* Rootward unicast: only the addressed next hop acts. */
+    if (h->dst != mesh_get_address()) {
+        return;                         /* not addressed to us */
+    }
+    if (mesh_is_master()) {
+        mesh_master_apply_claim(h, payload);
+        return;
+    }
+    if (h->hops <= 1) {
+        return;                         /* TTL exhausted */
+    }
+    if (s_route.parent_addr == MESH_ADDR_NONE) {
+        /* We cannot forward rootward right now: fall back to a flood (origin's
+         * src preserved, dst cleared) so the claim can still reach the master
+         * via another path. */
+        flen = mesh_build_frame(frame, MESH_TYPE_ADDR_CLAIM, 0, h->src,
+                                MESH_ADDR_NONE, (uint8_t)(h->hops - 1), h->seq,
+                                payload, plen);
+        mesh_send_frame(frame, flen);
+        return;
+    }
+    flen = mesh_build_frame(frame, MESH_TYPE_ADDR_CLAIM, 0, h->src,
+                            s_route.parent_addr, (uint8_t)(h->hops - 1), h->seq,
+                            payload, plen);
+    mesh_send_frame(frame, flen);       /* best effort; no pending retry */
 }
 
 uint16_t mesh_get_epoch(void)

@@ -138,7 +138,7 @@ header is **not** repeated in the payload (header-field reuse).
 | 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the master, carrying `ACK_REQ`. Each relay dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
 | 5 | `DATA_DOWNLINK` | 3 + N | flooded with `dst` = target | WiRoc payload (N bytes) | A WiRoc payload from the master to one specific node. The target delivers it to its host; everyone else relays it one hop further. |
 | 6 | `LINK_ACK` | 4 | broadcast (single hop) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, used only by the master (it has no next hop whose forward it could overhear, so relays rely on the implicit ACK instead). |
-| 7 | `ADDR_CLAIM` | 9 | flooded | `token[6]`; **own address already in header `src`** | A node re-announces its flash-stored address so a restarted master can rebuild its RAM-only table. Sent on a new boot epoch, on re-attach, and periodically as a safety net. |
+| 7 | `ADDR_CLAIM` | 9 | rootward unicast (flood fallback) | `token[6]`; **own address already in header `src`** | A node re-announces its flash-stored address so a restarted master can rebuild its RAM-only table. Sent hop-by-hop toward the parent (on a new boot epoch, on re-attach, and periodically as a safety net); a node with no route yet -- or a relay that has lost its own parent -- floods it instead. |
 
 All sizes include the fixed 3-byte header. The control types (0, 1, 2, 3, 6, 7) have
 a fixed length; the two data types (4, 5) are `3 + N`, where `N` is the verbatim
@@ -263,11 +263,14 @@ has no neighbour at all it keeps listening until beacons return.
   first. The 3-bit epoch is enough because its only job is *fast* reboot detection;
   a rare miss (the master rebooting a multiple of 8 times while a node was deaf) is
   caught by the periodic `ADDR_CLAIM` safety net.
-* A node re-announces its flash-stored address with a flooded
-  `ADDR_CLAIM{ token }` (its own address is already in the header `src`) when it
-  sees a new epoch (fast path), on its first
-  beacon after boot, after re-attaching a lost parent, and periodically as a
-  safety net (`MESH_CLAIM_INTERVAL_MS`).
+* A node re-announces its flash-stored address with an `ADDR_CLAIM{ token }` (its
+  own address is already in the header `src`) when it sees a new epoch (fast
+  path), on its first beacon after boot, after re-attaching a lost parent, and
+  periodically as a safety net (`MESH_CLAIM_INTERVAL_MS`). The claim is a
+  **rootward unicast**: it travels hop-by-hop toward the parent (like an uplink),
+  so the network-wide cost is `O(hops)` per claim rather than the `O(N)` of a
+  flood. Only a node with no route yet (just booted / parent lost), or a relay
+  that has lost its own parent, falls back to flooding it.
 * The master rebuilds its table from the claims: it adopts the claimed address when
   free, re-asserts its own assignment when the token is already known, and hands
   out a fresh address when the claimed one is already taken.
@@ -342,8 +345,10 @@ airtime`. At the old defaults (5 s beacons, standalone 5-byte ACKs, 30 slaves) a
 M7 design changes cut this several ways: **4-bit addresses (14 slaves max)** roughly
 halve the beacon term, the **adaptive beacon** back-off cuts the steady-state beacon
 term by the interval ratio, **frame slimming** (1-byte beacons, 2-byte ADDR_TABLE,
-header-field reuse) shrinks every control frame, and the host can **measure** the
-resulting ratio live via `ATC+MESHMAP?` (`overhead%`). The 10% target is only
+header-field reuse) shrinks every control frame, the **rootward `ADDR_CLAIM`**
+keeps the claim plane `O(N)` rather than the `O(N^2)` of a flood (it floods only
+when a node is route-less), and the host can **measure** the resulting ratio live
+via `ATC+MESHMAP?` (`overhead%`). The 10% target is only
 plausible for a data-dominant, few-node, fat-payload regime -- the header and the
 per-uplink ACK are proportional and set the floor.
 
