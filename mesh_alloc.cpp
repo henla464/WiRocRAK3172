@@ -12,6 +12,9 @@ typedef struct {
 
 static mesh_alloc_entry_t s_entries[MESH_MAX_SLAVES];
 
+/* Bumped on every real change of the occupied set (see mesh_alloc_version()). */
+static uint16_t s_version;
+
 static int mesh_alloc_find(const uint8_t token[MESH_TOKEN_LEN])
 {
     for (uint8_t i = 0; i < MESH_MAX_SLAVES; i++) {
@@ -36,6 +39,12 @@ static bool mesh_alloc_addr_used(uint8_t addr)
 void mesh_alloc_reset(void)
 {
     memset(s_entries, 0, sizeof(s_entries));
+    s_version++;
+}
+
+uint16_t mesh_alloc_version(void)
+{
+    return s_version;
 }
 
 uint8_t mesh_alloc_count(void)
@@ -79,6 +88,7 @@ uint8_t mesh_alloc_assign(const uint8_t token[MESH_TOKEN_LEN])
             if (s_entries[k].addr == MESH_ADDR_NONE) {
                 memcpy(s_entries[k].token, token, MESH_TOKEN_LEN);
                 s_entries[k].addr = addr;
+                s_version++;
                 return addr;
             }
         }
@@ -105,6 +115,7 @@ bool mesh_alloc_claim(const uint8_t token[MESH_TOKEN_LEN], uint8_t addr)
         if (s_entries[k].addr == MESH_ADDR_NONE) {
             memcpy(s_entries[k].token, token, MESH_TOKEN_LEN);
             s_entries[k].addr = addr;
+            s_version++;
             return true;
         }
     }
@@ -113,9 +124,13 @@ bool mesh_alloc_claim(const uint8_t token[MESH_TOKEN_LEN], uint8_t addr)
 
 void mesh_alloc_free(uint8_t addr)
 {
+    if (addr == MESH_ADDR_NONE) {
+        return;                         /* 0 addresses a free slot, not an entry */
+    }
     for (uint8_t i = 0; i < MESH_MAX_SLAVES; i++) {
         if (s_entries[i].addr == addr) {
             memset(&s_entries[i], 0, sizeof(s_entries[i]));
+            s_version++;
             return;
         }
     }

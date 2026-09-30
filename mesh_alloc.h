@@ -41,6 +41,12 @@ bool    mesh_alloc_claim(const uint8_t token[MESH_TOKEN_LEN], uint8_t addr);
 /* Release the address held by `addr` (used for eviction / recycling). */
 void    mesh_alloc_free(uint8_t addr);
 
+/* Monotonic change counter: bumped on every *real* mutation of the table (a new
+ * binding in assign/claim, an actual release in free, or a reset).  Idempotent
+ * assign/claim calls do not move it.  The master uses it to flood ADDR_TABLE
+ * when -- and only when -- the occupied set has actually changed. */
+uint16_t mesh_alloc_version(void);
+
 /* True when `addr` is currently allocated to a slave. */
 bool    mesh_alloc_occupies(uint8_t addr);
 

@@ -134,9 +134,9 @@ header is **not** repeated in the payload (header-field reuse).
 | 0 | `BEACON` | 4 | link-local, not relayed, not deduped | `epoch[3]\|cost[5]` (1 B); header `hops` = hop-count to master | Liveness and routing advertisement. Emitted on an adaptive interval by the master and by any node that has a parent. Neighbours use it to select a parent and to detect a node going quiet. |
 | 1 | `JOIN_REQ` | 9 | flooded | `token[6]`; `src` = 0 | An unassigned node asks the master for an address, retrying with backoff until assigned. Because `src` is 0, it is deduped on a hash of the token instead of `(src,seq)`. |
 | 2 | `ADDR_ASSIGN` | 9 | flooded | `token[6]`; **assigned address in header `dst`** | The master's answer to a `JOIN_REQ` (and its re-assertion after an `ADDR_CLAIM`). The node whose token matches adopts and persists the address. A node that sees its own address given to a *different* token relinquishes it. |
-| 3 | `ADDR_TABLE` | 5 | flooded | `occupied_bitmap[2]` (16-bit; the master bit is always set) | The master periodically floods its occupied-address bitmap so nodes can reconcile. A node that sees its own bit clear for `MESH_TABLE_MISS_LIMIT` intervals relinquishes its address and re-joins. |
+| 3 | `ADDR_TABLE` | 5 | flooded (relayed by relays only) | `occupied_bitmap[2]` (16-bit; the master bit is always set) | The master floods its occupied-address bitmap whenever the table **changes** (debounced) and as a slow periodic backstop, so nodes can reconcile. A node that sees its own bit clear for `MESH_TABLE_MISS_LIMIT` intervals relinquishes its address and re-joins. A *leaf* does not relay it (see "Flood relay"). |
 | 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the master, carrying `ACK_REQ`. Each relay dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
-| 5 | `DATA_DOWNLINK` | 3 + N | flooded with `dst` = target | WiRoc payload (N bytes) | A WiRoc payload from the master to one specific node. The target delivers it to its host; everyone else relays it one hop further. |
+| 5 | `DATA_DOWNLINK` | 3 + N | flooded with `dst` = target (relayed by relays only) | WiRoc payload (N bytes) | A WiRoc payload from the master to one specific node. The target delivers it to its host; any other node that has children relays it one hop further (a *leaf* does not relay). |
 | 6 | `LINK_ACK` | 4 | broadcast (single hop) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, used only by the master (it has no next hop whose forward it could overhear, so relays rely on the implicit ACK instead). |
 | 7 | `ADDR_CLAIM` | 9 | rootward unicast (flood fallback) | `token[6]`; **own address already in header `src`** | A node re-announces its flash-stored address so a restarted master can rebuild its RAM-only table. Sent hop-by-hop toward the parent (on a new boot epoch, on re-attach, and periodically as a safety net); a node with no route yet -- or a relay that has lost its own parent -- floods it instead. |
 
@@ -161,9 +161,9 @@ so it is used as the "invalid / out of range" bound when validating a frame.
    address in 2-15 and floods `ADDR_ASSIGN{ token }` (the address is the header `dst`).
 3. The matching node adopts and **persists** the address (flash), emits
    `ADDR_CLAIM`, resets its beacon to fast, and becomes **JOINED**.
-4. The master periodically floods `ADDR_TABLE{ occupied_bitmap[2] }`; a node that
-   sees its own bit cleared for several intervals relinquishes its address and
-   re-joins.
+4. The master floods `ADDR_TABLE{ occupied_bitmap[2] }` **whenever the table
+   changes** (debounced), with a slow periodic backstop; a node whose own bit is
+   cleared for several intervals relinquishes its address and re-joins.
 
 The master owns address `1`. Its table is **RAM-only**; nodes are the source of
 truth for their own address via flash (see *Recovery*).
@@ -206,8 +206,9 @@ origin.
 ### Downlink
 
 The master floods `DATA_DOWNLINK{ src=master, dst=target, ttl }`; the node whose
-address matches delivers it to its host and everyone else relays it one hop
-further (bounded by TTL and dedup).
+address matches delivers it to its host and any node with children relays it one
+hop further (bounded by TTL and dedup; a *leaf* does not relay -- see "Flood
+relay").
 
 ## Channel access (listen before talk)
 
@@ -296,7 +297,8 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_BEACON_LEAF_MULT` | 3 | a childless *leaf* beacons at this multiple of its back-off interval |
 | `MESH_RELAY_HOLD_MS` | 200000 | a node counts as a *relay* while it forwarded for a child within this window |
 | `MESH_JOIN_INTERVAL_MS` / `MESH_JOIN_INTERVAL_MAX_MS` | 3000 / 15000 | join backoff |
-| `MESH_TABLE_INTERVAL_MS` | 90000 | ADDR_TABLE flood period |
+| `MESH_TABLE_INTERVAL_MS` | 300000 | ADDR_TABLE flood backstop period (a table change also triggers an immediate flood) |
+| `MESH_TABLE_DEBOUNCE_MS` | 500 | window that coalesces table changes into one ADDR_TABLE flood |
 | `MESH_CLAIM_INTERVAL_MS` | 90000 | node safety-net re-announce |
 | `MESH_EVICT_MS` | 180000 | master eviction grace |
 | `MESH_RECOVER_MS` | 10000 | master post-boot recovery window |
@@ -327,6 +329,17 @@ Trade-off (accepted): discovering a *leaf* as a parent takes up to one leaf
 interval, so re-parenting onto a former leaf is slower (its parent-side liveness
 is unaffected -- claims make the leaf a relay's child within one interval, and
 the leaf's own 90 s claims keep it alive at the master regardless).
+
+**Flood relay.** A flood is re-broadcast once per receiving node (deduped on
+`(src,seq)`), so one flood costs one transmission per relay. Floods whose
+recipients are all **attached** nodes -- `ADDR_TABLE` and `DATA_DOWNLINK` -- are
+relayed only by **relays** (non-leaves, the same signal as leaf suppression): a
+node with no children has no downstream node, so its re-broadcast reaches nobody
+that has not already seen the frame, while the routing tree guarantees every
+attached node still receives the flood from its own parent. Floods that must
+reach an **unattached** node -- `JOIN_REQ`, `ADDR_ASSIGN` and the flooded
+`ADDR_CLAIM` fallback -- are still relayed by **everyone**, because the target may
+not yet have a parent whose relay it could rely on.
 
 ## Narrowband (31.25 kHz) operation
 
@@ -403,6 +416,12 @@ per-uplink ACK are proportional and set the floor.
 * **Failure / recovery**: power off a relay -> children re-attach; reboot the
   master -> nodes re-claim on the new epoch and are back within one or two beacon
   intervals. Reboot a slave -> it keeps / re-joins its address.
+* **Flood pruning / change-triggered table**: add a node and confirm the master
+  emits an `ADDR_TABLE` within ~`MESH_TABLE_DEBOUNCE_MS` (sniff, or watch the new
+  node's fast adoption) rather than waiting for the backstop; confirm a fresh
+  multi-hop node keeps reconciling (no rising table-miss / no spurious re-join),
+  i.e. its parent still relays the table. Confirm a *leaf* does not re-broadcast
+  `ADDR_TABLE` / `DATA_DOWNLINK` while a node with children does.
 * **Channel access (CAD / backoff)**: hold the channel busy with a second
   transmitter and confirm a host `ATC+SEND` returns `AT_BUSY_ERROR` with no
   module-side resend, while module-generated traffic (beacons, joins) keeps

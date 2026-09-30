@@ -110,6 +110,30 @@ int main(void)
     CHECK(!mesh_alloc_claim(tC, MESH_ADDR_NONE));
     CHECK(mesh_alloc_count() == 2);
 
+    /* Version counter: bumped on real mutations, never on idempotent calls. */
+    mesh_alloc_reset();
+    {
+        uint16_t v = mesh_alloc_version();
+        CHECK(mesh_alloc_assign(tA) == MESH_FIRST_SLAVE_ADDR);
+        CHECK(mesh_alloc_version() == (uint16_t)(v + 1));   /* new bind  */
+        (void)mesh_alloc_assign(tA);                        /* idempotent */
+        CHECK(mesh_alloc_version() == (uint16_t)(v + 1));
+        CHECK(mesh_alloc_claim(tB, 9));                     /* new bind  */
+        CHECK(mesh_alloc_version() == (uint16_t)(v + 2));
+        CHECK(mesh_alloc_claim(tB, 9));                     /* idempotent */
+        CHECK(mesh_alloc_version() == (uint16_t)(v + 2));
+        CHECK(!mesh_alloc_claim(tB, 10));                   /* no change */
+        CHECK(mesh_alloc_version() == (uint16_t)(v + 2));
+        mesh_alloc_free(9);                                 /* real free */
+        CHECK(mesh_alloc_version() == (uint16_t)(v + 3));
+        mesh_alloc_free(MESH_ADDR_NONE);                    /* no-op     */
+        mesh_alloc_free(9);                                 /* already free */
+        CHECK(mesh_alloc_version() == (uint16_t)(v + 3));
+        v = mesh_alloc_version();
+        mesh_alloc_reset();
+        CHECK(mesh_alloc_version() == (uint16_t)(v + 1));
+    }
+
     if (g_failures == 0) {
         std::printf("ALL TESTS PASSED\n");
         return 0;

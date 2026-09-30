@@ -110,6 +110,9 @@ static uint8_t  s_bcast_seq;                    /* rotating broadcast seq     */
 static uint32_t s_join_next_ms;                 /* next JOIN_REQ tx time      */
 static uint32_t s_join_interval_ms;             /* JOIN_REQ backoff interval  */
 static uint32_t s_table_next_ms;                /* next ADDR_TABLE flood (mst)*/
+static uint16_t s_table_ver_seen;               /* alloc version last flooded   */
+static bool     s_table_dirty;                  /* table changed, flood pending*/
+static uint32_t s_table_dirty_ms;               /* when the change was noticed */
 static uint8_t  s_table_miss;                   /* consecutive table misses   */
 
 /* ======================================================================= */
@@ -242,6 +245,9 @@ static void mesh_state_clear(void)
     memset(s_heard_ms, 0, sizeof(s_heard_ms));
 
     mesh_alloc_reset();
+    s_table_ver_seen = mesh_alloc_version();    /* no pending flood after reset */
+    s_table_dirty    = false;
+    s_table_dirty_ms = 0;
     mesh_update_state();
 }
 
@@ -389,12 +395,25 @@ static void mesh_timer_cb(void *)
                 mesh_alloc_free(a);
             }
         }
-        /* Periodically flood the occupied bitmap so nodes can reconcile. */
-        if ((int32_t)(now - s_table_next_ms) >= 0) {
-            uint8_t bm[2];
-            mesh_alloc_bitmap(bm);
-            mesh_send_broadcast(MESH_TYPE_ADDR_TABLE, MESH_DEFAULT_TTL, bm, 2);
-            s_table_next_ms = now + MESH_TABLE_INTERVAL_MS;
+        /* Flood the occupied bitmap when the table actually changed (an address
+         * was allocated, claimed or recycled), coalescing a burst of changes
+         * into one flood, and otherwise only on the slow backstop timer. */
+        {
+            uint16_t ver = mesh_alloc_version();
+            if (ver != s_table_ver_seen && !s_table_dirty) {
+                s_table_dirty    = true;    /* start the coalescing window */
+                s_table_dirty_ms = now;
+            }
+            if ((int32_t)(now - s_table_next_ms) >= 0 ||
+                (s_table_dirty &&
+                 (uint32_t)(now - s_table_dirty_ms) >= MESH_TABLE_DEBOUNCE_MS)) {
+                uint8_t bm[2];
+                mesh_alloc_bitmap(bm);
+                mesh_send_broadcast(MESH_TYPE_ADDR_TABLE, MESH_DEFAULT_TTL, bm, 2);
+                s_table_ver_seen = ver;
+                s_table_dirty    = false;
+                s_table_next_ms  = now + MESH_TABLE_INTERVAL_MS;
+            }
         }
     } else {
         if (s_state == MESH_STATE_JOINING) {
@@ -744,6 +763,21 @@ static void mesh_relay_flood(const mesh_header_t *h, const uint8_t *payload, uin
     mesh_send_frame(frame, flen);
 }
 
+/* Re-broadcast a flooded frame only if we are not a leaf.  A leaf has no
+ * downstream node, so its re-broadcast reaches nobody that has not already seen
+ * the frame; the routing tree guarantees every attached node still receives the
+ * flood from its own parent (a parent is never a leaf -- it forwarded a rootward
+ * unicast from the child that chose it).  Only used for floods whose recipients
+ * are all attached (ADDR_TABLE, DATA_DOWNLINK); joins/assigns, which must reach
+ * unattached nodes, are relayed by everyone. */
+static void mesh_relay_flood_gated(const mesh_header_t *h,
+                                   const uint8_t *payload, uint8_t plen)
+{
+    if (mesh_is_relay()) {
+        mesh_relay_flood(h, payload, plen);
+    }
+}
+
 /* 8-bit hash of a node token, used to dedup JOIN_REQ (whose src is 0). */
 static uint8_t mesh_token_hash8(const uint8_t token[MESH_TOKEN_LEN])
 {
@@ -849,7 +883,7 @@ static void mesh_rx_addr_table(const mesh_header_t *h, const uint8_t *payload, u
             mesh_beacon_fast();
         }
     }
-    mesh_relay_flood(h, payload, plen);
+    mesh_relay_flood_gated(h, payload, plen);
 }
 
 /* ======================================================================= */
@@ -1189,7 +1223,7 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
     if (mesh_is_master()) {
         return;                         /* the master originates downlinks */
     }
-    mesh_relay_flood(h, payload, plen);
+    mesh_relay_flood_gated(h, payload, plen);
 }
 
 /* ======================================================================= */

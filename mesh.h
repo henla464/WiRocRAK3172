@@ -82,7 +82,8 @@ bool    mesh_config_save(void);
 /* --- M2 join / address assignment --------------------------------------- */
 #define MESH_JOIN_INTERVAL_MS   3000    /* initial JOIN_REQ period            */
 #define MESH_JOIN_INTERVAL_MAX_MS 15000 /* JOIN_REQ backoff ceiling           */
-#define MESH_TABLE_INTERVAL_MS  90000   /* master ADDR_TABLE flood period     */
+#define MESH_TABLE_INTERVAL_MS  300000  /* master ADDR_TABLE backstop period   */
+#define MESH_TABLE_DEBOUNCE_MS  500     /* coalesce table changes into a flood */
 #define MESH_TABLE_MISS_LIMIT   3       /* misses before a node re-joins      */
 
 /* --- M3 tree / uplink --------------------------------------------------- */
