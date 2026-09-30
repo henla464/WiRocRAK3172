@@ -84,6 +84,8 @@ Addresses travel in the AT interface, so the host is updated in lock-step:
   as a downlink to that node; on a non-master it is ignored and the payload goes
   to the master anyway. The legacy single-parameter form `ATC+SEND=<hexpayload>`
   stays valid (`dest=0`).
+  In **both** modes a busy channel (CAD) is reported back as `AT_BUSY_ERROR`; the
+  host backs off and resends (see "Channel access").
 * **`ATC+REC`** appends one **source-address** byte to both response forms:
 
   ```
@@ -206,6 +208,32 @@ The master floods `DATA_DOWNLINK{ src=master, dst=target, ttl }`; the node whose
 address matches delivers it to its host and everyone else relays it one hop
 further (bounded by TTL and dedup).
 
+## Channel access (listen before talk)
+
+Every transmission is preceded by a **CAD** (channel activity detection) that is
+**forced on in firmware** -- `api.lora.psend(len, frame, true)` -- so it does not
+depend on the module's persisted `AT+CAD` setting. When CAD detects activity the
+frame is **not** put on the air (`psend` returns false).
+
+How a busy channel is handled depends on who wants the transmission:
+
+* **Module-generated traffic** (beacons, joins, claims, table floods, relays,
+  link ACKs and link retransmits) is queued and re-tried by the mesh timer. After
+  a busy verdict the drain holds off for a **randomised backoff** that starts at
+  `MESH_TX_BACKOFF_MIN_MS` and **doubles per consecutive busy attempt** up to
+  `MESH_TX_BACKOFF_MAX_MS`, resetting after a clean send. The random draw (from a
+  per-node xorshift PRNG) stops nodes that just collided from retrying in lockstep
+  on the 200 ms tick.
+* **Host-originated traffic** (`ATC+SEND`, i.e. an uplink or a master downlink) is
+  **not queued**. The frame is tried **once, immediately**: if the channel is busy
+  the AT handler returns `AT_BUSY_ERROR` and the **host owns the backoff and
+  resend**, exactly like legacy P2P mode. If the frame does go out, it is still
+  armed in the pending slot, so a lost *hop* is retried by the mesh MAC (below)
+  independently of the host.
+
+The legacy P2P `ATC+SEND` and the built-in punch auto-ACK also pass `true`, so CAD
+is checked first there too.
+
 ## MAC / link reliability
 
 Uplink unicasts are remembered in a single pending slot. A relay clears its pending
@@ -267,6 +295,7 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_EVICT_MS` | 180000 | master eviction grace |
 | `MESH_RECOVER_MS` | 10000 | master post-boot recovery window |
 | `MESH_LINK_RETRIES` | 3 | link retransmits (timeout is derived, see MAC) |
+| `MESH_TX_BACKOFF_MIN_MS` / `MESH_TX_BACKOFF_MAX_MS` | 40 / 1280 | queued-frame backoff after a busy CAD (randomised window, doubles per attempt) |
 | `MESH_DEFAULT_TTL` | 4 | max hops |
 | `MESH_NEIGHBOR_MAX` | 8 | tracked neighbours per node |
 | `MESH_PARENT_HYSTERESIS` | 1 | cost margin required to switch parent |
@@ -350,6 +379,11 @@ per-uplink ACK are proportional and set the floor.
 * **Failure / recovery**: power off a relay -> children re-attach; reboot the
   master -> nodes re-claim on the new epoch and are back within one or two beacon
   intervals. Reboot a slave -> it keeps / re-joins its address.
+* **Channel access (CAD / backoff)**: hold the channel busy with a second
+  transmitter and confirm a host `ATC+SEND` returns `AT_BUSY_ERROR` with no
+  module-side resend, while module-generated traffic (beacons, joins) keeps
+  retrying after the randomised backoff once the channel clears. Confirm CAD is
+  applied even with `AT+CAD=0` persisted (i.e. listen before talk is always on).
 * **Regression**: with mesh disabled the P2P punch / double-punch ACK+hash path is
   unchanged (and no `srcaddr` byte is added).
 

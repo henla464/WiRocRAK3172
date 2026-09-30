@@ -136,6 +136,13 @@ static bool     s_lde;                          /* low-datarate optimize (DE) */
 static uint32_t s_air_ctrl;
 static uint32_t s_air_data;
 
+/* --- Channel access (listen before talk) -------------------------------- */
+/* After a busy channel the queue drain holds off until s_tx_next_ms, drawing a
+ * fresh random window from s_tx_backoff_ms (which doubles per busy attempt). */
+static uint32_t s_tx_next_ms;                   /* earliest next drain attempt */
+static uint32_t s_tx_backoff_ms;                /* current backoff window      */
+static uint32_t s_rand_state;                   /* xorshift PRNG state         */
+
 /* Last unicast frame awaiting an implicit hop ACK (M4). */
 typedef struct {
     bool     active;
@@ -212,6 +219,12 @@ static void mesh_state_clear(void)
     s_rx_snr         = 0;
     s_air_ctrl       = 0;
     s_air_data       = 0;
+    s_tx_next_ms     = 0;
+    s_tx_backoff_ms  = MESH_TX_BACKOFF_MIN_MS;
+    s_rand_state     = 0x9E3779B9u ^ millis();  /* per-node, non-zero */
+    if (s_rand_state == 0) {
+        s_rand_state = 0x1234567u;
+    }
     memset(&s_pending, 0, sizeof(s_pending));
 
     mesh_refresh_radio_params();
@@ -248,24 +261,73 @@ static bool mesh_dedup_check(uint8_t src, uint8_t seq)
 /*  Timer-driven housekeeping                                             */
 /* ======================================================================= */
 
+/* Small xorshift PRNG: makes the retry backoff random per node so units that
+ * collided do not retry in lockstep. */
+static uint32_t mesh_rand(void)
+{
+    uint32_t x = s_rand_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    s_rand_state = x;
+    return x;
+}
+
+/* Draw a delay in [window/2, window] ms from the current backoff window. */
+static uint32_t mesh_tx_backoff_draw(void)
+{
+    uint32_t half = s_tx_backoff_ms / 2;
+    return half + (mesh_rand() % (half + 1));
+}
+
+/* Transmit one frame *now* with CAD forced on (listen before talk), whatever
+ * the module's persisted CAD setting is.  Returns false when the radio is busy
+ * or CAD found the channel busy; the caller decides whether to back off (queued
+ * mesh traffic) or report busy to the host (host-originated traffic). */
+static bool mesh_tx_radio_send(const uint8_t *frame, uint8_t len)
+{
+    mesh_header_t h;
+    uint32_t air;
+
+    if (!api.lora.psend(len, (uint8_t *)frame, true)) {
+        return false;
+    }
+    /* Overhead accounting: bucket the frame's airtime as data or control. */
+    mesh_wire_decode(frame, &h);
+    air = mesh_frame_airtime_ms(len);
+    if (h.type == MESH_TYPE_DATA_UPLINK || h.type == MESH_TYPE_DATA_DOWNLINK) {
+        s_air_data += air;
+    } else {
+        s_air_ctrl += air;
+    }
+    return true;
+}
+
 static void mesh_tx_drain(void)
 {
+    uint32_t now;
+
     if (s_txq_count == 0) {
         return;
     }
-    /* Retry next tick if the radio is busy (psend returns false). */
-    if (api.lora.psend(s_txq[s_txq_head].len, s_txq[s_txq_head].buf)) {
-        /* Overhead accounting: bucket the frame's airtime as data or control. */
-        mesh_header_t h;
-        uint32_t air = mesh_frame_airtime_ms(s_txq[s_txq_head].len);
-        mesh_wire_decode(s_txq[s_txq_head].buf, &h);
-        if (h.type == MESH_TYPE_DATA_UPLINK || h.type == MESH_TYPE_DATA_DOWNLINK) {
-            s_air_data += air;
-        } else {
-            s_air_ctrl += air;
-        }
+    now = millis();
+    if ((int32_t)(now - s_tx_next_ms) < 0) {
+        return;                             /* still in the post-busy backoff */
+    }
+    if (mesh_tx_radio_send(s_txq[s_txq_head].buf, s_txq[s_txq_head].len)) {
         s_txq_head = (uint8_t)((s_txq_head + 1) % MESH_TX_QUEUE_SIZE);
         s_txq_count--;
+        s_tx_backoff_ms = MESH_TX_BACKOFF_MIN_MS;   /* reset after a clean send */
+        return;
+    }
+    /* Channel busy: wait a randomised window (doubling per consecutive busy
+     * attempt) before trying the same frame again. */
+    s_tx_next_ms = now + mesh_tx_backoff_draw();
+    if (s_tx_backoff_ms < MESH_TX_BACKOFF_MAX_MS) {
+        s_tx_backoff_ms *= 2;
+        if (s_tx_backoff_ms > MESH_TX_BACKOFF_MAX_MS) {
+            s_tx_backoff_ms = MESH_TX_BACKOFF_MAX_MS;
+        }
     }
 }
 
@@ -969,7 +1031,6 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
     uint8_t frame[MESH_MAX_FRAME];
     uint8_t flen;
     uint8_t seq;
-    bool ok;
 
     if (len > MESH_MAX_FRAME - MESH_HEADER_SIZE) {
         return false;
@@ -987,11 +1048,17 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
     flen = mesh_build_frame(frame, MESH_TYPE_DATA_UPLINK, MESH_FLAG_ACK_REQ,
                             mesh_get_address(), s_route.parent_addr,
                             MESH_DEFAULT_TTL, seq, payload, len);
-    ok = mesh_send_frame(frame, flen);
-    if (ok) {
-        mesh_set_pending(frame, flen, mesh_get_address(), seq);
+
+    /* Host message: one immediate attempt.  If the channel is busy we return
+     * false so the host backs off and resends -- the module does not queue or
+     * retry it. */
+    if (!mesh_tx_radio_send(frame, flen)) {
+        return false;
     }
-    return ok;
+    /* It is on the air: arm the pending entry so a lost hop is still retried
+     * by the mesh MAC (implicit link ACK), independent of the host. */
+    mesh_set_pending(frame, flen, mesh_get_address(), seq);
+    return true;
 }
 
 static void mesh_deliver_to_host(const uint8_t *payload, uint8_t len, uint8_t src)
@@ -1070,7 +1137,10 @@ bool mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len)
     flen = mesh_build_frame(frame, MESH_TYPE_DATA_DOWNLINK, 0, mesh_get_address(),
                             dst, MESH_DEFAULT_TTL, seq, payload, len);
     mesh_mark_seen(MESH_TYPE_DATA_DOWNLINK, mesh_get_address(), seq, payload);
-    return mesh_send_frame(frame, flen);
+
+    /* Host-originated: one immediate attempt; a busy channel goes back to the
+     * host as a busy status (it owns the backoff / resend). */
+    return mesh_tx_radio_send(frame, flen);
 }
 
 /* Node: a downlink is flooded; the target delivers it to its host, everyone

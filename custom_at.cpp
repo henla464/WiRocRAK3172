@@ -853,7 +853,9 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
         return AT_OK;
     }
 
-    sentOK = api.lora.psend(datalen / 2, lora_data);
+    /* CAD forced on: listen before talk, whatever the module's persisted CAD
+     * setting is.  A busy channel comes back as AT_BUSY_ERROR for the host. */
+    sentOK = api.lora.psend(datalen / 2, lora_data, true);
     if (sentOK) {
         return AT_OK;
     } else {
@@ -903,7 +905,8 @@ bool send_ack(bool drf1268dsCompatMode, uint8_t channelNumber, uint8_t calculate
     digitalWrite(LED_RED_TRANSMIT, LOW);
     // indicate radio is sending
     digitalWrite(LORA_AUX, LOW);
-    bool ackSentOK = api.lora.psend(drf1268dsCompatMode ? 8:7, ackMsg);
+    /* CAD forced on (listen before talk) for the auto-ACK too. */
+    bool ackSentOK = api.lora.psend(drf1268dsCompatMode ? 8:7, ackMsg, true);
     return ackSentOK;
 }
 

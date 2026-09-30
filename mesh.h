@@ -115,6 +115,15 @@ bool    mesh_send_uplink(const uint8_t *payload, uint8_t len);
 /* --- M4 MAC / downlink -------------------------------------------------- */
 #define MESH_LINK_RETRIES        3      /* retransmits before giving up       */
 
+/* Channel access: every transmission is preceded by a CAD (listen before
+ * talk), forced on regardless of the module's persisted CAD setting.  When the
+ * channel is busy a *queued* (module-generated) frame is retried after a
+ * randomised backoff window that doubles per consecutive busy attempt.  Host
+ * messages are not queued: they are tried once and a busy channel is reported
+ * back to the host, which owns the backoff/resend. */
+#define MESH_TX_BACKOFF_MIN_MS   40     /* smallest randomised window (ms)    */
+#define MESH_TX_BACKOFF_MAX_MS   1280   /* ceiling of the doubling backoff    */
+
 /* Master only: flood a payload down to a specific node (0 on failure). */
 bool    mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len);
 
