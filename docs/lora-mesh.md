@@ -293,8 +293,8 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_BEACON_FAST_MS` | 1000 | fast beacon interval (start / after any topology change / master recovering) |
 | `MESH_BEACON_MAX_MS` | 90000 | adaptive beacon back-off ceiling (interval doubles while stable) |
 | `MESH_JOIN_INTERVAL_MS` / `MESH_JOIN_INTERVAL_MAX_MS` | 3000 / 15000 | join backoff |
-| `MESH_TABLE_INTERVAL_MS` | 60000 | ADDR_TABLE flood period |
-| `MESH_CLAIM_INTERVAL_MS` | 60000 | node safety-net re-announce |
+| `MESH_TABLE_INTERVAL_MS` | 90000 | ADDR_TABLE flood period |
+| `MESH_CLAIM_INTERVAL_MS` | 90000 | node safety-net re-announce |
 | `MESH_EVICT_MS` | 180000 | master eviction grace |
 | `MESH_RECOVER_MS` | 10000 | master post-boot recovery window |
 | `MESH_LINK_RETRIES` | 3 | link retransmits (timeout is derived, see MAC) |

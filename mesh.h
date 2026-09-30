@@ -82,7 +82,7 @@ bool    mesh_config_save(void);
 /* --- M2 join / address assignment --------------------------------------- */
 #define MESH_JOIN_INTERVAL_MS   3000    /* initial JOIN_REQ period            */
 #define MESH_JOIN_INTERVAL_MAX_MS 15000 /* JOIN_REQ backoff ceiling           */
-#define MESH_TABLE_INTERVAL_MS  60000   /* master ADDR_TABLE flood period     */
+#define MESH_TABLE_INTERVAL_MS  90000   /* master ADDR_TABLE flood period     */
 #define MESH_TABLE_MISS_LIMIT   3       /* misses before a node re-joins      */
 
 /* --- M3 tree / uplink --------------------------------------------------- */
@@ -134,7 +134,7 @@ uint32_t mesh_get_link_ack_timeout_ms(void);
 /* --- M5 recovery / robustness ------------------------------------------- */
 #define MESH_BEACON_LEN          1      /* epoch[3] | cost[5]                 */
 #define MESH_BEACON_FAST_MS      1000   /* beacon period while (re)attaching  */
-#define MESH_CLAIM_INTERVAL_MS   60000  /* node re-announces its address      */
+#define MESH_CLAIM_INTERVAL_MS   90000  /* node re-announces its address      */
 #define MESH_EVICT_MS            180000 /* master frees a silent node's addr  */
 #define MESH_RECOVER_MS          10000  /* master defers new allocs after boot*/
 
