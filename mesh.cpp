@@ -120,6 +120,7 @@ static mesh_route_neighbor_t s_neigh[MESH_NEIGHBOR_MAX];
 static mesh_route_t s_route;                    /* our route to the master    */
 static uint32_t s_beacon_next_ms;               /* next beacon transmission   */
 static uint32_t s_beacon_interval_ms;           /* adaptive beacon interval   */
+static uint32_t s_relay_last_ms;                /* last forward for a child    */
 static uint8_t  s_data_seq;                     /* rotating seq for uplink    */
 static int16_t  s_rx_rssi;                      /* last received radio metrics*/
 static int8_t   s_rx_snr;
@@ -182,6 +183,7 @@ static void mesh_refresh_radio_params(void);
 static uint32_t mesh_frame_airtime_ms(uint8_t len);
 static uint32_t mesh_link_ack_timeout_for(uint8_t len);
 static void mesh_beacon_fast(void);
+static bool mesh_is_relay(void);
 
 /* Recompute the join FSM state from the current role / address / token. */
 static void mesh_update_state(void)
@@ -214,6 +216,7 @@ static void mesh_state_clear(void)
     s_route.parent_addr = MESH_ADDR_NONE;
     s_beacon_next_ms = 0;
     s_beacon_interval_ms = MESH_BEACON_FAST_MS;  /* start fast, back off */
+    s_relay_last_ms  = millis() - MESH_RELAY_HOLD_MS;  /* a fresh node is a leaf */
     s_data_seq       = 0;
     s_rx_rssi        = 0;
     s_rx_snr         = 0;
@@ -350,7 +353,18 @@ static void mesh_timer_cb(void *)
     if ((int32_t)(now - s_beacon_next_ms) >= 0) {
         bool recovering = mesh_is_master() &&
                           (uint32_t)(now - s_boot_ms) < MESH_RECOVER_MS;
-        uint32_t interval = recovering ? MESH_BEACON_FAST_MS : s_beacon_interval_ms;
+        uint32_t interval;
+
+        if (recovering) {
+            interval = MESH_BEACON_FAST_MS;
+        } else {
+            interval = s_beacon_interval_ms;
+            /* A leaf (no children) is on nobody's path: it only needs to
+             * advertise itself as a potential parent occasionally. */
+            if (!mesh_is_master() && !mesh_is_relay()) {
+                interval *= MESH_BEACON_LEAF_MULT;
+            }
+        }
 
         mesh_emit_beacon();
         s_beacon_next_ms = now + interval;
@@ -489,6 +503,26 @@ static void mesh_beacon_fast(void)
 {
     s_beacon_interval_ms = MESH_BEACON_FAST_MS;
     s_beacon_next_ms     = 0;
+}
+
+/* A node is a relay while it has recently forwarded a rootward unicast (an
+ * uplink or a claim) addressed to it: only a node that selected us as its parent
+ * ever does that.  A childless node is a leaf and beacons more slowly. */
+static bool mesh_is_relay(void)
+{
+    return (uint32_t)(millis() - s_relay_last_ms) < MESH_RELAY_HOLD_MS;
+}
+
+/* Record that we just forwarded for a child.  On the leaf->relay transition,
+ * reset the beacon to the normal rate so the new child can track us promptly. */
+static void mesh_note_relay(void)
+{
+    bool was = mesh_is_relay();
+
+    s_relay_last_ms = millis();
+    if (!was) {
+        mesh_beacon_fast();
+    }
 }
 
 /* The master always owns MESH_MASTER_ADDR; a demoted master must rejoin. */
@@ -1107,6 +1141,7 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
     if (h->dst != mesh_get_address()) {
         return;                         /* not addressed to us */
     }
+    mesh_note_relay();                  /* a child routed through us */
     if (h->hops <= 1 || s_route.parent_addr == MESH_ADDR_NONE) {
         return;                         /* TTL exhausted / no route */
     }
@@ -1254,6 +1289,7 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
         mesh_master_apply_claim(h, payload);
         return;
     }
+    mesh_note_relay();                  /* a child routed through us */
     if (h->hops <= 1) {
         return;                         /* TTL exhausted */
     }

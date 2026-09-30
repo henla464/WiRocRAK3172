@@ -87,6 +87,13 @@ bool    mesh_config_save(void);
 
 /* --- M3 tree / uplink --------------------------------------------------- */
 #define MESH_BEACON_MAX_MS      90000   /* adaptive beacon back-off ceiling    */
+/* A *leaf* -- a joined node that no other node routes through -- is on nobody's
+ * path, so it only needs to advertise itself as a *potential* parent: it beacons
+ * at LEAF_MULT x the normal back-off.  A node counts as a *relay* while it has
+ * recently forwarded a rootward unicast (uplink / claim) addressed to it, which
+ * is the only signal that another node has selected it as its parent. */
+#define MESH_BEACON_LEAF_MULT   3       /* leaf beacon interval multiplier     */
+#define MESH_RELAY_HOLD_MS      200000  /* "recently forwarded for a child"    */
 #define MESH_NEIGHBOR_MAX       8       /* tracked neighbours per node        */
 #define MESH_DEFAULT_TTL        4       /* uplink hop limit (max 4)           */
 #define MESH_PARENT_HYSTERESIS  1       /* cost margin required to switch     */

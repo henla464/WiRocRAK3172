@@ -171,8 +171,9 @@ truth for their own address via flash (see *Recovery*).
 ## Routing and the link-quality metric
 
 All routable nodes emit a **beacon** advertising
-`path cost = link_cost(self,parent) + parent.path_cost` and their hop-count. A node
-picks as parent the neighbour minimising `link_cost + n.path_cost`.
+`path cost = link_cost(self,parent) + parent.path_cost` and their hop-count (a
+childless *leaf* advertises at a reduced rate -- see "Adaptive beacon" below). A
+node picks as parent the neighbour minimising `link_cost + n.path_cost`.
 
 **SNR is preferred to RSSI** (RSSI saturates and is dominated by the noise floor;
 SNR reflects the demodulation margin). Per-neighbour SNR is smoothed with an EWMA.
@@ -292,6 +293,8 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 |----------|---------|---------|
 | `MESH_BEACON_FAST_MS` | 1000 | fast beacon interval (start / after any topology change / master recovering) |
 | `MESH_BEACON_MAX_MS` | 90000 | adaptive beacon back-off ceiling (interval doubles while stable) |
+| `MESH_BEACON_LEAF_MULT` | 3 | a childless *leaf* beacons at this multiple of its back-off interval |
+| `MESH_RELAY_HOLD_MS` | 200000 | a node counts as a *relay* while it forwarded for a child within this window |
 | `MESH_JOIN_INTERVAL_MS` / `MESH_JOIN_INTERVAL_MAX_MS` | 3000 / 15000 | join backoff |
 | `MESH_TABLE_INTERVAL_MS` | 90000 | ADDR_TABLE flood period |
 | `MESH_CLAIM_INTERVAL_MS` | 90000 | node safety-net re-announce |
@@ -309,6 +312,21 @@ fast** on join, re-attach, parent change, epoch change or when a better candidat
 appears. Parent staleness is `3x` the *current* interval. The master keeps its
 `MESH_RECOVER_MS` fast window after boot, then backs off too. Trade-off (accepted):
 failure detection slows down once backed off.
+
+**Leaf suppression.** A **leaf** -- a joined node that no other node routes
+through -- is on nobody's path, so it only needs to advertise itself as a
+*potential* parent rather than maintain a live route. It therefore beacons at
+`MESH_BEACON_LEAF_MULT` x its back-off interval (3x, so ~270 s in steady state),
+cutting the dominant control-plane term (most nodes in a convergecast tree are
+leaves). A node is a **relay** while it has recently forwarded a rootward unicast
+(an uplink or a `ADDR_CLAIM`) **addressed to it** -- the only signal that another
+node has selected it as its parent -- for `MESH_RELAY_HOLD_MS`; relays and the
+master beacon at the full `MESH_BEACON_MAX_MS` rate. On the leaf -> relay
+transition the beacon resets to fast so the new child can track us promptly.
+Trade-off (accepted): discovering a *leaf* as a parent takes up to one leaf
+interval, so re-parenting onto a former leaf is slower (its parent-side liveness
+is unaffected -- claims make the leaf a relay's child within one interval, and
+the leaf's own 90 s claims keep it alive at the master regardless).
 
 ## Narrowband (31.25 kHz) operation
 
@@ -343,7 +361,8 @@ The overhead budget is `[header + per-uplink ACK + beacons + claims + table] / d
 airtime`. At the old defaults (5 s beacons, standalone 5-byte ACKs, 30 slaves) a
 15-byte-payload traffic pattern reached ~235% overhead at SF7 -- far above 10%. The
 M7 design changes cut this several ways: **4-bit addresses (14 slaves max)** roughly
-halve the beacon term, the **adaptive beacon** back-off cuts the steady-state beacon
+halve the beacon term, the **adaptive beacon** back-off plus **leaf suppression**
+(only relays and the master beacon at the full rate) cut the steady-state beacon
 term by the interval ratio, **frame slimming** (1-byte beacons, 2-byte ADDR_TABLE,
 header-field reuse) shrinks every control frame, the **rootward `ADDR_CLAIM`**
 keeps the claim plane `O(N)` rather than the `O(N^2)` of a flood (it floods only
