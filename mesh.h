@@ -86,7 +86,7 @@ bool    mesh_config_save(void);
 #define MESH_TABLE_MISS_LIMIT   3       /* misses before a node re-joins      */
 
 /* --- M3 tree / uplink --------------------------------------------------- */
-#define MESH_BEACON_MAX_MS      60000   /* adaptive beacon back-off ceiling    */
+#define MESH_BEACON_MAX_MS      90000   /* adaptive beacon back-off ceiling    */
 #define MESH_NEIGHBOR_MAX       8       /* tracked neighbours per node        */
 #define MESH_DEFAULT_TTL        4       /* uplink hop limit (max 4)           */
 #define MESH_PARENT_HYSTERESIS  1       /* cost margin required to switch     */
