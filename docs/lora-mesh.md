@@ -91,16 +91,22 @@ The 3-bit `type` field carries one of the following values. `MESH_TOKEN_LEN` = 1
 (the 96-bit UID); the value itself is part of the wire format and must not change
 without a version bump.
 
-| id | type | delivery | payload | purpose |
-|----|------|----------|---------|---------|
-| 0 | `BEACON` | link-local, not relayed, not deduped | `epoch[2]` + `cost[1]`; header `hops` = hop-count to master | Liveness and routing advertisement. Emitted every `MESH_BEACON_INTERVAL_MS` by the master and by any node that has a parent. Neighbours use it to select a parent and to detect a node going quiet. |
-| 1 | `JOIN_REQ` | flooded | `token[12]`; `src` = 0 | An unassigned node asks the master for an address, retrying with backoff until assigned. Because `src` is 0, it is deduped on a hash of the token instead of `(src,seq)`. |
-| 2 | `ADDR_ASSIGN` | flooded | `token[12]` + `addr[1]` | The master's answer to a `JOIN_REQ` (and its re-assertion after an `ADDR_CLAIM`). The node whose token matches adopts and persists the address. A node that sees its own address given to a *different* token relinquishes it. |
-| 3 | `ADDR_TABLE` | flooded | `occupied_bitmap[4]` (bit set = address in use; the master bit is always set) | The master periodically floods its occupied-address bitmap so nodes can reconcile. A node that sees its own bit clear for `MESH_TABLE_MISS_LIMIT` intervals relinquishes its address and re-joins. |
-| 4 | `DATA_UPLINK` | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload | A WiRoc payload travelling toward the master, carrying `ACK_REQ`. Each relay dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
-| 5 | `DATA_DOWNLINK` | flooded with `dst` = target | WiRoc payload | A WiRoc payload from the master to one specific node. The target delivers it to its host; everyone else relays it one hop further. |
-| 6 | `LINK_ACK` | broadcast (single hop) | `acked_src[1]` + `acked_seq[1]` | Explicit per-hop ACK, used only by the master (it has no next hop whose forward it could overhear, so relays rely on the implicit ACK instead). |
-| 7 | `ADDR_CLAIM` | flooded | `token[12]` + `addr[1]` | A node re-announces its flash-stored address so a restarted master can rebuild its RAM-only table. Sent on a new boot epoch, on re-attach, and periodically as a safety net. |
+| id | type | on-air size (B) | delivery | payload | purpose |
+|----|------|-----------------|----------|---------|---------|
+| 0 | `BEACON` | 6 | link-local, not relayed, not deduped | `epoch[2]` + `cost[1]`; header `hops` = hop-count to master | Liveness and routing advertisement. Emitted every `MESH_BEACON_INTERVAL_MS` by the master and by any node that has a parent. Neighbours use it to select a parent and to detect a node going quiet. |
+| 1 | `JOIN_REQ` | 15 | flooded | `token[12]`; `src` = 0 | An unassigned node asks the master for an address, retrying with backoff until assigned. Because `src` is 0, it is deduped on a hash of the token instead of `(src,seq)`. |
+| 2 | `ADDR_ASSIGN` | 16 | flooded | `token[12]` + `addr[1]` | The master's answer to a `JOIN_REQ` (and its re-assertion after an `ADDR_CLAIM`). The node whose token matches adopts and persists the address. A node that sees its own address given to a *different* token relinquishes it. |
+| 3 | `ADDR_TABLE` | 7 | flooded | `occupied_bitmap[4]` (bit set = address in use; the master bit is always set) | The master periodically floods its occupied-address bitmap so nodes can reconcile. A node that sees its own bit clear for `MESH_TABLE_MISS_LIMIT` intervals relinquishes its address and re-joins. |
+| 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the master, carrying `ACK_REQ`. Each relay dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
+| 5 | `DATA_DOWNLINK` | 3 + N | flooded with `dst` = target | WiRoc payload (N bytes) | A WiRoc payload from the master to one specific node. The target delivers it to its host; everyone else relays it one hop further. |
+| 6 | `LINK_ACK` | 5 | broadcast (single hop) | `acked_src[1]` + `acked_seq[1]` | Explicit per-hop ACK, used only by the master (it has no next hop whose forward it could overhear, so relays rely on the implicit ACK instead). |
+| 7 | `ADDR_CLAIM` | 16 | flooded | `token[12]` + `addr[1]` | A node re-announces its flash-stored address so a restarted master can rebuild its RAM-only table. Sent on a new boot epoch, on re-attach, and periodically as a safety net. |
+
+All sizes include the fixed 3-byte header. The control types (0, 1, 2, 3, 6, 7) have
+a fixed length; the two data types (4, 5) are `3 + N`, where `N` is the verbatim
+WiRoc payload (WiRoc punch payloads are typically 15 or 27 bytes, giving 18 or 30
+bytes on air). A frame cannot exceed `MESH_MAX_FRAME` = 64 bytes, so `N` ≤ 61 for
+data frames (and the control payloads above are well within that).
 
 `MESH_TYPE_COUNT` (= 8) is not a wire value: the 3-bit field encodes only `0`-`7`,
 so it is used as the "invalid / out of range" bound when validating a frame.
