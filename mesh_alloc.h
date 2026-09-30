@@ -3,7 +3,7 @@
  *
  *  Master-side slave address allocator for LoRa mesh mode.
  *
- *  Maps a node identity token (MESH_TOKEN_LEN bytes) to a 5-bit slave address
+ *  Maps a node identity token (MESH_TOKEN_LEN bytes) to a 4-bit slave address
  *  in the range [MESH_FIRST_SLAVE_ADDR .. MESH_ADDR_MAX].  The table is
  *  RAM-only (lost on reboot) per the design: nodes are the source of truth for
  *  their own address via flash and re-announce it when the master restarts.
@@ -44,7 +44,7 @@ void    mesh_alloc_free(uint8_t addr);
 /* True when `addr` is currently allocated to a slave. */
 bool    mesh_alloc_occupies(uint8_t addr);
 
-/* Pack the 32-bit occupied bitmap (master + allocated slaves) into out[4]. */
-void    mesh_alloc_bitmap(uint8_t out[4]);
+/* Pack the 16-bit occupied bitmap (master + allocated slaves) into out[2]. */
+void    mesh_alloc_bitmap(uint8_t out[2]);
 
 #endif /* INC_MESH_ALLOC_H_ */

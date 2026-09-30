@@ -8,6 +8,10 @@
  *  minimises (link cost + neighbour's advertised path cost), so an extra
  *  reliable hop is preferred over one weak link.  Switching parent requires a
  *  hysteresis margin to avoid flapping.
+ *
+ *  The link cost is a margin over the LoRa demodulation floor, which depends on
+ *  the spreading factor (not the bandwidth): SF5 ~ -2.5 dB .. SF8 ~ -10 dB.
+ *  Working in margin keeps the metric meaningful when the datarate is retuned.
  */
 
 #ifndef INC_MESH_ROUTE_H_
@@ -34,8 +38,10 @@ typedef struct {
     uint8_t self_hops;      /* our hop-count to the master                    */
 } mesh_route_t;
 
-/* Map a smoothed SNR (0.1 dB units) to a small integer link cost. */
-uint8_t mesh_route_link_cost(int16_t snr_x10);
+/* Map a smoothed SNR (0.1 dB units) to a small integer link cost, given the
+ * active spreading factor `sf` (its demodulation floor sets the reference).
+ * At SF7 this reproduces the fixed >= +5 / 0 / -5 dB thresholds. */
+uint8_t mesh_route_link_cost(int16_t snr_x10, uint8_t sf);
 
 /* Pick the parent from `count` neighbours, honouring `hysteresis` against the
  * current route `cur` (which may have `parent_addr == 0`).  `self_addr` is

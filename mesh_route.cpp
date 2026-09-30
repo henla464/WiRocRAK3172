@@ -5,12 +5,29 @@
 #include <stddef.h>
 #include "mesh_route.h"
 
-uint8_t mesh_route_link_cost(int16_t snr_x10)
+/* LoRa demodulation floor (0.1 dB units) per spreading factor.  These are the
+ * SNRs at which the PHY still decodes; the bandwidth does not change them. */
+static int16_t mesh_route_snr_floor_x10(uint8_t sf)
 {
-    if (snr_x10 >= 50)  return 1;       /* >= 5 dB  : good   */
-    if (snr_x10 >= 0)   return 2;       /* 0..5 dB  : fair   */
-    if (snr_x10 >= -50) return 3;       /* -5..0 dB : poor   */
-    return 6;                           /* < -5 dB  : avoid  */
+    switch (sf) {
+    case 5:  return -25;    /* -2.5 dB  */
+    case 6:  return -50;    /* -5.0 dB  */
+    case 7:  return -75;    /* -7.5 dB  */
+    case 8:  return -100;   /* -10.0 dB */
+    default: return -75;    /* outside the narrowband set: treat as SF7 */
+    }
+}
+
+/* Cost = f(margin over the SF's demod floor).  Thresholds 12.5/7.5/2.5 dB map
+ * to the classic >= +5 / 0 / -5 dB at SF7 and shift by +/- the floor elsewhere. */
+uint8_t mesh_route_link_cost(int16_t snr_x10, uint8_t sf)
+{
+    int32_t margin = (int32_t)snr_x10 - (int32_t)mesh_route_snr_floor_x10(sf);
+
+    if (margin >= 125) return 1;        /* >= 12.5 dB margin : good  */
+    if (margin >= 75)  return 2;        /* >=  7.5 dB margin : fair  */
+    if (margin >= 25)  return 3;        /* >=  2.5 dB margin : poor  */
+    return 6;                           /* below floor       : avoid */
 }
 
 static void mesh_route_clear(mesh_route_t *r)

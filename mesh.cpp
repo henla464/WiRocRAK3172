@@ -14,7 +14,7 @@
 
 #include <Arduino.h>
 #include <string.h>
-#include "stm32wle5xx.h"        /* UID_BASE: STM32 96-bit unique device id */
+#include "service_lora_p2p.h"   /* service_lora_p2p_get_sf()/..._get_bandwidth() */
 #include "mesh.h"
 #include "mesh_alloc.h"
 #include "mesh_route.h"
@@ -27,14 +27,15 @@
 /*  Persistent configuration                                              */
 /* ======================================================================= */
 
-/* Persistent layout (6 bytes). */
+/* Persistent layout: magic, version, flags, address, boot counter, token. */
 struct __attribute__((packed)) mesh_flash_config_t {
     uint8_t  magic;
     uint8_t  version;
     uint8_t  flags;      /* MESH_FLAG_* */
-    uint8_t  address;    /* own 5-bit address, MESH_ADDR_NONE when unassigned */
+    uint8_t  address;    /* own 4-bit address, MESH_ADDR_NONE when unassigned */
     uint16_t boot_count; /* master boot counter: bumped each boot, used as the
                           * beacon epoch so nodes detect a master restart */
+    uint8_t  token[MESH_TOKEN_LEN]; /* host-provisioned identity token */
 };
 
 static mesh_flash_config_t s_cfg;
@@ -46,6 +47,7 @@ static void mesh_config_defaults(void)
     s_cfg.flags      = 0;               /* meshing disabled, not master */
     s_cfg.address    = MESH_ADDR_NONE;
     s_cfg.boot_count = 0;
+    memset(s_cfg.token, 0, MESH_TOKEN_LEN);
 }
 
 static bool mesh_config_load(void)
@@ -104,7 +106,6 @@ static uint8_t s_dedup_idx;
 /* ======================================================================= */
 
 static mesh_state_t s_state;                    /* this node's join state     */
-static uint8_t  s_token[MESH_TOKEN_LEN];        /* device identity token      */
 static uint8_t  s_bcast_seq;                    /* rotating broadcast seq     */
 static uint32_t s_join_next_ms;                 /* next JOIN_REQ tx time      */
 static uint32_t s_join_interval_ms;             /* JOIN_REQ backoff interval  */
@@ -118,9 +119,22 @@ static uint8_t  s_table_miss;                   /* consecutive table misses   */
 static mesh_route_neighbor_t s_neigh[MESH_NEIGHBOR_MAX];
 static mesh_route_t s_route;                    /* our route to the master    */
 static uint32_t s_beacon_next_ms;               /* next beacon transmission   */
+static uint32_t s_beacon_interval_ms;           /* adaptive beacon interval   */
 static uint8_t  s_data_seq;                     /* rotating seq for uplink    */
 static int16_t  s_rx_rssi;                      /* last received radio metrics*/
 static int8_t   s_rx_snr;
+
+/* --- Radio parameters (read from the P2P driver, used for airtime maths) --- */
+static uint8_t  s_sf;                           /* active spreading factor    */
+static uint8_t  s_bw;                           /* active bandwidth index     */
+static uint8_t  s_cr;                           /* coding rate index (1..4)   */
+static uint16_t s_ppl;                          /* preamble length            */
+static bool     s_lde;                          /* low-datarate optimize (DE) */
+
+/* Control-plane overhead accounting (TX airtime, ms).  s_air_ctrl counts every
+ * non-data frame we transmit; s_air_data counts the data frames. */
+static uint32_t s_air_ctrl;
+static uint32_t s_air_data;
 
 /* Last unicast frame awaiting an implicit hop ACK (M4). */
 typedef struct {
@@ -156,10 +170,18 @@ static bool mesh_send_broadcast(uint8_t type, uint8_t hops,
 /* Defined in the M5 section below; used by the timer. */
 static void mesh_send_claim(void);
 
-/* Recompute the join FSM state from the current role / address. */
+/* Radio/beacon helpers defined further down; used by the timer. */
+static void mesh_refresh_radio_params(void);
+static uint32_t mesh_frame_airtime_ms(uint8_t len);
+static uint32_t mesh_link_ack_timeout_for(uint8_t len);
+static void mesh_beacon_fast(void);
+
+/* Recompute the join FSM state from the current role / address / token. */
 static void mesh_update_state(void)
 {
-    if (!mesh_is_enabled()) {
+    if (!mesh_is_enabled() || !mesh_has_token()) {
+        /* Without a host-provisioned token the mesh does not run: no beacons
+         * and no join attempt.  The token is how the master identifies us. */
         s_state = MESH_STATE_UNASSIGNED;
     } else if (mesh_is_master() || mesh_get_address() != MESH_ADDR_NONE) {
         s_state = MESH_STATE_JOINED;
@@ -184,10 +206,15 @@ static void mesh_state_clear(void)
     memset(&s_route, 0, sizeof(s_route));
     s_route.parent_addr = MESH_ADDR_NONE;
     s_beacon_next_ms = 0;
+    s_beacon_interval_ms = MESH_BEACON_FAST_MS;  /* start fast, back off */
     s_data_seq       = 0;
     s_rx_rssi        = 0;
     s_rx_snr         = 0;
+    s_air_ctrl       = 0;
+    s_air_data       = 0;
     memset(&s_pending, 0, sizeof(s_pending));
+
+    mesh_refresh_radio_params();
 
     /* M5 recovery state.  s_boot_epoch is *not* reset here: it is owned by
      * mesh_apply_role() and must survive an enable/disable cycle. */
@@ -228,6 +255,15 @@ static void mesh_tx_drain(void)
     }
     /* Retry next tick if the radio is busy (psend returns false). */
     if (api.lora.psend(s_txq[s_txq_head].len, s_txq[s_txq_head].buf)) {
+        /* Overhead accounting: bucket the frame's airtime as data or control. */
+        mesh_header_t h;
+        uint32_t air = mesh_frame_airtime_ms(s_txq[s_txq_head].len);
+        mesh_wire_decode(s_txq[s_txq_head].buf, &h);
+        if (h.type == MESH_TYPE_DATA_UPLINK || h.type == MESH_TYPE_DATA_DOWNLINK) {
+            s_air_data += air;
+        } else {
+            s_air_ctrl += air;
+        }
         s_txq_head = (uint8_t)((s_txq_head + 1) % MESH_TX_QUEUE_SIZE);
         s_txq_count--;
     }
@@ -237,22 +273,32 @@ static void mesh_timer_cb(void *)
 {
     uint32_t now;
 
-    if (!mesh_is_enabled()) {
+    if (!mesh_is_enabled() || !mesh_has_token()) {
         return;
     }
+    mesh_refresh_radio_params();
     mesh_tx_drain();
 
     now = millis();
 
     /* Beacons: the master and every routable node advertise periodically so
-     * neighbours can pick parents and detect a node going down. */
+     * neighbours can pick parents and detect a node going down.  The interval
+     * backs off toward MESH_BEACON_MAX_MS while stable, and is reset fast on
+     * any topology change (join, re-attach, epoch change). */
     if ((int32_t)(now - s_beacon_next_ms) >= 0) {
-        uint32_t interval = MESH_BEACON_INTERVAL_MS;
-        if (mesh_is_master() && (uint32_t)(now - s_boot_ms) < MESH_RECOVER_MS) {
-            interval = MESH_BEACON_FAST_MS; /* beacon fast while recovering */
-        }
+        bool recovering = mesh_is_master() &&
+                          (uint32_t)(now - s_boot_ms) < MESH_RECOVER_MS;
+        uint32_t interval = recovering ? MESH_BEACON_FAST_MS : s_beacon_interval_ms;
+
         mesh_emit_beacon();
         s_beacon_next_ms = now + interval;
+
+        if (!recovering && s_beacon_interval_ms < MESH_BEACON_MAX_MS) {
+            s_beacon_interval_ms *= 2;
+            if (s_beacon_interval_ms > MESH_BEACON_MAX_MS) {
+                s_beacon_interval_ms = MESH_BEACON_MAX_MS;
+            }
+        }
     }
     mesh_check_parent_staleness(now);
     mesh_pending_tick(now);
@@ -269,9 +315,9 @@ static void mesh_timer_cb(void *)
         }
         /* Periodically flood the occupied bitmap so nodes can reconcile. */
         if ((int32_t)(now - s_table_next_ms) >= 0) {
-            uint8_t bm[4];
+            uint8_t bm[2];
             mesh_alloc_bitmap(bm);
-            mesh_send_broadcast(MESH_TYPE_ADDR_TABLE, MESH_DEFAULT_TTL, bm, 4);
+            mesh_send_broadcast(MESH_TYPE_ADDR_TABLE, MESH_DEFAULT_TTL, bm, 2);
             s_table_next_ms = now + MESH_TABLE_INTERVAL_MS;
         }
     } else {
@@ -279,7 +325,7 @@ static void mesh_timer_cb(void *)
             /* Ask the master for an address, backing off between attempts. */
             if ((int32_t)(now - s_join_next_ms) >= 0) {
                 mesh_send_broadcast(MESH_TYPE_JOIN_REQ, MESH_DEFAULT_TTL,
-                                    s_token, MESH_TOKEN_LEN);
+                                    s_cfg.token, MESH_TOKEN_LEN);
                 if (s_join_interval_ms < MESH_JOIN_INTERVAL_MAX_MS) {
                     s_join_interval_ms += MESH_JOIN_INTERVAL_MS;
                     if (s_join_interval_ms > MESH_JOIN_INTERVAL_MAX_MS) {
@@ -313,18 +359,74 @@ static void mesh_timer_stop(void)
 /*  Lifecycle + accessors                                                 */
 /* ======================================================================= */
 
-/* Device identity token for address assignment (stable across reboots).
- * Uses the STM32 96-bit unique device id (UID) read straight from the device
- * registers: it is guaranteed unique per die, so no hashing is needed.
- * (api.system.chipId.get() is NOT usable here - in this RUI3 build it returns
- * the compile-time constant chip_id "stm32wle5xx", identical on every board.) */
-static void mesh_token_load(void)
-{
-    const volatile uint32_t *uid = (const volatile uint32_t *)UID_BASE;
+/* --- Radio parameters + LoRa airtime ------------------------------------ */
 
-    for (uint8_t i = 0; i < MESH_TOKEN_LEN; i++) {
-        s_token[i] = (uint8_t)(uid[i >> 2] >> ((i & 3) * 8));
+/* Bandwidth enum index (RAK) to Hz.  7 == 31.25 kHz ("32 kHz" narrowband). */
+static uint32_t mesh_bw_hz(uint8_t idx)
+{
+    switch (idx) {
+    case 0: return 125000;  case 1: return 250000;  case 2: return 500000;
+    case 3: return 7800;    case 4: return 10400;   case 5: return 15600;
+    case 6: return 20800;   case 7: return 31250;   case 8: return 41700;
+    case 9: return 62500;   default: return 125000;
     }
+}
+
+static void mesh_refresh_radio_params(void)
+{
+    s_sf  = service_lora_p2p_get_sf();
+    s_bw  = (uint8_t)service_lora_p2p_get_bandwidth();
+    s_cr  = service_lora_p2p_get_codingrate();
+    s_ppl = service_lora_p2p_get_preamlen();
+    s_lde = service_lora_p2p_get_low_datarate_optimize();
+}
+
+/* LoRa frame airtime in ms (CR 4/(4+cr), CRC on), from the active radio params.
+ * Tsym = 2^SF / BW; n = 8 + max(ceil((8L - 4SF + 28 + 16)/(4(SF - 2DE))),0)*(4+CR). */
+static uint32_t mesh_frame_airtime_ms(uint8_t len)
+{
+    uint32_t bw = mesh_bw_hz(s_bw);
+    uint32_t sf = (s_sf >= 5) ? s_sf : 7;
+    uint32_t cr = (s_cr >= 1 && s_cr <= 4) ? s_cr : 1;
+    uint64_t tsym_ns = ((uint64_t)1 << sf) * 1000000000ull / bw;
+    uint8_t  de = (s_lde || tsym_ns > 16000000ull) ? 1u : 0u;
+    int32_t  num = 8 * (int32_t)len - 4 * (int32_t)sf + 28 + 16; /* CRC on */
+    uint32_t den = 4 * (sf - 2 * de);
+    int32_t  pl = (num > 0 && den > 0) ? (num + (int32_t)den - 1) / (int32_t)den : 0;
+    uint32_t n_payload = 8 + (uint32_t)pl * (cr + 4);
+    uint32_t n_total   = (s_ppl >= 5 ? s_ppl : 8) + 4;  /* preamble + ~4.25 hdr */
+
+    return (uint32_t)(((uint64_t)(n_total + n_payload) * tsym_ns) / 1000000ull + 1u);
+}
+
+/* Implicit-ACK wait for a frame of `len` bytes: ~2x its airtime plus a tick,
+ * floored so very fast datarates still leave room for a reply. */
+static uint32_t mesh_link_ack_timeout_for(uint8_t len)
+{
+    uint32_t t = 2 * mesh_frame_airtime_ms(len) + MESH_TIMER_PERIOD_MS;
+    return (t < 500u) ? 500u : t;
+}
+
+uint32_t mesh_get_link_ack_timeout_ms(void)
+{
+    return mesh_link_ack_timeout_for((uint8_t)(MESH_HEADER_SIZE + 32));
+}
+
+uint16_t mesh_get_overhead_pct(void)
+{
+    uint64_t pct;
+    if (s_air_data == 0) {
+        return 0;
+    }
+    pct = (uint64_t)s_air_ctrl * 100u / s_air_data;
+    return (pct > 65535u) ? 65535u : (uint16_t)pct;
+}
+
+/* Reset the adaptive beacon to the fast interval (emit on the next tick). */
+static void mesh_beacon_fast(void)
+{
+    s_beacon_interval_ms = MESH_BEACON_FAST_MS;
+    s_beacon_next_ms     = 0;
 }
 
 /* The master always owns MESH_MASTER_ADDR; a demoted master must rejoin. */
@@ -358,7 +460,6 @@ bool mesh_init(void)
          * We don't force a flash write here; it happens on the first change. */
         mesh_config_defaults();
     }
-    mesh_token_load();
     mesh_state_clear();
     mesh_apply_role();
     mesh_update_state();
@@ -417,6 +518,32 @@ uint8_t mesh_get_address(void)
 void mesh_set_address(uint8_t address)
 {
     s_cfg.address = (uint8_t)(address & MESH_ADDR_MASK);
+}
+
+bool mesh_has_token(void)
+{
+    for (uint8_t i = 0; i < MESH_TOKEN_LEN; i++) {
+        if (s_cfg.token[i] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void mesh_set_token(const uint8_t *token)
+{
+    if (token != NULL) {
+        memcpy(s_cfg.token, token, MESH_TOKEN_LEN);
+    } else {
+        memset(s_cfg.token, 0, MESH_TOKEN_LEN);
+    }
+    /* A token appearing can start the join; losing it stops the mesh. */
+    mesh_update_state();
+}
+
+void mesh_get_token(uint8_t out[MESH_TOKEN_LEN])
+{
+    memcpy(out, s_cfg.token, MESH_TOKEN_LEN);
 }
 
 /* ======================================================================= */
@@ -484,18 +611,26 @@ static uint8_t mesh_build_frame(uint8_t *out, uint8_t type, uint8_t flags,
 static uint8_t mesh_token_hash8(const uint8_t token[MESH_TOKEN_LEN]);
 static void mesh_mark_seen(uint8_t type, uint8_t src, uint8_t seq, const uint8_t *payload);
 
-static bool mesh_send_broadcast(uint8_t type, uint8_t hops,
-                                const uint8_t *payload, uint8_t plen)
+/* Flood a control frame with an explicit dst (ADDR_ASSIGN carries the assigned
+ * address in the header dst; everything else uses MESH_ADDR_NONE). */
+static bool mesh_send_flood(uint8_t type, uint8_t dst, uint8_t hops,
+                            const uint8_t *payload, uint8_t plen)
 {
     uint8_t frame[MESH_MAX_FRAME];
     uint8_t seq = s_bcast_seq;
     uint8_t len;
 
-    s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x0F);
-    len = mesh_build_frame(frame, type, 0, mesh_get_address(),
-                           MESH_ADDR_NONE, hops, seq, payload, plen);
+    s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x1F);
+    len = mesh_build_frame(frame, type, 0, mesh_get_address(), dst, hops, seq,
+                           payload, plen);
     mesh_mark_seen(type, mesh_get_address(), seq, payload);
     return mesh_send_frame(frame, len);
+}
+
+static bool mesh_send_broadcast(uint8_t type, uint8_t hops,
+                                const uint8_t *payload, uint8_t plen)
+{
+    return mesh_send_flood(type, MESH_ADDR_NONE, hops, payload, plen);
 }
 
 /* Re-broadcast a flooded control frame once, decrementing the TTL. */
@@ -537,15 +672,12 @@ static void mesh_mark_seen(uint8_t type, uint8_t src, uint8_t seq, const uint8_t
     }
 }
 
-/* Flood ADDR_ASSIGN{ token, addr } so the requesting node learns its address. */
+/* Flood ADDR_ASSIGN{ token } so the requesting node learns its address.  The
+ * assigned address rides in the header `dst`, so no address byte is needed. */
 static void mesh_send_addr_assign(const uint8_t token[MESH_TOKEN_LEN], uint8_t addr)
 {
-    uint8_t out[MESH_TOKEN_LEN + 1];
-
-    memcpy(out, token, MESH_TOKEN_LEN);
-    out[MESH_TOKEN_LEN] = (uint8_t)(addr & MESH_ADDR_MASK);
-    mesh_send_broadcast(MESH_TYPE_ADDR_ASSIGN, MESH_DEFAULT_TTL,
-                        out, (uint8_t)(MESH_TOKEN_LEN + 1));
+    mesh_send_flood(MESH_TYPE_ADDR_ASSIGN, (uint8_t)(addr & MESH_ADDR_MASK),
+                    MESH_DEFAULT_TTL, token, MESH_TOKEN_LEN);
 }
 
 /* A joining node asks for an address (payload = token, flooded).  The master
@@ -573,18 +705,19 @@ static void mesh_rx_addr_assign(const mesh_header_t *h, const uint8_t *payload, 
 {
     uint8_t addr;
 
-    if (plen < MESH_TOKEN_LEN + 1) {
+    if (plen < MESH_TOKEN_LEN) {
         return;
     }
-    addr = (uint8_t)(payload[MESH_TOKEN_LEN] & MESH_ADDR_MASK);
+    addr = (uint8_t)(h->dst & MESH_ADDR_MASK);
     if (!mesh_is_master()) {
-        if (memcmp(payload, s_token, MESH_TOKEN_LEN) == 0) {
+        if (memcmp(payload, s_cfg.token, MESH_TOKEN_LEN) == 0) {
             if (addr >= MESH_FIRST_SLAVE_ADDR) {
                 if (mesh_get_address() != addr) {
                     mesh_set_address(addr);
                     mesh_config_save();
                 }
                 mesh_update_state();
+                mesh_beacon_fast();     /* announce the new attachment quickly */
             }
         } else if (addr >= MESH_FIRST_SLAVE_ADDR && addr == mesh_get_address()) {
             /* Our address was handed to a different node: relinquish it and
@@ -592,6 +725,7 @@ static void mesh_rx_addr_assign(const mesh_header_t *h, const uint8_t *payload, 
             mesh_set_address(MESH_ADDR_NONE);
             mesh_config_save();
             mesh_update_state();
+            mesh_beacon_fast();
         }
     }
     mesh_relay_flood(h, payload, plen);
@@ -602,7 +736,7 @@ static void mesh_rx_addr_table(const mesh_header_t *h, const uint8_t *payload, u
 {
     uint8_t addr = mesh_get_address();
 
-    if (plen < 4) {
+    if (plen < 2) {
         return;
     }
     if (!mesh_is_master() && addr != MESH_ADDR_NONE) {
@@ -616,6 +750,7 @@ static void mesh_rx_addr_table(const mesh_header_t *h, const uint8_t *payload, u
             mesh_set_address(MESH_ADDR_NONE);
             mesh_config_save();
             mesh_update_state();
+            mesh_beacon_fast();
         }
     }
     mesh_relay_flood(h, payload, plen);
@@ -629,7 +764,7 @@ static void mesh_rx_addr_table(const mesh_header_t *h, const uint8_t *payload, u
  * an extra reliable hop over a weak direct link (see the design notes). */
 static uint8_t mesh_link_cost(int16_t snr_x10)
 {
-    return mesh_route_link_cost(snr_x10);
+    return mesh_route_link_cost(snr_x10, s_sf);
 }
 
 static mesh_route_neighbor_t *mesh_neighbor_find(uint8_t addr)
@@ -690,11 +825,12 @@ static void mesh_select_parent(void)
 static void mesh_check_parent_staleness(uint32_t now)
 {
     uint8_t i;
+    uint32_t stale = 3u * s_beacon_interval_ms;     /* 3x the current interval */
 
     /* Drop neighbours that have gone quiet. */
     for (i = 0; i < MESH_NEIGHBOR_MAX; i++) {
         if (s_neigh[i].addr != MESH_ADDR_NONE &&
-            (uint32_t)(now - s_neigh[i].last_ms) > MESH_BEACON_STALE_MS) {
+            (uint32_t)(now - s_neigh[i].last_ms) > stale) {
             memset(&s_neigh[i], 0, sizeof(s_neigh[i]));
         }
     }
@@ -704,30 +840,29 @@ static void mesh_check_parent_staleness(uint32_t now)
         s_route.parent_addr = MESH_ADDR_NONE;
         s_had_parent = false;                   /* claim again when we re-attach */
         mesh_select_parent();
+        if (s_route.parent_addr != MESH_ADDR_NONE) {
+            mesh_beacon_fast();
+        }
     }
 }
 
 /* Emit this node's beacon: only routable nodes (master, or a node with a
- * parent) advertise, so advertised costs are always meaningful. */
+ * parent) advertise, so advertised costs are always meaningful.  The 1-byte
+ * payload packs the master epoch (3 bits) over the path cost (5 bits). */
 static void mesh_emit_beacon(void)
 {
     uint8_t payload[MESH_BEACON_LEN];
-    uint16_t epoch;
 
     if (mesh_is_master()) {
-        epoch = s_boot_epoch;
-        payload[0] = (uint8_t)(epoch & 0xFF);
-        payload[1] = (uint8_t)(epoch >> 8);
-        payload[2] = 0;                 /* master: cost 0, hops 0 */
+        payload[0] = (uint8_t)((s_boot_epoch & 0x07) << 5);     /* cost 0 */
         mesh_send_broadcast(MESH_TYPE_BEACON, 0, payload, MESH_BEACON_LEN);
         return;
     }
     if (s_route.parent_addr != MESH_ADDR_NONE) {
-        epoch = s_master_epoch;
-        payload[0] = (uint8_t)(epoch & 0xFF);
-        payload[1] = (uint8_t)(epoch >> 8);
-        payload[2] = s_route.self_cost;
-        mesh_send_broadcast(MESH_TYPE_BEACON, s_route.self_hops, payload, MESH_BEACON_LEN);
+        payload[0] = (uint8_t)(((s_master_epoch & 0x07) << 5) |
+                               (s_route.self_cost & 0x1F));
+        mesh_send_broadcast(MESH_TYPE_BEACON, s_route.self_hops, payload,
+                            MESH_BEACON_LEN);
     }
 }
 
@@ -750,6 +885,7 @@ static void mesh_note_epoch(uint16_t epoch)
     }
     if (announce && mesh_get_address() != MESH_ADDR_NONE) {
         s_claim_next_ms = 0;            /* re-announce on the next timer tick */
+        mesh_beacon_fast();
     }
 }
 
@@ -758,12 +894,13 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
     mesh_route_neighbor_t *n;
     int16_t sample;
     uint32_t now = millis();
-    uint16_t epoch;
+    uint8_t  old_parent = s_route.parent_addr;
+    uint8_t  epoch;
 
     if (h->src == mesh_get_address() || plen < MESH_BEACON_LEN) {
         return;
     }
-    epoch = (uint16_t)(payload[0] | ((uint16_t)payload[1] << 8));
+    epoch = (uint8_t)((payload[0] >> 5) & 0x07);    /* 3-bit master epoch */
     n = mesh_neighbor_obtain(h->src);
     if (n == NULL) {
         return;
@@ -775,13 +912,18 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
         sample = (int16_t)s_rx_snr * 10;
         n->snr_x10 = (int16_t)((n->snr_x10 * 3 + sample) / 4);  /* EWMA */
     }
-    n->cost      = payload[2];
+    n->cost      = (uint8_t)(payload[0] & 0x1F);
     n->hops      = h->hops;
     n->link_cost = mesh_link_cost(n->snr_x10);
     n->last_ms   = now;
 
     mesh_check_parent_staleness(now);
     mesh_select_parent();
+
+    /* A parent change (or a fresh attachment) resets the beacon to fast. */
+    if (s_route.parent_addr != old_parent) {
+        mesh_beacon_fast();
+    }
 
     /* If we re-attached after losing our parent, re-announce our address. */
     if (!mesh_is_master() && s_route.parent_addr != MESH_ADDR_NONE) {
@@ -805,7 +947,7 @@ static void mesh_set_pending(const uint8_t *frame, uint8_t len, uint8_t src, uin
     s_pending.seq     = seq;
     s_pending.retries = 0;
     s_pending.active  = true;
-    s_pending.next_ms = millis() + MESH_LINK_ACK_TIMEOUT_MS;
+    s_pending.next_ms = millis() + mesh_link_ack_timeout_for(len);
 }
 
 static void mesh_pending_tick(uint32_t now)
@@ -819,7 +961,7 @@ static void mesh_pending_tick(uint32_t now)
     }
     mesh_send_frame(s_pending.frame, s_pending.len);
     s_pending.retries++;
-    s_pending.next_ms = now + MESH_LINK_ACK_TIMEOUT_MS;
+    s_pending.next_ms = now + mesh_link_ack_timeout_for(s_pending.len);
 }
 
 bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
@@ -841,7 +983,7 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
         return false;                   /* no route yet */
     }
     seq = s_data_seq;
-    s_data_seq = (uint8_t)((s_data_seq + 1) & 0x0F);
+    s_data_seq = (uint8_t)((s_data_seq + 1) & 0x1F);
     flen = mesh_build_frame(frame, MESH_TYPE_DATA_UPLINK, MESH_FLAG_ACK_REQ,
                             mesh_get_address(), s_route.parent_addr,
                             MESH_DEFAULT_TTL, seq, payload, len);
@@ -869,17 +1011,17 @@ static void mesh_deliver_to_host(const uint8_t *payload, uint8_t len, uint8_t sr
 }
 
 /* Explicit link ACK: the master has no next hop to forward to, so it acks the
- * uplink it just delivered by (origin,seq); relays clear on the same key. */
+ * uplink it just delivered by (origin,seq); relays clear on the same key.
+ * The acked origin rides in the header `dst`, so the payload is just the seq. */
 static void mesh_send_link_ack(uint8_t acked_src, uint8_t acked_seq)
 {
     uint8_t frame[MESH_MAX_FRAME];
-    uint8_t payload[2];
+    uint8_t payload[1];
     uint8_t flen;
 
-    payload[0] = acked_src;
-    payload[1] = acked_seq;
+    payload[0] = acked_seq;
     flen = mesh_build_frame(frame, MESH_TYPE_LINK_ACK, 0, mesh_get_address(),
-                            MESH_ADDR_NONE, 0, 0, payload, 2);
+                            acked_src, 0, 0, payload, 1);
     mesh_send_frame(frame, flen);
 }
 
@@ -924,7 +1066,7 @@ bool mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len)
         return false;
     }
     seq = s_data_seq;
-    s_data_seq = (uint8_t)((s_data_seq + 1) & 0x0F);
+    s_data_seq = (uint8_t)((s_data_seq + 1) & 0x1F);
     flen = mesh_build_frame(frame, MESH_TYPE_DATA_DOWNLINK, 0, mesh_get_address(),
                             dst, MESH_DEFAULT_TTL, seq, payload, len);
     mesh_mark_seen(MESH_TYPE_DATA_DOWNLINK, mesh_get_address(), seq, payload);
@@ -950,18 +1092,15 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
 /* ======================================================================= */
 
 /* Node: re-announce our flash-stored address so a restarted master can
- * rebuild its RAM-only table (flooded, best-effort). */
+ * rebuild its RAM-only table (flooded, best-effort).  Our address is already
+ * in the header `src`; the payload is just our token. */
 static void mesh_send_claim(void)
 {
-    uint8_t payload[MESH_TOKEN_LEN + 1];
-
     if (mesh_is_master() || mesh_get_address() == MESH_ADDR_NONE) {
         return;
     }
-    memcpy(payload, s_token, MESH_TOKEN_LEN);
-    payload[MESH_TOKEN_LEN] = mesh_get_address();
     mesh_send_broadcast(MESH_TYPE_ADDR_CLAIM, MESH_DEFAULT_TTL,
-                        payload, (uint8_t)(MESH_TOKEN_LEN + 1));
+                        s_cfg.token, MESH_TOKEN_LEN);
     s_claim_next_ms = millis() + MESH_CLAIM_INTERVAL_MS;
 }
 
@@ -973,12 +1112,12 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
     uint8_t want;
     uint8_t have;
 
-    if (plen < MESH_TOKEN_LEN + 1) {
+    if (plen < MESH_TOKEN_LEN) {
         return;
     }
     if (mesh_is_master()) {
-        want = (uint8_t)(payload[MESH_TOKEN_LEN] & MESH_ADDR_MASK);
-        if (want >= MESH_FIRST_SLAVE_ADDR) {
+        want = (uint8_t)(h->src & MESH_ADDR_MASK);  /* node's own address */
+        if (want >= MESH_FIRST_SLAVE_ADDR && want <= MESH_ADDR_MAX) {
             have = mesh_alloc_lookup(payload);
             if (have == want) {
                 /* already known — nothing to do */
@@ -1053,9 +1192,9 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
         if (h.type == MESH_TYPE_DATA_UPLINK) {
             ack_src = h.src;
             ack_seq = h.seq;
-        } else if (h.type == MESH_TYPE_LINK_ACK && plen >= 2) {
-            ack_src = payload[0];
-            ack_seq = payload[1];
+        } else if (h.type == MESH_TYPE_LINK_ACK && plen >= 1) {
+            ack_src = h.dst;            /* acked origin is in the header dst */
+            ack_seq = payload[0];
         }
         if (ack_src == s_pending.src && ack_seq == s_pending.seq &&
             (h.type == MESH_TYPE_LINK_ACK || h.dst != mesh_get_address())) {

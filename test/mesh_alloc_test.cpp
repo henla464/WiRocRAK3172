@@ -30,7 +30,7 @@ int main(void)
 {
     uint8_t tA[MESH_TOKEN_LEN], tB[MESH_TOKEN_LEN], tC[MESH_TOKEN_LEN];
     uint8_t unknown[MESH_TOKEN_LEN];
-    uint8_t bm[4];
+    uint8_t bm[2];
 
     make_token(tA, 0x11);
     make_token(tB, 0x22);
@@ -70,9 +70,9 @@ int main(void)
     CHECK(bm[0] & (1u << 3));
     CHECK(bm[0] & (1u << 4));
     CHECK(!(bm[0] & (1u << 5)));
-    CHECK(bm[1] == 0 && bm[2] == 0 && bm[3] == 0);
+    CHECK(bm[1] == 0);
 
-    /* Exhaust the pool (30 slaves total; A/B/C already hold 3) -> next fails. */
+    /* Exhaust the pool (14 slaves total; A/B/C already hold 3) -> next fails. */
     for (uint16_t id = 0x40; id < 0x40 + (MESH_MAX_SLAVES - 3); id++) {
         uint8_t t[MESH_TOKEN_LEN];
         make_token(t, (uint8_t)id);

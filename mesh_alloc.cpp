@@ -121,9 +121,9 @@ void mesh_alloc_free(uint8_t addr)
     }
 }
 
-void mesh_alloc_bitmap(uint8_t out[4])
+void mesh_alloc_bitmap(uint8_t out[2])
 {
-    memset(out, 0, 4);
+    memset(out, 0, 2);
     out[MESH_MASTER_ADDR >> 3] |= (uint8_t)(1u << (MESH_MASTER_ADDR & 7));
     for (uint8_t i = 0; i < MESH_MAX_SLAVES; i++) {
         uint8_t addr = s_entries[i].addr;

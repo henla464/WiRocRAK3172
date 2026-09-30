@@ -26,6 +26,7 @@ int receive_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int mesh_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int master_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int meshtoken_handler(SERIAL_PORT port, char *cmd, stParam *param);
 void send_cb(void);
 void cad_cb(bool detect);
 void receive_cb(rui_lora_p2p_recv_t recv_data_pkg);
@@ -86,6 +87,10 @@ bool init_mesh_at(void)
 								(char *)"Get mesh state. Usage: ATC+MESHMAP=?",
 								(char *)"MESHMAP", meshmaps_handler,
 								RAK_ATCMD_PERM_READ);
+	ok &= api.system.atMode.add((char *)"MESHTOKEN",
+								(char *)"Set the 6-byte mesh identity token (12 hex chars). Usage: ATC+MESHTOKEN=<12 hex> / ATC+MESHTOKEN=?",
+								(char *)"MESHTOKEN", meshtoken_handler,
+								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
 	return ok;
 }
 
@@ -198,19 +203,57 @@ int master_handler(SERIAL_PORT port, char *cmd, stParam *param)
 }
 
 /**
+ * @brief Set/read the 6-byte mesh identity token (12 hex chars).
+ *        Usage: ATC+MESHTOKEN=<12 hex> / ATC+MESHTOKEN=?
+ *
+ *        The token is host-provisioned (e.g. from the host's own device id) and
+ *        persisted in flash.  Without a token the mesh neither starts nor joins.
+ */
+int meshtoken_handler(SERIAL_PORT port, char *cmd, stParam *param)
+{
+	if (param->argc == 1 && !strcmp(param->argv[0], "?"))
+	{
+		uint8_t token[MESH_TOKEN_LEN];
+		mesh_get_token(token);
+		atcmd_printf("%s=", cmd);
+		for (uint8_t i = 0; i < MESH_TOKEN_LEN; i++)
+		{
+			atcmd_printf("%02X", token[i]);
+		}
+		return AT_NO_STATUS;
+	}
+	else if (param->argc == 1)
+	{
+		uint8_t token[MESH_TOKEN_LEN];
+		uint32_t len = (uint32_t)strlen(param->argv[0]);
+		if (len != MESH_TOKEN_LEN * 2)
+			return AT_PARAM_ERROR;
+		if (0 != at_check_hex_param(param->argv[0], len, token))
+			return AT_PARAM_ERROR;
+		mesh_set_token(token);
+		mesh_config_save();
+		return AT_OK;
+	}
+	return AT_PARAM_ERROR;
+}
+
+/**
  * @brief Get mesh state. Usage: ATC+MESHMAP=?
  *        Returns
- *        '<enabled>:<is master>:<own address>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neigh>:<epoch>'
+ *        '<enabled>:<is master>:<own address>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neigh>:<epoch>:<overhead%>:<ackms>'
  *        where <state> is 0=unassigned 1=joining 2=joined, <alloc> is the number
  *        of addresses the master has allocated, <parent> is the current parent
  *        address (0 = none), <hops>/<cost> are the route to the master, <neigh>
- *        is the live neighbour count and <epoch> is the master boot epoch.
+ *        is the live neighbour count, <epoch> is the master boot epoch,
+ *        <overhead%> is the measured control-plane airtime as a percentage of
+ *        the data-frame airtime transmitted and <ackms> is the derived per-hop
+ *        ACK timeout (datarate dependent).
  */
 int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if ((param->argc == 1 && !strcmp(param->argv[0], "?")) || param->argc == 0)
 	{
-		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d", cmd,
+		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d", cmd,
 					 mesh_is_enabled() ? 1 : 0,
 					 mesh_is_master() ? 1 : 0,
 					 mesh_get_address(),
@@ -221,7 +264,9 @@ int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
 					 mesh_get_hops(),
 					 mesh_get_path_cost(),
 					 mesh_get_neighbor_count(),
-					 mesh_get_epoch());
+					 mesh_get_epoch(),
+					 mesh_get_overhead_pct(),
+					 (int)mesh_get_link_ack_timeout_ms());
 		return AT_NO_STATUS;
 	}
 	return AT_PARAM_ERROR;
@@ -297,12 +342,22 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 			atcmd_printf("%d:", mesh_is_enabled() ? 1 : 0);
 			atcmd_printf("%d", mesh_is_master() ? 1 : 0);
         }
+        {
+            uint8_t token[MESH_TOKEN_LEN];
+            mesh_get_token(token);
+            atcmd_printf(":");
+            for (uint8_t i = 0; i < MESH_TOKEN_LEN; i++)
+            {
+                atcmd_printf("%02X", token[i]);
+            }
+        }
         return AT_NO_STATUS;
     }
     else if (param->argc == 12
              || (param->argc == 13 && !strcmp(param->argv[12],"0"))
              || (param->argc == 14)
-             || (param->argc == 15 && !strcmp(param->argv[14],"0")))
+             || (param->argc == 15)
+             || (param->argc == 16 && !strcmp(param->argv[15],"0")))
     {
         uint32_t frequency,spreading_factor,bandwidth,coding_rate,preamble_length,
 			txpower, low_data_rate_optimize, crc_on, rxgain, drf1268dscompatmode,
@@ -314,9 +369,11 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
             o_sendack, o_fix_length_payload;
 		uint8_t o_payload_len;
         uint8_t udrv_code;
-        // Optional trailing <mesh>:<master> parameters (argc >= 14)
+        // Optional trailing <mesh>:<master>[:<token>] parameters (argc >= 14)
         bool haveMeshParams = (param->argc >= 14);
+        bool haveToken = (param->argc >= 15);
         uint32_t mesh_enabled = 0, is_master = 0;
+        uint8_t mesh_token[MESH_TOKEN_LEN] = {0};
 
         // Preserve current p2p parameters
         o_frequency = service_lora_p2p_get_freq();
@@ -368,6 +425,14 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
                 return AT_PARAM_ERROR;
             if (mesh_enabled > 1 || is_master > 1)
                 return AT_PARAM_ERROR;
+            if (haveToken)
+            {
+                uint32_t tlen = (uint32_t)strlen(param->argv[14]);
+                if (tlen != MESH_TOKEN_LEN * 2)
+                    return AT_PARAM_ERROR;
+                if (0 != at_check_hex_param(param->argv[14], tlen, mesh_token))
+                    return AT_PARAM_ERROR;
+            }
         }
 
         if ((frequency < 150e6) || (frequency > 960e6))
@@ -442,6 +507,10 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         {
             mesh_set_enabled(mesh_enabled != 0);
             mesh_set_master(is_master != 0);
+            if (haveToken)
+            {
+                mesh_set_token(mesh_token);
+            }
             mesh_config_save();
         }
 
@@ -470,7 +539,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         return at_error_code_form_udrv(udrv_code);
     }
     else if ((param->argc == 13 && !strcmp(param->argv[12],"1"))
-             || (param->argc == 15 && !strcmp(param->argv[14],"1"))) { //for runtime setting
+             || (param->argc == 16 && !strcmp(param->argv[15],"1"))) { //for runtime setting
         uint32_t frequency,spreading_factor,bandwidth,coding_rate,preamble_length,
 			txpower, low_data_rate_optimize, crc_on, rxgain, drf1268dscompatmode,
             sendack, payload_len;
@@ -479,9 +548,11 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
             o_sendack, o_fix_length_payload;
 		uint8_t o_payload_len;
         uint8_t udrv_code;
-        // Optional trailing <mesh>:<master> parameters (argc == 15)
-        bool haveMeshParams = (param->argc >= 15);
+        // Optional trailing <mesh>:<master>[:<token>] parameters (argc >= 16)
+        bool haveMeshParams = (param->argc >= 16);
+        bool haveToken = (param->argc >= 16);
         uint32_t mesh_enabled = 0, is_master = 0;
+        uint8_t mesh_token[MESH_TOKEN_LEN] = {0};
         bool o_useRuntimeConfig = get_useRuntimeConfigP2P();
         runtimeConfigP2P_t runtimeConfigP2P;
 
@@ -557,6 +628,14 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
                 return AT_PARAM_ERROR;
             if (mesh_enabled > 1 || is_master > 1)
                 return AT_PARAM_ERROR;
+            if (haveToken)
+            {
+                uint32_t tlen = (uint32_t)strlen(param->argv[14]);
+                if (tlen != MESH_TOKEN_LEN * 2)
+                    return AT_PARAM_ERROR;
+                if (0 != at_check_hex_param(param->argv[14], tlen, mesh_token))
+                    return AT_PARAM_ERROR;
+            }
         }
 
         // Compatible old SPEC for bandwidth
@@ -621,6 +700,10 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         {
             mesh_set_enabled(mesh_enabled != 0);
             mesh_set_master(is_master != 0);
+            if (haveToken)
+            {
+                mesh_set_token(mesh_token);
+            }
             mesh_config_save();
         }
 

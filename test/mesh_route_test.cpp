@@ -30,7 +30,7 @@ static void put(mesh_route_neighbor_t n[NEIGH_MAX], int i, uint8_t addr,
     n[i].snr_x10   = snr_x10;
     n[i].cost      = cost;
     n[i].hops      = hops;
-    n[i].link_cost = mesh_route_link_cost(snr_x10);
+    n[i].link_cost = mesh_route_link_cost(snr_x10, 7);
     n[i].last_ms   = 0;
 }
 
@@ -39,15 +39,31 @@ int main(void)
     mesh_route_neighbor_t n[NEIGH_MAX];
     mesh_route_t cur, out;
 
-    /* --- link-cost mapping --------------------------------------------- */
-    CHECK(mesh_route_link_cost(90)  == 1);
-    CHECK(mesh_route_link_cost(50)  == 1);
-    CHECK(mesh_route_link_cost(49)  == 2);
-    CHECK(mesh_route_link_cost(0)   == 2);
-    CHECK(mesh_route_link_cost(-1)  == 3);
-    CHECK(mesh_route_link_cost(-50) == 3);
-    CHECK(mesh_route_link_cost(-51) == 6);
-    CHECK(mesh_route_link_cost(-200)== 6);
+    /* --- link-cost mapping: SF7 reproduces the classic +5/0/-5 dB ------ */
+    CHECK(mesh_route_link_cost(90, 7)  == 1);
+    CHECK(mesh_route_link_cost(50, 7)  == 1);
+    CHECK(mesh_route_link_cost(49, 7)  == 2);
+    CHECK(mesh_route_link_cost(0, 7)   == 2);
+    CHECK(mesh_route_link_cost(-1, 7)  == 3);
+    CHECK(mesh_route_link_cost(-50, 7) == 3);
+    CHECK(mesh_route_link_cost(-51, 7) == 6);
+    CHECK(mesh_route_link_cost(-200, 7)== 6);
+
+    /* --- thresholds shift with the SF's demodulation floor -------------- */
+    /* SF5 floor -2.5 dB:  cost1 >= +10.0, cost2 >= +5.0, cost3 >= +0.0 */
+    CHECK(mesh_route_link_cost(100, 5) == 1);
+    CHECK(mesh_route_link_cost(99, 5)  == 2);
+    CHECK(mesh_route_link_cost(50, 5)  == 2);
+    CHECK(mesh_route_link_cost(49, 5)  == 3);
+    CHECK(mesh_route_link_cost(0, 5)   == 3);
+    CHECK(mesh_route_link_cost(-1, 5)  == 6);
+    /* SF8 floor -10.0 dB: cost1 >= +2.5, cost2 >= -2.5, cost3 >= -7.5 */
+    CHECK(mesh_route_link_cost(25, 8)  == 1);
+    CHECK(mesh_route_link_cost(24, 8)  == 2);
+    CHECK(mesh_route_link_cost(-25, 8) == 2);
+    CHECK(mesh_route_link_cost(-26, 8) == 3);
+    CHECK(mesh_route_link_cost(-75, 8) == 3);
+    CHECK(mesh_route_link_cost(-76, 8) == 6);
 
     /* --- prefer a good 2-hop path over a weak direct link to the master --- */
     std::memset(n, 0, sizeof(n));
