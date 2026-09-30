@@ -384,6 +384,47 @@ via `ATC+MESHMAP?` (`overhead%`). The 10% target is only
 plausible for a data-dominant, few-node, fat-payload regime -- the header and the
 per-uplink ACK are proportional and set the floor.
 
+### Control-plane occupancy
+
+The tables above are per-frame costs; these measure how much of the channel the
+**module-generated** control plane occupies by itself (no data traffic), as a
+percentage of wall-clock time -- i.e. the fraction of the time the single channel is
+busy with mesh housekeeping. They count **beacons, `ADDR_CLAIM`s and the `ADDR_TABLE`
+flood**, and exclude `LINK_ACK` (which only exists alongside an uplink) and
+application data. Everything is derived from the airtimes above and the live tunables:
+relays and the master beacon every `MESH_BEACON_MAX_MS` (90 s), a leaf every `3x` that
+(270 s); every joined node claims once per `MESH_CLAIM_INTERVAL_MS` (90 s) over `d`
+hops; the master floods `ADDR_TABLE` on the `MESH_TABLE_INTERVAL_MS` backstop (300 s),
+relayed by non-leaves only. `<slaves>` is `N` (non-master nodes); the tree is rooted at
+the master with depth `<= 4`. `F` = non-leaves incl. the master, `L` = leaves,
+`SD` = sum of node depths (= claim hops per claim round).
+
+| topology | F | L | SD |
+|---|---|---|---|
+| worst case (spine 1-2-3, the rest at depth 4) | 4 | N-3 | 4N-6 |
+| average 1.5 hops (2-level: half at depth 1, half at depth 2) | 1+N/2 | N/2 | 1.5N |
+| average 2 hops (balanced 3-level) | ~1+2N/3 | ~N/3 | ~2N |
+
+**Control-plane occupancy, % of wall-clock time (LINK_ACK and data excluded)**
+
+| topology | slaves | SF5 | SF6 | SF7 | SF8 |
+|---|---|---|---|---|---|
+| **worst case tree**        | 4  | 0.7 | 1.4 | 2.6 | 4.7 |
+|                           | 9  | 1.8 | 3.3 | 6.5 | 11.5 |
+|                           | 14 | 2.9 | 5.3 | 10.3 | 18.4 |
+| **average 1.5 hops**       | 4  | 0.5 | 0.9 | 1.7 | 3.2 |
+|                           | 9  | 1.0 | 1.9 | 3.6 | 6.6 |
+|                           | 14 | 1.6 | 2.9 | 5.6 | 10.2 |
+| **average 2 hops**         | 4  | 0.6 | 1.2 | 2.3 | 4.1 |
+|                           | 9  | 1.3 | 2.4 | 4.7 | 8.5 |
+|                           | 14 | 2.0 | 3.7 | 7.1 | 12.9 |
+
+At SF5-SF6 the idle control plane stays within a few percent even at 14 nodes. At SF8
+the deepest 14-node tree reaches 18.4%, but that is dominated by the **claim plane**:
+50 claim-hops per 90 s is ~16% on its own (beacons 2.1%, table 0.3%), so a deep
+14-node SF8 network should be avoided or the claim interval lengthened. Churn adds
+change-triggered `ADDR_TABLE` floods on top of the backstop counted here.
+
 ## Files
 
 | File | Role |
