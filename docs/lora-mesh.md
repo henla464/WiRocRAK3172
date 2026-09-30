@@ -396,10 +396,10 @@ relays and the master beacon every `MESH_BEACON_MAX_MS` (90 s), a leaf every `3x
 (270 s); every joined node claims once per `MESH_CLAIM_INTERVAL_MS` (90 s) over `d`
 hops; the master floods `ADDR_TABLE` on the `MESH_TABLE_INTERVAL_MS` backstop (300 s),
 relayed by non-leaves only. `<slaves>` is `N` (non-master nodes); the tree is rooted at
-the master with depth `<= 4`. `F` = non-leaves incl. the master, `L` = leaves,
-`SD` = sum of node depths (= claim hops per claim round).
+the master with depth `<= 4`. In the topology table below, `SD` is also the total
+number of `ADDR_CLAIM` hops per claim round.
 
-| topology | F | L | SD |
+| topology | F = non-leaves (incl. master) | L = leaves | SD = sum of node depths |
 |---|---|---|---|
 | worst case (spine 1-2-3, the rest at depth 4) | 4 | N-3 | 4N-6 |
 | average 1.5 hops (2-level: half at depth 1, half at depth 2) | 1+N/2 | N/2 | 1.5N |
@@ -409,15 +409,15 @@ the master with depth `<= 4`. `F` = non-leaves incl. the master, `L` = leaves,
 
 | topology | slaves | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
-| **worst case tree**        | 4  | 0.7 | 1.4 | 2.6 | 4.7 |
-|                           | 9  | 1.8 | 3.3 | 6.5 | 11.5 |
-|                           | 14 | 2.9 | 5.3 | 10.3 | 18.4 |
-| **average 1.5 hops**       | 4  | 0.5 | 0.9 | 1.7 | 3.2 |
-|                           | 9  | 1.0 | 1.9 | 3.6 | 6.6 |
-|                           | 14 | 1.6 | 2.9 | 5.6 | 10.2 |
-| **average 2 hops**         | 4  | 0.6 | 1.2 | 2.3 | 4.1 |
-|                           | 9  | 1.3 | 2.4 | 4.7 | 8.5 |
-|                           | 14 | 2.0 | 3.7 | 7.1 | 12.9 |
+| **worst case tree**        | 4  | 0.7% | 1.4% | 2.6% | 4.7% |
+|                           | 9  | 1.8% | 3.3% | 6.5% | 11.5% |
+|                           | 14 | 2.9% | 5.3% | 10.3% | 18.4% |
+| **average 1.5 hops**       | 4  | 0.5% | 0.9% | 1.7% | 3.2% |
+|                           | 9  | 1.0% | 1.9% | 3.6% | 6.6% |
+|                           | 14 | 1.6% | 2.9% | 5.6% | 10.2% |
+| **average 2 hops**         | 4  | 0.6% | 1.2% | 2.3% | 4.1% |
+|                           | 9  | 1.3% | 2.4% | 4.7% | 8.5% |
+|                           | 14 | 2.0% | 3.7% | 7.1% | 12.9% |
 
 At SF5-SF6 the idle control plane stays within a few percent even at 14 nodes. At SF8
 the deepest 14-node tree reaches 18.4%, but that is dominated by the **claim plane**:
