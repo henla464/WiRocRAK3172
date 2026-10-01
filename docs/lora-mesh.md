@@ -402,26 +402,26 @@ number of `ADDR_CLAIM` hops per claim round.
 
 | topology | F = non-leaves (incl. master) | L = leaves | SD = sum of node depths |
 |---|---|---|---|
-| worst case (spine 1-2-3, the rest at depth 4) | 4 | N-3 | 4N-6 |
-| average 1.5 hops (2-level: half at depth 1, half at depth 2) | 1+N/2 | N/2 | 1.5N |
+| deep tree (max uplink hops -- fewest relays) | 4 | N-3 | 4N-6 |
+| average 1.5 hops (2-level: floor(N/2) at depth 1, the rest at depth 2) | 1+floor(N/2) | ceil(N/2) | ~1.5N |
 | average 2 hops (balanced 3-level) | ~1+2N/3 | ~N/3 | ~2N |
 
 **Control-plane occupancy, % of wall-clock time (LINK_ACK and data excluded)**
 
 | topology | slaves | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
-| **worst case tree**        | 4  | 0.7% | 1.4% | 2.6% | 4.7% |
+| **deep tree**              | 4  | 0.7% | 1.4% | 2.6% | 4.7% |
 |                           | 9  | 1.8% | 3.3% | 6.5% | 11.5% |
 |                           | 14 | 2.9% | 5.3% | 10.3% | 18.4% |
 | **average 1.5 hops**       | 4  | 0.5% | 0.9% | 1.7% | 3.2% |
-|                           | 9  | 1.0% | 1.9% | 3.6% | 6.6% |
+|                           | 9  | 1.1% | 1.9% | 3.7% | 6.7% |
 |                           | 14 | 1.6% | 2.9% | 5.6% | 10.2% |
 | **average 2 hops**         | 4  | 0.6% | 1.2% | 2.3% | 4.1% |
 |                           | 9  | 1.3% | 2.4% | 4.7% | 8.5% |
-|                           | 14 | 2.0% | 3.7% | 7.1% | 12.9% |
+|                           | 14 | 2.1% | 3.8% | 7.3% | 13.3% |
 
 At SF5-SF6 the idle control plane stays within a few percent even at 14 nodes. At SF8
-the deepest 14-node tree reaches 18.4%, but that is dominated by the **claim plane**:
+the deep 14-node tree reaches 18.4%, but that is dominated by the **claim plane**:
 50 claim-hops per 90 s is ~16% on its own (beacons 2.1%, table 0.3%), so a deep
 14-node SF8 network should be avoided or the claim interval lengthened. Churn adds
 change-triggered `ADDR_TABLE` floods on top of the backstop counted here.
@@ -440,22 +440,81 @@ gives the network-wide rate below.
 
 | topology | slaves | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
-| **worst case tree**        | 4  | 145 | 81 | 45 | 25 |
+| **deep tree**              | 4  | 145 | 81 | 45 | 25 |
 |                           | 9  | 126 | 71 | 38 | 20 |
 |                           | 14 | 121 | 67 | 36 | 18 |
 | **average 1.5 hops**       | 4  | 204 | 114 | 64 | 35 |
-|                           | 9  | 134 | 74 | 41 | 22 |
+|                           | 9  | 148 | 83 | 46 | 25 |
 |                           | 14 | 107 | 59 | 32 | 17 |
 | **average 2 hops**         | 4  | 174 | 98 | 54 | 30 |
 |                           | 9  | 111 | 62 | 34 | 18 |
-|                           | 14 | 80 | 44 | 24 | 13 |
+|                           | 14 | 85 | 47 | 25 | 13 |
 
-The **downlink ACK flood dominates** once the tree has many relays: at SF8 the
-11-relay "average 2 hops" tree spends `11 x 289 ms` on that one ACK, so it carries
-*fewer* punches than the 4-relay worst-case tree despite a shorter uplink. A reverse
-source-route (the reserved `HAS_PATH`) would relay the ACK over `d_avg` hops instead
-and restore the expected ordering (more nodes -> more throughput). Retries, busy
-backoff and per-hop implicit-ACK waits make these figures upper bounds.
+The **downlink ACK flood dominates** once the tree has many relays (see below).
+Retries, busy backoff and per-hop implicit-ACK waits make these figures upper bounds.
+
+### Why the deep tree beats the balanced ones
+
+The two costs move in opposite directions, because the uplink is a **unicast** (one
+frame per hop) while the downlink ACK is a **flood** (one frame per *relay*). A
+balanced tree is shallower per node but has many more relays, so its ACK flood is
+bigger even though its uplinks are shorter. The three N=14 shapes (`r` = relay /
+non-leaf, `l` = leaf):
+
+deep tree (max uplink hops):
+
+```
+       M r
+       |
+       a r
+       |
+       b r
+       |
+       c r
+  +-+-+-+-+-+-+-+-+-+-+
+  l l l l l l l l l l l   (11 leaves)
+relays = 4 (M,a,b,c)   d_avg = 3.6
+```
+
+average 1.5 hops:
+
+```
+          M r
+  +-+-+-+-+-+-+-+
+  a b c d e f g         (7 relays at depth 1)
+  | | | | | | |
+  l l l l l l l         (7 leaves at depth 2)
+relays = 8 (M + 7)   d_avg = 1.5
+```
+
+average 2 hops:
+
+```
+            M r
+  +-+-+-+-+
+  a b c d               (4 relays at depth 1)
+  | | | | \
+  e f g h  i            (5 relays at depth 2)
+  | | | |  |
+  l l l l  l            (5 leaves at depth 3)
+relays = 10 (M + 4 + 5)   d_avg = 2.1
+```
+
+| tree | uplink unicast `d_avg x 369 ms` | `LINK_ACK` (master) | downlink ACK flood `relays x 289 ms` | exchange | punches/min |
+|---|---|---|---|---|---|
+| deep tree | 1317 ms | 246 ms | **4 x 289 = 1156 ms** | 2719 ms | **18** |
+| average 1.5 hops | 554 ms | 246 ms | **8 x 289 = 2312 ms** | 3112 ms | 17 |
+| average 2 hops | 712 ms | 246 ms | **10 x 289 = 2890 ms** | 3848 ms | **13** |
+
+(`LINK_ACK` is a single 4 B frame from the master per uplink -- 246 ms at SF8; the older
+`exchange` figures folded it in silently, which is why they exceed uplink + downlink.)
+
+So the **deep tree** is the *best* case for the downlink flood (fewest relays) even
+though it is the worst case for hops -- and for the idle control plane, where the
+claim term dominates. It is the flood, not the hop count, that caps throughput. A
+reverse source-route ACK (the reserved `HAS_PATH`) would cost `d_avg` hops instead of
+`relays` and flip the ordering back to the intuitive one (shorter tree -> more
+throughput).
 
 ## Files
 
