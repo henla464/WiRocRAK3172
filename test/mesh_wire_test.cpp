@@ -35,10 +35,10 @@ int main()
 
     /* --- Known bit vector (guards the exact bit layout) --- */
     mesh_header_t h { MESH_WIRE_VERSION, MESH_TYPE_DATA_UPLINK,
-                      MESH_FLAG_ACK_REQ, 5, 1, 2, 3 };
+                      0, 5, 1, 2, 3 };
     uint8_t b[MESH_HEADER_SIZE];
     mesh_wire_encode(b, &h);
-    assert(b[0] == 0x8A && b[1] == 0x8A && b[2] == 0x19);
+    assert(b[0] == 0x82 && b[1] == 0x8A && b[2] == 0x1A);
     std::printf("known vector: OK (%02X %02X %02X)\n", b[0], b[1], b[2]);
 
     /* --- Path length packing (4-bit addresses: ceil(n/2) bytes) --- */

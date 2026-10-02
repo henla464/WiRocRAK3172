@@ -26,7 +26,7 @@
 
 #include <stdint.h>
 
-#define MESH_WIRE_VERSION   1
+#define MESH_WIRE_VERSION   2
 #define MESH_HEADER_SIZE    3
 
 /* Message type (3 bits). Includes the count so it doubles as "invalid" bound. */
@@ -42,9 +42,10 @@ typedef enum {
     MESH_TYPE_COUNT
 } mesh_type_t;
 
-/* Header flags (2 bits). */
-#define MESH_FLAG_ACK_REQ   0x01
-#define MESH_FLAG_HAS_PATH  0x02
+/* Header flags (2 bits).  Both bits are reserved today: the master always
+ * answers a delivered uplink with an explicit LINK_ACK, so there is no
+ * per-frame "ack requested" flag. */
+#define MESH_FLAG_HAS_PATH  0x02    /* reserved: explicit source path in payload (unused) */
 
 typedef struct {
     uint8_t version;    /* 3 bits */

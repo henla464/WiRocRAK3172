@@ -1113,7 +1113,7 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
     }
     seq = s_data_seq;
     s_data_seq = (uint8_t)((s_data_seq + 1) & 0x1F);
-    flen = mesh_build_frame(frame, MESH_TYPE_DATA_UPLINK, MESH_FLAG_ACK_REQ,
+    flen = mesh_build_frame(frame, MESH_TYPE_DATA_UPLINK, 0,
                             mesh_get_address(), s_route.parent_addr,
                             MESH_DEFAULT_TTL, seq, payload, len);
 
@@ -1167,9 +1167,9 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
 
     if (mesh_is_master()) {
         mesh_deliver_to_host(payload, plen, h->src);
-        if (h->flags & MESH_FLAG_ACK_REQ) {
-            mesh_send_link_ack(h->src, h->seq);
-        }
+        /* The master has no next hop whose forward it could overhear, so it
+         * always answers the incoming hop with an explicit LINK_ACK. */
+        mesh_send_link_ack(h->src, h->seq);
         return;
     }
     if (h->dst != mesh_get_address()) {
