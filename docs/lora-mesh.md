@@ -333,11 +333,11 @@ has no neighbour at all it keeps listening until beacons return.
   routing state is node-side.
 
 **Eviction / recycling.** The master node frees the address of a node it has not heard
-from for `MESH_EVICT_MS` (660 s). A live node is refreshed well inside that window:
+from for `MESH_EVICT_MS` (610 s). A live node is refreshed well inside that window:
 either by a frame carrying its own `src`, or by any ancestor's `ADDR_ALIVE` aggregate
 (every `MESH_ALIVE_INTERVAL_MS`, 300 s) that carries its bit -- so an idle-but-alive
 node is never dropped and even a single missed aggregate is tolerated. A relay node
-drops a child that has been silent for `MESH_ALIVE_CHILD_HOLD_MS` (600 s) from its own
+drops a child that has been silent for `MESH_ALIVE_CHILD_HOLD_MS` (610 s) from its own
 aggregate, so a dead node's bit stops being reported and its ancestors' coverage
 shrinks toward the master node; the master node then evicts it after `MESH_EVICT_MS`.
 
@@ -358,8 +358,8 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_TABLE_INTERVAL_MS` | 300000 | ADDR_TABLE flood backstop period (a table change also triggers an immediate flood) |
 | `MESH_TABLE_DEBOUNCE_MS` | 500 | window that coalesces table changes into one ADDR_TABLE flood |
 | `MESH_ALIVE_INTERVAL_MS` | 300000 | node liveness **aggregate** period (must stay well under `MESH_EVICT_MS`) |
-| `MESH_ALIVE_CHILD_HOLD_MS` | 600000 | a relay node drops a child from its aggregate after this long without hearing it |
-| `MESH_EVICT_MS` | 660000 | master-node eviction grace |
+| `MESH_ALIVE_CHILD_HOLD_MS` | 610000 | a relay node drops a child from its aggregate after this long without hearing it |
+| `MESH_EVICT_MS` | 610000 | master-node eviction grace |
 | `MESH_RECOVER_MS` | 10000 | master-node post-boot recovery window |
 | `MESH_LINK_RETRIES` | 3 | link retransmits (timeout is derived, see MAC) |
 | `MESH_TX_BACKOFF_MIN_MS` / `MESH_TX_BACKOFF_MAX_MS` | 40 / 1280 | queued-frame backoff after a busy CAD (randomised window, doubles per attempt) |
