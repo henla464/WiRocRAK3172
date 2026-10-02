@@ -177,7 +177,7 @@ header is **not** repeated in the payload (header-field reuse).
 | 5 | `DATA_DOWNLINK` | 3 + N | flooded with `dst` = target (relayed by relays only) | WiRoc payload (N bytes) | A WiRoc payload from the master node to one specific node. The target delivers it to its host; any other node that has children relays it one hop further (a leaf node does not relay). |
 | 6 | `LINK_ACK` | 4 | broadcast (single hop) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, emitted only by the master node, which has no next hop whose forward it could overhear; it sends one for every `DATA_UPLINK` it delivers. Relay nodes use the implicit ACK instead. |
 | 7 | `ADDR_CLAIM` | 9 | rootward unicast (flood fallback) | `devid[6]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted master node can rebuild its RAM-only table. **Event-driven** -- sent on a new boot epoch, on boot, and on re-attach, never on a timer. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead. |
-| 8 | `ADDR_ALIVE` | 3 | rootward unicast (flood fallback) | none; **own address already in header `src`** | Periodic liveness keepalive so the master node does not evict a deep idle node (whose beacon is link-local and never reaches it). **Header-only**, so it costs one 3-byte frame per hop; sent rootward like a claim while the node holds a parent. The master node books liveness from the header `src` and discards it. |
+| 8 | `ADDR_ALIVE` | 5 | single hop to the parent (absorbed, never forwarded) | `subtree_bitmap[2]` (16-bit; bit `a` = "address `a` is alive in my subtree") | Periodic liveness **aggregate**, so the master node does not evict a deep idle node (whose beacon is link-local and never reaches it). Each node sets its own bit and ORs in the last bitmap reported by each of its children, so **one frame per node covers its whole subtree**; the parent absorbs it and does not forward it, so a round costs one single-hop frame per node (independent of tree depth) and the union of the master node's direct children's bitmaps covers every non-master node each round. The master node refreshes last-heard for **every** set bit. Sent while the node holds a parent. |
 
 All sizes include the fixed 3-byte header. The control types (0, 1, 2, 3, 6, 7, 8) have
 a fixed length; the two data types (4, 5) are `3 + N`, where `N` is the verbatim
@@ -314,13 +314,18 @@ has no neighbour at all it keeps listening until beacons return.
   cost is `O(hops)` per claim rather than the `O(N)` of a flood. Only a node with
   no route yet (just booted / parent lost), or a relay node that has lost its own
   parent, falls back to flooding it.
-* **Liveness is a separate, cheaper message.** A deep idle node's beacon is
-  link-local, so it would otherwise go unheard at the master node; the node instead
-  sends a **header-only** `ADDR_ALIVE` keepalive rootward every
-  `MESH_ALIVE_INTERVAL_MS` (300 s). It carries no payload -- the address is already
-  the header `src` -- so it costs one 3-byte frame per hop, far below the 9-byte
-  claim. (Splitting liveness from the claim is what lets the claim be event-driven
-  and payload-free keepalives be aggregated later.)
+* **Liveness is a separate, cheaper message, and it is aggregated.** A deep idle
+  node's beacon is link-local, so it would otherwise go unheard at the master node;
+  the node instead sends an `ADDR_ALIVE` **subtree aggregate** to its parent every
+  `MESH_ALIVE_INTERVAL_MS` (300 s). The 2-byte payload is a bitmap of the
+  addresses alive in that node's subtree: the node sets its own bit and ORs in the
+  last bitmap each child reported. The parent **absorbs** the frame (it is a single
+  hop, never forwarded) and, if it is a relay node, folds it into its own next
+  aggregate; the master node refreshes last-heard for **every** set bit. So one
+  frame per node covers a whole subtree and the liveness plane costs `O(N)`
+  single-hop frames per round -- independent of tree depth, unlike the old
+  per-hop keepalive. (Splitting liveness from the claim is what lets the claim be
+  event-driven and the liveness be aggregated.)
 * The master node rebuilds its table from the claims: it adopts the claimed address when
   free, re-asserts its own assignment when the node device id is already known, and
   hands out a fresh address when the claimed one is already taken.
@@ -328,10 +333,13 @@ has no neighbour at all it keeps listening until beacons return.
   routing state is node-side.
 
 **Eviction / recycling.** The master node frees the address of a node it has not heard
-from for `MESH_EVICT_MS` (660 s). A live node's periodic `ADDR_ALIVE` (every
-`MESH_ALIVE_INTERVAL_MS`, 300 s) refreshes the master node's last-heard time well inside
-that window, so an idle-but-alive node is never dropped and even a single missed
-keepalive is tolerated.
+from for `MESH_EVICT_MS` (660 s). A live node is refreshed well inside that window:
+either by a frame carrying its own `src`, or by any ancestor's `ADDR_ALIVE` aggregate
+(every `MESH_ALIVE_INTERVAL_MS`, 300 s) that carries its bit -- so an idle-but-alive
+node is never dropped and even a single missed aggregate is tolerated. A relay node
+drops a child that has been silent for `MESH_ALIVE_CHILD_HOLD_MS` (600 s) from its own
+aggregate, so a dead node's bit stops being reported and its ancestors' coverage
+shrinks toward the master node; the master node then evicts it after `MESH_EVICT_MS`.
 
 **Duplicate addresses.** If a node hears its own address handed to a different node
 device id it relinquishes it and re-joins, so no duplicate address can persist.
@@ -345,11 +353,12 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_BEACON_FAST_MS` | 1000 | fast beacon interval (start / after any topology change / master node recovering) |
 | `MESH_BEACON_MAX_MS` | 90000 | adaptive beacon back-off ceiling (interval doubles while stable) |
 | `MESH_BEACON_LEAF_MULT` | 3 | a leaf node beacons at this multiple of its back-off interval |
-| `MESH_RELAY_HOLD_MS` | 200000 | a node counts as a relay node while it forwarded for a child within this window |
+| `MESH_RELAY_HOLD_MS` | 400000 | a node counts as a relay node while a child declared itself to it within this window (>= `MESH_ALIVE_INTERVAL_MS` so liveness aggregates keep it refreshed) |
 | `MESH_JOIN_INTERVAL_MS` / `MESH_JOIN_INTERVAL_MAX_MS` | 3000 / 15000 | join backoff |
 | `MESH_TABLE_INTERVAL_MS` | 300000 | ADDR_TABLE flood backstop period (a table change also triggers an immediate flood) |
 | `MESH_TABLE_DEBOUNCE_MS` | 500 | window that coalesces table changes into one ADDR_TABLE flood |
-| `MESH_ALIVE_INTERVAL_MS` | 300000 | node liveness keepalive period (must stay well under `MESH_EVICT_MS`) |
+| `MESH_ALIVE_INTERVAL_MS` | 300000 | node liveness **aggregate** period (must stay well under `MESH_EVICT_MS`) |
+| `MESH_ALIVE_CHILD_HOLD_MS` | 600000 | a relay node drops a child from its aggregate after this long without hearing it |
 | `MESH_EVICT_MS` | 660000 | master-node eviction grace |
 | `MESH_RECOVER_MS` | 10000 | master-node post-boot recovery window |
 | `MESH_LINK_RETRIES` | 3 | link retransmits (timeout is derived, see MAC) |
@@ -370,15 +379,16 @@ through -- is on nobody's path, so it only needs to advertise itself as a
 *potential* parent rather than maintain a live route. It therefore beacons at
 `MESH_BEACON_LEAF_MULT` x its back-off interval (3x, so ~270 s in steady state),
 cutting the dominant control-plane term (most nodes in a convergecast tree are
-leaf nodes). A node is a **relay node** while it has recently forwarded a rootward unicast
-(an uplink, a claim or a keepalive) **addressed to it** -- the only signal that another
-node has selected it as its parent -- for `MESH_RELAY_HOLD_MS`; relay nodes and the
+leaf nodes). A node is a **relay node** while a child declared itself to it **addressed
+to it** within `MESH_RELAY_HOLD_MS` -- via a rootward unicast (uplink / claim), a
+liveness aggregate, or that child's own beacon (the only signal that another node has
+selected it as its parent); relay nodes and the
 master node beacon at the full `MESH_BEACON_MAX_MS` rate. On the leaf-node -> relay-node
 transition the beacon resets to fast so the new child can track us promptly.
 Trade-off (accepted): discovering a leaf node as a parent takes up to one leaf-node
 interval, so re-parenting onto a former leaf node is slower (its parent-side liveness
-is unaffected -- the leaf node's own rootward keepalives keep it alive at the relay
-node within one interval, and at the master node regardless).
+is unaffected -- the leaf node's own `ADDR_ALIVE` aggregate keeps it alive at the relay
+node within one interval, and at the master node -- via that relay node -- regardless).
 
 **Flood relay.** A flood is re-broadcast once per receiving node (deduped on
 `(src,seq)`), so one flood costs one transmission per relay node. Floods whose
@@ -388,7 +398,7 @@ node with no children has no downstream node, so its re-broadcast reaches nobody
 that has not already seen the frame, while the routing tree guarantees every
 attached node still receives the flood from its own parent. Floods that must
 reach an **unattached** node -- `JOIN_REQ`, `ADDR_ASSIGN` and the flooded
-`ADDR_CLAIM` fallback (and, defensively, any flooded `ADDR_ALIVE`) -- are still relayed by
+`ADDR_CLAIM` fallback -- are still relayed by
 **every node**, because the target may
 not yet have a parent whose forward it could rely on.
 
@@ -412,7 +422,7 @@ For the v3 frame sizes (CR 4/5, preamble 8, CRC on), approximate airtimes in ms 
 | BEACON | 4 | 36 | 72 | 123 | 246 |
 | LINK_ACK | 4 | 36 | 72 | 123 | 246 |
 | ADDR_TABLE | 5 | 41 | 72 | 123 | 246 |
-| ADDR_ALIVE | 3 | 36 | 62 | 123 | 246 |
+| ADDR_ALIVE | 5 | 41 | 72 | 123 | 246 |
 | JOIN_REQ / ADDR_ASSIGN / ADDR_CLAIM | 9 | 46 | 82 | 164 | 287 |
 | DATA (15 B payload) | 18 | 67 | 113 | 205 | 369 |
 | DATA (7 B payload) | 10 | 52 | 93 | 165 | 289 |
@@ -424,14 +434,16 @@ preamble, so *fewer, larger frames beat many small frames* -- and the **proporti
 terms (the 3-byte header and the per-uplink ACK) never amortise, while only the
 **fixed-rate** control terms do.
 
-The overhead budget is `[header + per-uplink ACK + beacons + keepalives + table] / data
+The overhead budget is `[header + per-uplink ACK + beacons + liveness + table] / data
 airtime`. The design cuts it several ways: **4-bit addresses (14 non-master nodes max)** roughly
 halve the beacon term, the **adaptive beacon** back-off plus **leaf suppression**
 (only relay nodes and the master node beacon at the full rate) cut the steady-state beacon
 term by the interval ratio, **frame slimming** (1-byte beacons, 2-byte ADDR_TABLE,
-header-only keepalives, header-field reuse) shrinks every control frame, the
-**rootward `ADDR_CLAIM` / `ADDR_ALIVE`** keeps the liveness plane `O(N)` rather than the
-`O(N^2)` of a flood (they flood only when a node is route-less), and the host can
+header-field reuse) shrinks every control frame, the **rootward `ADDR_CLAIM`** reaches
+the master node hop-by-hop (flooding only when a node is route-less) instead of the
+`O(N)` of a flood, and the **aggregated `ADDR_ALIVE`** collapses per-node liveness into
+one single-hop subtree bitmap per node, so the liveness plane is `O(N)` transmissions
+per round independent of tree depth. The host can
 **measure** the resulting ratio live via `ATC+MESHMAP?` (`overhead%`). The header and
 the per-uplink ACK are proportional terms (one per data frame), so they set a floor on
 this ratio.
@@ -441,18 +453,28 @@ this ratio.
 The tables above are per-frame costs; these measure how much of the channel the
 **module-generated** control plane occupies by itself (no data traffic), as a
 percentage of wall-clock time -- i.e. the fraction of the time the single channel is
-busy with mesh housekeeping. They count **beacons, `ADDR_ALIVE` keepalives and the
+busy with mesh housekeeping. They count **beacons, `ADDR_ALIVE` aggregates and the
 `ADDR_TABLE` flood**, and exclude `LINK_ACK` (which only exists alongside an uplink) and
 application data. `ADDR_CLAIM`s are event-driven and contribute negligibly in steady
 state, so they are not counted. Everything is derived from the airtimes above and the
-live tunables:
-relay nodes and the master node beacon every `MESH_BEACON_MAX_MS` (90 s), a leaf node every `3x` that
-(270 s); every joined node sends a header-only `ADDR_ALIVE` once per
-`MESH_ALIVE_INTERVAL_MS` (300 s) over `d`
-hops; the master node floods `ADDR_TABLE` on the `MESH_TABLE_INTERVAL_MS` backstop (300 s),
-relayed by non-leaf nodes only. `<nodes>` is `N` (non-master nodes); the tree is rooted at
-the master node with depth `<= 4`. In the topology table below, `SD` is also the total
-number of `ADDR_ALIVE` hops per liveness round.
+live tunables: relay nodes and the master node beacon every `MESH_BEACON_MAX_MS` (90 s),
+a leaf node every `3x` that (270 s); every non-master node sends a single-hop `ADDR_ALIVE`
+aggregate (5 B) once per `MESH_ALIVE_INTERVAL_MS` (300 s) -- **one frame per node,
+independent of depth**; the master node floods `ADDR_TABLE` on the
+`MESH_TABLE_INTERVAL_MS` backstop (300 s), relayed by non-leaf nodes only. `<nodes>` is
+`N` (non-master nodes); the tree is rooted at the master node with depth `<= 4`.
+
+With `B4` = airtime of a 4 B beacon, `A5` = airtime of a 5 B `ADDR_ALIVE`, `T5` = airtime
+of a 5 B `ADDR_TABLE`, and `F` / `L` the non-leaf / leaf counts:
+
+```
+beacon%   = F*B4/900  + L*B4/2700
+liveness% = N*A5/3000            (one single-hop aggregate per non-master node)
+table%    = F*T5/3000            (master flood + one relay per non-leaf node)
+```
+
+`SD` below is the sum of node depths (the uplink hop-cost); unlike the old per-hop
+keepalive, liveness no longer scales with it.
 
 | topology | F = non-leaf nodes (incl. master node) | L = leaf nodes | SD = sum of node depths |
 |---|---|---|---|
@@ -464,29 +486,31 @@ number of `ADDR_ALIVE` hops per liveness round.
 
 | topology | nodes | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
-| **deep tree**              | 4  | 0.3% | 0.6% | 1.2% | 2.3% |
-|                           | 9  | 0.7% | 1.2% | 2.2% | 4.4% |
-|                           | 14 | 1.0% | 1.7% | 3.3% | 6.5% |
-| **average 1.5 hops**       | 4  | 0.3% | 0.5% | 0.9% | 1.7% |
-|                           | 9  | 0.5% | 0.9% | 1.7% | 3.4% |
+| **deep tree**              | 4  | 0.3% | 0.5% | 0.9% | 1.8% |
+|                           | 9  | 0.4% | 0.8% | 1.4% | 2.7% |
+|                           | 14 | 0.6% | 1.0% | 1.8% | 3.6% |
+| **average 1.5 hops**       | 4  | 0.2% | 0.5% | 0.8% | 1.6% |
+|                           | 9  | 0.5% | 0.9% | 1.5% | 3.0% |
+|                           | 14 | 0.7% | 1.4% | 2.3% | 4.6% |
+| **average 2 hops**         | 4  | 0.3% | 0.5% | 0.9% | 1.8% |
+|                           | 9  | 0.5% | 1.0% | 1.7% | 3.5% |
 |                           | 14 | 0.8% | 1.5% | 2.6% | 5.2% |
-| **average 2 hops**         | 4  | 0.3% | 0.6% | 1.1% | 2.2% |
-|                           | 9  | 0.6% | 1.2% | 2.1% | 4.2% |
-|                           | 14 | 1.0% | 1.8% | 3.2% | 6.4% |
 
-The idle control plane stays within a few percent at SF5-SF6 even at 14 nodes, and even
-at SF8 the worst cell -- the deep 14-node tree -- reaches only 6.5%. That cell is still
-liveness-dominated (keepalives 4.1%, beacons 2.1%, table 0.3%), which is why the
-keepalive interval is the lever that keeps it down. Churn adds change-triggered
-`ADDR_TABLE` floods on top of the backstop counted here.
+The idle control plane stays within a few percent even at SF8. The worst cell -- the
+average-2-hop 14-node tree -- reaches 5.2%, now **beacon-dominated** (beacons 3.2%,
+table 0.8%, liveness 1.1%); aggregation made the liveness term `O(N)` and depth-free, so
+the adaptive/leaf beacon back-off is the remaining lever on the worst case. Churn adds
+change-triggered `ADDR_TABLE` floods on top of the backstop counted here.
 
 **Control-plane target.** The design goal is that this module-generated traffic
-(beacons, keepalives and the table flood -- everything counted here) stays **under 10%
+(beacons, liveness aggregates and the table flood -- everything counted here) stays
+**under 10%
 of total wall-clock time**. `LINK_ACK` is deliberately excluded from both the
 target and the table: it is a per-uplink cost that scales with data traffic, not a
-fixed control-plane load. At the 300 s keepalive interval the target holds for **every
-topology up to 14 nodes across the whole SF5-SF8 range** (worst cell: the deep
-14-node tree at SF8, 6.5%).
+fixed control-plane load. At the 300 s liveness-aggregate interval the target holds for
+**every
+topology up to 14 nodes across the whole SF5-SF8 range** (worst cell: the
+average-2-hop 14-node tree at SF8, 5.2%).
 
 ### Punch throughput
 

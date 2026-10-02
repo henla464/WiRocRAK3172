@@ -164,10 +164,16 @@ static uint16_t s_boot_epoch;       /* master: this boot's epoch              */
 static uint16_t s_master_epoch;     /* node: last epoch heard (0 = unknown)   */
 static bool     s_epoch_valid;      /* node: s_master_epoch is meaningful      */
 static bool     s_claim_due;        /* node: an ADDR_CLAIM is pending (event)  */
-static uint32_t s_alive_next_ms;    /* node: next periodic liveness keepalive  */
+static uint32_t s_alive_next_ms;    /* node: next periodic liveness aggregate  */
 static bool     s_had_parent;       /* node: had a parent on the previous tick*/
 static uint32_t s_boot_ms;          /* master: uptime reference for RECOVER   */
 static uint32_t s_heard_ms[MESH_ADDR_MAX + 1]; /* master: last frame per addr  */
+/* Step-2 liveness aggregation: per-child subtree bitmap (bit a = "address a is
+ * alive in that child's subtree") plus the last time we heard that child.  A
+ * child is current while s_child_heard_ms[addr] is within MESH_ALIVE_CHILD_HOLD_MS;
+ * heard_ms == 0 means "not a child".  Indexed by address (2..15). */
+static uint16_t s_child_bm[MESH_ADDR_MAX + 1];      /* last subtree bitmap      */
+static uint32_t s_child_heard_ms[MESH_ADDR_MAX + 1];/* last heard as our child */
 
 /* Defined in the M3 section below; used by the timer. */
 static void mesh_emit_beacon(void);
@@ -246,6 +252,8 @@ static void mesh_state_clear(void)
     s_had_parent     = false;
     s_boot_ms        = millis();
     memset(s_heard_ms, 0, sizeof(s_heard_ms));
+    memset(s_child_bm, 0, sizeof(s_child_bm));
+    memset(s_child_heard_ms, 0, sizeof(s_child_heard_ms));
 
     mesh_alloc_reset();
     s_table_ver_seen = mesh_alloc_version();    /* no pending flood after reset */
@@ -390,8 +398,9 @@ static void mesh_timer_cb(void *)
 
     if (mesh_is_master()) {
         /* Recycle the address of a node we have not heard from for a long
-         * time (its periodic ADDR_ALIVE, or any other frame, refreshes
-         * s_heard_ms, so a live-but-idle node is never evicted). */
+         * time (any frame carrying its src, or an ancestor's liveness aggregate
+         * that reports its bit, refreshes s_heard_ms, so a live-but-idle node is
+         * never evicted). */
         for (uint8_t a = MESH_FIRST_SLAVE_ADDR; a <= MESH_ADDR_MAX; a++) {
             if (mesh_alloc_occupies(a) &&
                 (uint32_t)(now - s_heard_ms[a]) > MESH_EVICT_MS) {
@@ -441,8 +450,8 @@ static void mesh_timer_cb(void *)
                 mesh_send_claim();
                 s_claim_due = false;
             }
-            /* Periodic liveness: a header-only keepalive a deep idle node would
-             * otherwise never refresh at the master (its beacon is link-local).
+            /* Periodic liveness: a subtree aggregate a deep idle node would
+             * otherwise never get to the master (its beacon is link-local).
              * Rate is set by MESH_ALIVE_INTERVAL_MS, which the eviction window
              * (MESH_EVICT_MS) must stay comfortably above. */
             if ((int32_t)(now - s_alive_next_ms) >= 0) {
@@ -537,21 +546,32 @@ static void mesh_beacon_fast(void)
     s_beacon_next_ms     = 0;
 }
 
-/* A node is a relay while it has recently forwarded a rootward unicast (an
- * uplink or a claim) addressed to it: only a node that selected us as its parent
- * ever does that.  A childless node is a leaf and beacons more slowly. */
+/* A node is a relay while a child has recently declared itself to us: a
+ * rootward unicast (uplink or claim) addressed to us, a periodic ADDR_ALIVE
+ * aggregate addressed to us, or a beacon from a child we already know.  Only a
+ * node that selected us as its parent ever does that.  A childless node is a
+ * leaf and beacons more slowly. */
 static bool mesh_is_relay(void)
 {
     return (uint32_t)(millis() - s_relay_last_ms) < MESH_RELAY_HOLD_MS;
 }
 
-/* Record that we just forwarded for a child.  On the leaf->relay transition,
- * reset the beacon to the normal rate so the new child can track us promptly. */
-static void mesh_note_relay(void)
+/* Record that a child just routed through us: refresh its liveness/bitmap entry
+ * and our relay status.  `child` is the child's address (the header `src` of the
+ * rootward unicast or liveness aggregate it sent us).  On the leaf->relay
+ * transition, reset the beacon to the normal rate so the new child can track us
+ * promptly. */
+static void mesh_note_relay(uint8_t child)
 {
     bool was = mesh_is_relay();
 
     s_relay_last_ms = millis();
+    if (child >= MESH_FIRST_SLAVE_ADDR && child <= MESH_ADDR_MAX) {
+        if (s_child_heard_ms[child] == 0) {
+            s_child_bm[child] = (uint16_t)(1u << child); /* at least itself */
+        }
+        s_child_heard_ms[child] = millis();
+    }
     if (!was) {
         mesh_beacon_fast();
     }
@@ -1060,6 +1080,15 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
     n->link_cost = mesh_link_cost(n->snr_x10);
     n->last_ms   = now;
 
+    /* A beacon from a child we already know proves it is still alive and still
+     * routing through us, so refresh its liveness/relay timestamps.  Set
+     * s_relay_last_ms directly (not via mesh_note_relay) so a periodic child
+     * beacon never resets our own beacon back-off. */
+    if (h->src >= MESH_FIRST_SLAVE_ADDR && s_child_heard_ms[h->src] != 0) {
+        s_child_heard_ms[h->src] = now;
+        s_relay_last_ms          = now;
+    }
+
     mesh_check_parent_staleness(now);
     mesh_select_parent();
 
@@ -1188,7 +1217,7 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
     if (h->dst != mesh_get_address()) {
         return;                         /* not addressed to us */
     }
-    mesh_note_relay();                  /* a child routed through us */
+    mesh_note_relay(h->src);            /* a child routed through us */
     if (h->hops <= 1 || s_route.parent_addr == MESH_ADDR_NONE) {
         return;                         /* TTL exhausted / no route */
     }
@@ -1281,7 +1310,8 @@ static void mesh_master_apply_claim(const mesh_header_t *h, const uint8_t *paylo
  * flood so a route-less node is still discoverable.  Best-effort either way.
  *
  * Claims are event-driven (boot, epoch change, re-attach); the recurring
- * rootward traffic is the far smaller ADDR_ALIVE keepalive (mesh_send_alive). */
+ * rootward traffic is the far cheaper single-hop ADDR_ALIVE aggregate
+ * (mesh_send_alive). */
 static void mesh_send_claim(void)
 {
     uint8_t frame[MESH_MAX_FRAME];
@@ -1305,23 +1335,31 @@ static void mesh_send_claim(void)
         mesh_send_frame(frame, flen);
     }
     /* The claim is itself a liveness signal; don't follow it immediately with
-     * a redundant keepalive. */
+     * a redundant aggregate. */
     s_alive_next_ms = millis() + MESH_ALIVE_INTERVAL_MS;
 }
 
-/* Node: periodic liveness keepalive.  Header-only (no payload): the address is
- * already in the header `src`, and the master books liveness from any frame
- * carrying that src.  A rootward unicast to the parent, same discipline as the
- * claim, so the cost is O(hops) and only the master ends up holding it.  Only
- * sent once we hold a parent -- a route-less node re-attaches (and re-claims)
- * instead. */
+/* Node: periodic liveness **aggregate**.  A single-hop unicast to our parent
+ * carrying a 2-byte subtree bitmap (bit a = "address a is alive in our
+ * subtree").  We set our own bit and OR in the last bitmap reported by every
+ * current child, so one frame per node covers the whole subtree -- the parent
+ * absorbs it (never forwards it), and the union of the master's direct children
+ * therefore covers every non-master node each round.  Cost is O(N) single-hop
+ * frames per round, independent of tree depth.  A child is "current" while we
+ * heard it within MESH_ALIVE_CHILD_HOLD_MS (refreshed by its aggregate, claim,
+ * uplink or beacon), so a dead child's bits eventually clear and the master can
+ * evict.  Only sent once we hold a parent -- a route-less node re-attaches (and
+ * re-claims) instead. */
 static void mesh_send_alive(void)
 {
-    uint8_t frame[MESH_MAX_FRAME];
-    uint8_t flen;
-    uint8_t seq;
+    uint8_t  frame[MESH_MAX_FRAME];
+    uint8_t  flen;
+    uint8_t  seq;
+    uint8_t  payload[2];
+    uint16_t bm;
+    uint32_t now = millis();
 
-    s_alive_next_ms = millis() + MESH_ALIVE_INTERVAL_MS;
+    s_alive_next_ms = now + MESH_ALIVE_INTERVAL_MS;
 
     if (mesh_is_master() || mesh_get_address() == MESH_ADDR_NONE) {
         return;
@@ -1329,23 +1367,35 @@ static void mesh_send_alive(void)
     if (s_state != MESH_STATE_JOINED || s_route.parent_addr == MESH_ADDR_NONE) {
         return;                         /* re-attaching: the claim path covers us */
     }
+    bm = (uint16_t)(1u << mesh_get_address());
+    for (uint8_t a = MESH_FIRST_SLAVE_ADDR; a <= MESH_ADDR_MAX; a++) {
+        if (a == mesh_get_address() || s_child_heard_ms[a] == 0) {
+            continue;
+        }
+        if ((uint32_t)(now - s_child_heard_ms[a]) <= MESH_ALIVE_CHILD_HOLD_MS) {
+            bm |= s_child_bm[a];
+        }
+    }
+    payload[0] = (uint8_t)(bm & 0xFF);
+    payload[1] = (uint8_t)(bm >> 8);
     seq = s_bcast_seq;
     s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x1F);
     flen = mesh_build_frame(frame, MESH_TYPE_ALIVE, 0,
                             mesh_get_address(), s_route.parent_addr,
-                            MESH_DEFAULT_TTL, seq, NULL, 0);
+                            MESH_DEFAULT_TTL, seq, payload, 2);
     mesh_send_frame(frame, flen);
 }
 
 /* Forward a rootward message one hop toward our parent (or convert it to a
- * flood if we have lost our parent).  Shared by ADDR_CLAIM and ADDR_ALIVE. */
+ * flood if we have lost our parent).  Used by ADDR_CLAIM only: an ADDR_ALIVE is
+ * a single-hop subtree aggregate consumed by the parent, never forwarded. */
 static void mesh_forward_rootward(const mesh_header_t *h,
                                   const uint8_t *payload, uint8_t plen)
 {
     uint8_t frame[MESH_MAX_FRAME];
     uint8_t flen;
 
-    mesh_note_relay();                  /* a child routed through us */
+    mesh_note_relay(h->src);            /* a child routed through us */
     if (h->hops <= 1) {
         return;                         /* TTL exhausted */
     }
@@ -1396,23 +1446,36 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
     mesh_forward_rootward(h, payload, plen);
 }
 
-/* Handle an incoming ADDR_ALIVE (header-only liveness keepalive).  The master
- * needs no action -- the last-heard bookkeeping at the top of mesh_handle_rx
- * already refreshed s_heard_ms from the header `src`; an intermediate node just
- * forwards it rootward. */
+/* Handle an incoming ADDR_ALIVE: a single-hop subtree-liveness aggregate
+ * addressed to us (its parent).  We never forward it.
+ *   - master: book liveness for every address the child reported alive, so the
+ *     eviction loop sees the whole subtree refreshed (not just the header src).
+ *   - relay: remember this child's subtree bitmap for our own next aggregate. */
 static void mesh_rx_alive(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
-    if (h->dst == MESH_ADDR_NONE) {
-        mesh_relay_flood(h, payload, plen);     /* defensive: origin flooded */
+    uint16_t bm;
+
+    if (h->dst != mesh_get_address()) {
+        return;                         /* single-hop aggregate: only the parent acts */
+    }
+    if (plen < 2) {
         return;
     }
-    if (h->dst != mesh_get_address()) {
-        return;                         /* not addressed to us */
-    }
+    bm = (uint16_t)(payload[0] | ((uint16_t)payload[1] << 8));
+
     if (mesh_is_master()) {
-        return;                         /* liveness already booked; consumed */
+        uint32_t now = millis();
+        for (uint8_t a = MESH_FIRST_SLAVE_ADDR; a <= MESH_ADDR_MAX; a++) {
+            if (bm & (uint16_t)(1u << a)) {
+                s_heard_ms[a] = now;
+            }
+        }
+        return;
     }
-    mesh_forward_rootward(h, payload, plen);
+    if (h->src >= MESH_FIRST_SLAVE_ADDR && h->src <= MESH_ADDR_MAX) {
+        mesh_note_relay(h->src);        /* refresh child + our relay status */
+        s_child_bm[h->src] = bm;        /* adopt the richer subtree bitmap   */
+    }
 }
 
 uint16_t mesh_get_epoch(void)
@@ -1455,7 +1518,8 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     s_rx_snr  = snr;
 
     /* Master liveness bookkeeping: refresh the last-heard time for a node as
-     * long as it sends anything (beacon, uplink, claim or keepalive). */
+     * long as it sends anything (beacon, uplink, claim or liveness aggregate);
+     * mesh_rx_alive additionally refreshes every bit of a child's aggregate. */
     if (mesh_is_master() && h.src >= MESH_FIRST_SLAVE_ADDR && h.src <= MESH_ADDR_MAX) {
         s_heard_ms[h.src] = millis();
     }
