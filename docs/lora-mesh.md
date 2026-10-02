@@ -318,8 +318,9 @@ has no neighbour at all it keeps listening until beacons return.
   routing state is node-side.
 
 **Eviction / recycling.** The master node frees the address of a node it has not heard
-from for `MESH_EVICT_MS`. A live node re-claims well inside that window, so an
-idle-but-alive node is never dropped.
+from for `MESH_EVICT_MS` (660 s). A live node re-claims every `MESH_CLAIM_INTERVAL_MS`
+(300 s), well inside that window, so an idle-but-alive node is never dropped and even a
+single missed claim is tolerated.
 
 **Duplicate addresses.** If a node hears its own address handed to a different node
 device id it relinquishes it and re-joins, so no duplicate address can persist.
@@ -337,8 +338,8 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_JOIN_INTERVAL_MS` / `MESH_JOIN_INTERVAL_MAX_MS` | 3000 / 15000 | join backoff |
 | `MESH_TABLE_INTERVAL_MS` | 300000 | ADDR_TABLE flood backstop period (a table change also triggers an immediate flood) |
 | `MESH_TABLE_DEBOUNCE_MS` | 500 | window that coalesces table changes into one ADDR_TABLE flood |
-| `MESH_CLAIM_INTERVAL_MS` | 90000 | node safety-net re-announce |
-| `MESH_EVICT_MS` | 180000 | master-node eviction grace |
+| `MESH_CLAIM_INTERVAL_MS` | 300000 | node safety-net re-announce |
+| `MESH_EVICT_MS` | 660000 | master-node eviction grace |
 | `MESH_RECOVER_MS` | 10000 | master-node post-boot recovery window |
 | `MESH_LINK_RETRIES` | 3 | link retransmits (timeout is derived, see MAC) |
 | `MESH_TX_BACKOFF_MIN_MS` / `MESH_TX_BACKOFF_MAX_MS` | 40 / 1280 | queued-frame backoff after a busy CAD (randomised window, doubles per attempt) |
@@ -366,7 +367,7 @@ transition the beacon resets to fast so the new child can track us promptly.
 Trade-off (accepted): discovering a leaf node as a parent takes up to one leaf-node
 interval, so re-parenting onto a former leaf node is slower (its parent-side liveness
 is unaffected -- claims make the leaf node a relay node's child within one interval, and
-the leaf node's own 90 s claims keep it alive at the master node regardless).
+the leaf node's own 300 s claims keep it alive at the master node regardless).
 
 **Flood relay.** A flood is re-broadcast once per receiving node (deduped on
 `(src,seq)`), so one flood costs one transmission per relay node. Floods whose
@@ -430,7 +431,7 @@ busy with mesh housekeeping. They count **beacons, `ADDR_CLAIM`s and the `ADDR_T
 flood**, and exclude `LINK_ACK` (which only exists alongside an uplink) and
 application data. Everything is derived from the airtimes above and the live tunables:
 relay nodes and the master node beacon every `MESH_BEACON_MAX_MS` (90 s), a leaf node every `3x` that
-(270 s); every joined node claims once per `MESH_CLAIM_INTERVAL_MS` (90 s) over `d`
+(270 s); every joined node claims once per `MESH_CLAIM_INTERVAL_MS` (300 s) over `d`
 hops; the master node floods `ADDR_TABLE` on the `MESH_TABLE_INTERVAL_MS` backstop (300 s),
 relayed by non-leaf nodes only. `<nodes>` is `N` (non-master nodes); the tree is rooted at
 the master node with depth `<= 4`. In the topology table below, `SD` is also the total
@@ -446,29 +447,29 @@ number of `ADDR_CLAIM` hops per claim round.
 
 | topology | nodes | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
-| **deep tree**              | 4  | 0.7% | 1.4% | 2.6% | 4.7% |
-|                           | 9  | 1.8% | 3.3% | 6.5% | 11.5% |
-|                           | 14 | 2.9% | 5.3% | 10.3% | 18.4% |
-| **average 1.5 hops**       | 4  | 0.5% | 0.9% | 1.7% | 3.2% |
-|                           | 9  | 1.1% | 1.9% | 3.7% | 6.7% |
-|                           | 14 | 1.6% | 2.9% | 5.6% | 10.2% |
-| **average 2 hops**         | 4  | 0.6% | 1.2% | 2.3% | 4.1% |
-|                           | 9  | 1.3% | 2.4% | 4.7% | 8.5% |
-|                           | 14 | 2.1% | 3.8% | 7.3% | 13.3% |
+| **deep tree**              | 4  | 0.4% | 0.7% | 1.3% | 2.5% |
+|                           | 9  | 0.8% | 1.4% | 2.6% | 4.8% |
+|                           | 14 | 1.1% | 2.1% | 3.9% | 7.2% |
+| **average 1.5 hops**       | 4  | 0.3% | 0.5% | 1.0% | 1.8% |
+|                           | 9  | 0.5% | 1.0% | 1.9% | 3.6% |
+|                           | 14 | 0.8% | 1.6% | 2.9% | 5.5% |
+| **average 2 hops**         | 4  | 0.4% | 0.7% | 1.2% | 2.3% |
+|                           | 9  | 0.7% | 1.3% | 2.4% | 4.5% |
+|                           | 14 | 1.0% | 2.0% | 3.6% | 6.8% |
 
-At SF5-SF6 the idle control plane stays within a few percent even at 14 nodes. At SF8
-the deep 14-node tree reaches 18.4%, but that is dominated by the **claim plane**:
-50 claim-hops per 90 s is ~16% on its own (beacons 2.1%, table 0.3%), so a deep
-14-node SF8 network should be avoided or the claim interval lengthened. Churn adds
-change-triggered `ADDR_TABLE` floods on top of the backstop counted here.
+The idle control plane stays within a few percent at SF5-SF6 even at 14 nodes, and even
+at SF8 the worst cell -- the deep 14-node tree -- reaches only 7.2%. That cell is still
+claim-dominated (claims 4.8%, beacons 2.1%, table 0.3%), which is why the claim interval
+is the lever that keeps it down. Churn adds change-triggered `ADDR_TABLE` floods on top
+of the backstop counted here.
 
 **Control-plane target.** The design goal is that this module-generated traffic
 (beacons, claims and the table flood -- everything counted here) stays **under 10%
 of total wall-clock time**. `LINK_ACK` is deliberately excluded from both the
 target and the table: it is a per-uplink cost that scales with data traffic, not a
-fixed control-plane load. At SF7 the target holds for every topology up to 14
-nodes except the deep tree (10.3%); at SF8 the claim plane pushes the deep tree
-over even at 9 nodes (11.5%) and every 14-node tree over (10.2%--18.4%).
+fixed control-plane load. At the 300 s claim interval the target holds for **every
+topology up to 14 nodes across the whole SF5-SF8 range** (worst cell: the deep
+14-node tree at SF8, 7.2%).
 
 ### Punch throughput
 
