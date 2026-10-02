@@ -418,9 +418,8 @@ term by the interval ratio, **frame slimming** (1-byte beacons, 2-byte ADDR_TABL
 header-field reuse) shrinks every control frame, the **rootward `ADDR_CLAIM`**
 keeps the claim plane `O(N)` rather than the `O(N^2)` of a flood (it floods only
 when a node is route-less), and the host can **measure** the resulting ratio live
-via `ATC+MESHMAP?` (`overhead%`). The 10% target is only
-plausible for a data-dominant, few-node, fat-payload regime -- the header and the
-per-uplink ACK are proportional and set the floor.
+via `ATC+MESHMAP?` (`overhead%`). The header and the per-uplink ACK are
+proportional terms (one per data frame), so they set a floor on this ratio.
 
 ### Control-plane occupancy
 
@@ -462,6 +461,14 @@ the deep 14-node tree reaches 18.4%, but that is dominated by the **claim plane*
 50 claim-hops per 90 s is ~16% on its own (beacons 2.1%, table 0.3%), so a deep
 14-node SF8 network should be avoided or the claim interval lengthened. Churn adds
 change-triggered `ADDR_TABLE` floods on top of the backstop counted here.
+
+**Control-plane target.** The design goal is that this module-generated traffic
+(beacons, claims and the table flood -- everything counted here) stays **under 10%
+of total wall-clock time**. `LINK_ACK` is deliberately excluded from both the
+target and the table: it is a per-uplink cost that scales with data traffic, not a
+fixed control-plane load. At SF7 the target holds for every topology up to 14
+nodes except the deep tree (10.3%); at SF8 the claim plane pushes the deep tree
+over even at 9 nodes (11.5%) and every 14-node tree over (10.2%--18.4%).
 
 ### Punch throughput
 
