@@ -26,7 +26,7 @@ int receive_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int mesh_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int master_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param);
-int meshtoken_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param);
 void send_cb(void);
 void cad_cb(bool detect);
 void receive_cb(rui_lora_p2p_recv_t recv_data_pkg);
@@ -46,7 +46,7 @@ bool init_config_at(void)
 {
 
 	return api.system.atMode.add((char *)"P2P",
-								 (char *)"Configure in P2P mode. Usage: ATC+P2P=<frequency>:<spreading factor>:<bandwidth>:<coding rate>:<preamble length>:<tx power>:<low data rate optimize>:<crc on>:<rx gain>:<drf1268dscompatmode>:<sendack>:<payload length>",
+								 (char *)"Configure in P2P mode. Usage: ATC+P2P=<runtime config 0|1>:<frequency>:<spreading factor>:<bandwidth>:<coding rate>:<preamble length>:<tx power>:<low data rate optimize>:<crc on>:<rx gain>:<drf1268dscompatmode>:<sendack>:<payload length>[:<mesh>:<master>:<deviceid>]",
 								 (char *)"P2P", config_handler,
 								 RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
 }
@@ -87,9 +87,9 @@ bool init_mesh_at(void)
 								(char *)"Get mesh state. Usage: ATC+MESHMAP=?",
 								(char *)"MESHMAP", meshmaps_handler,
 								RAK_ATCMD_PERM_READ);
-	ok &= api.system.atMode.add((char *)"MESHTOKEN",
-								(char *)"Set the 6-byte mesh identity token (12 hex chars). Usage: ATC+MESHTOKEN=<12 hex> / ATC+MESHTOKEN=?",
-								(char *)"MESHTOKEN", meshtoken_handler,
+	ok &= api.system.atMode.add((char *)"MESHNODEDEVICEID",
+								(char *)"Set the 6-byte mesh node device id (12 hex chars). Usage: ATC+MESHNODEDEVICEID=<12 hex> / ATC+MESHNODEDEVICEID=?",
+								(char *)"MESHNODEDEVICEID", meshnodedeviceid_handler,
 								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
 	return ok;
 }
@@ -203,34 +203,35 @@ int master_handler(SERIAL_PORT port, char *cmd, stParam *param)
 }
 
 /**
- * @brief Set/read the 6-byte mesh identity token (12 hex chars).
- *        Usage: ATC+MESHTOKEN=<12 hex> / ATC+MESHTOKEN=?
+ * @brief Set/read the 6-byte mesh node device id (12 hex chars).
+ *        Usage: ATC+MESHNODEDEVICEID=<12 hex> / ATC+MESHNODEDEVICEID=?
  *
- *        The token is host-provisioned (e.g. from the host's own device id) and
- *        persisted in flash.  Without a token the mesh neither starts nor joins.
+ *        The node device id is host-provisioned (from the host's own Bluetooth
+ *        address) and persisted in flash.  Without one the mesh neither starts
+ *        nor joins.
  */
-int meshtoken_handler(SERIAL_PORT port, char *cmd, stParam *param)
+int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if (param->argc == 1 && !strcmp(param->argv[0], "?"))
 	{
-		uint8_t token[MESH_TOKEN_LEN];
-		mesh_get_token(token);
+		uint8_t device_id[MESH_NODE_DEVICE_ID_LEN];
+		mesh_get_node_device_id(device_id);
 		atcmd_printf("%s=", cmd);
-		for (uint8_t i = 0; i < MESH_TOKEN_LEN; i++)
+		for (uint8_t i = 0; i < MESH_NODE_DEVICE_ID_LEN; i++)
 		{
-			atcmd_printf("%02X", token[i]);
+			atcmd_printf("%02X", device_id[i]);
 		}
 		return AT_NO_STATUS;
 	}
 	else if (param->argc == 1)
 	{
-		uint8_t token[MESH_TOKEN_LEN];
+		uint8_t device_id[MESH_NODE_DEVICE_ID_LEN];
 		uint32_t len = (uint32_t)strlen(param->argv[0]);
-		if (len != MESH_TOKEN_LEN * 2)
+		if (len != MESH_NODE_DEVICE_ID_LEN * 2)
 			return AT_PARAM_ERROR;
-		if (0 != at_check_hex_param(param->argv[0], len, token))
+		if (0 != at_check_hex_param(param->argv[0], len, device_id))
 			return AT_PARAM_ERROR;
-		mesh_set_token(token);
+		mesh_set_node_device_id(device_id);
 		mesh_config_save();
 		return AT_OK;
 	}
@@ -240,11 +241,13 @@ int meshtoken_handler(SERIAL_PORT port, char *cmd, stParam *param)
 /**
  * @brief Get mesh state. Usage: ATC+MESHMAP=?
  *        Returns
- *        '<enabled>:<is master>:<own address>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neigh>:<epoch>:<overhead%>:<ackms>'
+ *        '<enabled>:<is master>:<own address>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>'
  *        where <state> is 0=unassigned 1=joining 2=joined, <alloc> is the number
  *        of addresses the master has allocated, <parent> is the current parent
- *        address (0 = none), <hops>/<cost> are the route to the master, <neigh>
- *        is the live neighbour count, <epoch> is the master boot epoch,
+ *        address (0 = none), <hops>/<cost> are the route to the master,
+ *        <neighbour-count> is the live neighbour count, <epoch> is the master's
+ *        boot number (incremented on every boot; only its low 3 bits ride the
+ *        beacon) as last seen by this node,
  *        <overhead%> is the measured control-plane airtime as a percentage of
  *        the data-frame airtime transmitted and <ackms> is the derived per-hop
  *        ACK timeout (datarate dependent).
@@ -304,11 +307,13 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
     */
     if (param->argc == 1 && !strcmp(param->argv[0], "?"))
     {
-        if (get_useRuntimeConfigP2P())
+        bool useRuntime = get_useRuntimeConfigP2P();
+        atcmd_printf("%s=", cmd);
+        atcmd_printf("%d:", useRuntime ? 1 : 0);
+        if (useRuntime)
         {
             runtimeConfigP2P_t runtimeConfigP2P;
             get_runtimeConfigP2P(&runtimeConfigP2P);
-            atcmd_printf("%s=", cmd);
             atcmd_printf("%u:", runtimeConfigP2P.frequency);
             atcmd_printf("%u:", runtimeConfigP2P.spreading_factor);
             atcmd_printf("%u:", runtimeConfigP2P.bandwidth);  
@@ -326,7 +331,6 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         }
         else
 	   	{
-            atcmd_printf("%s=", cmd);
             atcmd_printf("%u:", service_lora_p2p_get_freq());
             atcmd_printf("%u:", service_lora_p2p_get_sf());
             atcmd_printf("%u:", service_lora_p2p_get_bandwidth());
@@ -343,21 +347,18 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 			atcmd_printf("%d", mesh_is_master() ? 1 : 0);
         }
         {
-            uint8_t token[MESH_TOKEN_LEN];
-            mesh_get_token(token);
+            uint8_t device_id[MESH_NODE_DEVICE_ID_LEN];
+            mesh_get_node_device_id(device_id);
             atcmd_printf(":");
-            for (uint8_t i = 0; i < MESH_TOKEN_LEN; i++)
+            for (uint8_t i = 0; i < MESH_NODE_DEVICE_ID_LEN; i++)
             {
-                atcmd_printf("%02X", token[i]);
+                atcmd_printf("%02X", device_id[i]);
             }
         }
         return AT_NO_STATUS;
     }
-    else if (param->argc == 12
-             || (param->argc == 13 && !strcmp(param->argv[12],"0"))
-             || (param->argc == 14)
-             || (param->argc == 15)
-             || (param->argc == 16 && !strcmp(param->argv[15],"0")))
+    else if ((param->argc == 13 || param->argc == 16)
+             && !strcmp(param->argv[0], "0"))
     {
         uint32_t frequency,spreading_factor,bandwidth,coding_rate,preamble_length,
 			txpower, low_data_rate_optimize, crc_on, rxgain, drf1268dscompatmode,
@@ -369,11 +370,11 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
             o_sendack, o_fix_length_payload;
 		uint8_t o_payload_len;
         uint8_t udrv_code;
-        // Optional trailing <mesh>:<master>[:<token>] parameters (argc >= 14)
-        bool haveMeshParams = (param->argc >= 14);
-        bool haveToken = (param->argc >= 15);
+        // argv[0] is the mandatory runtime-config selector (0 = stored config).
+        // Optional trailing <mesh>:<master>:<deviceid> parameters (argc == 16)
+        bool haveMeshParams = (param->argc >= 16);
         uint32_t mesh_enabled = 0, is_master = 0;
-        uint8_t mesh_token[MESH_TOKEN_LEN] = {0};
+        uint8_t mesh_device_id[MESH_NODE_DEVICE_ID_LEN] = {0};
 
         // Preserve current p2p parameters
         o_frequency = service_lora_p2p_get_freq();
@@ -390,47 +391,47 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         o_sendack = service_lora_p2p_get_sendack();
 		o_fix_length_payload = service_lora_p2p_get_fix_length_payload();
 
-        // Exchange parameters
-        if (0 != at_check_digital_uint32_t(param->argv[0], &frequency))
+        // Exchange parameters (argv[0] is the runtime-config selector)
+        if (0 != at_check_digital_uint32_t(param->argv[1], &frequency))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[1], &spreading_factor))
+        if (0 != at_check_digital_uint32_t(param->argv[2], &spreading_factor))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[2], &bandwidth))
+        if (0 != at_check_digital_uint32_t(param->argv[3], &bandwidth))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[3], &coding_rate))
+        if (0 != at_check_digital_uint32_t(param->argv[4], &coding_rate))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[4], &preamble_length))
+        if (0 != at_check_digital_uint32_t(param->argv[5], &preamble_length))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[5], &txpower))
+        if (0 != at_check_digital_uint32_t(param->argv[6], &txpower))
             return AT_PARAM_ERROR;
-		if (0 != at_check_digital_uint32_t(param->argv[6], &low_data_rate_optimize))
+		if (0 != at_check_digital_uint32_t(param->argv[7], &low_data_rate_optimize))
             return AT_PARAM_ERROR;
-		if (0 != at_check_digital_uint32_t(param->argv[7], &crc_on))
+		if (0 != at_check_digital_uint32_t(param->argv[8], &crc_on))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[8], &rxgain))
+        if (0 != at_check_digital_uint32_t(param->argv[9], &rxgain))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[9], &drf1268dscompatmode))
+        if (0 != at_check_digital_uint32_t(param->argv[10], &drf1268dscompatmode))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[10], &sendack))
+        if (0 != at_check_digital_uint32_t(param->argv[11], &sendack))
             return AT_PARAM_ERROR;
-		if (0 != at_check_digital_uint32_t(param->argv[11], &payload_len))
+		if (0 != at_check_digital_uint32_t(param->argv[12], &payload_len))
             return AT_PARAM_ERROR;
 
 
         if (haveMeshParams)
         {
-            if (0 != at_check_digital_uint32_t(param->argv[12], &mesh_enabled))
+            if (0 != at_check_digital_uint32_t(param->argv[13], &mesh_enabled))
                 return AT_PARAM_ERROR;
-            if (0 != at_check_digital_uint32_t(param->argv[13], &is_master))
+            if (0 != at_check_digital_uint32_t(param->argv[14], &is_master))
                 return AT_PARAM_ERROR;
             if (mesh_enabled > 1 || is_master > 1)
                 return AT_PARAM_ERROR;
-            if (haveToken)
+            // The node device id is mandatory whenever the mesh tail is present.
             {
-                uint32_t tlen = (uint32_t)strlen(param->argv[14]);
-                if (tlen != MESH_TOKEN_LEN * 2)
+                uint32_t tlen = (uint32_t)strlen(param->argv[15]);
+                if (tlen != MESH_NODE_DEVICE_ID_LEN * 2)
                     return AT_PARAM_ERROR;
-                if (0 != at_check_hex_param(param->argv[14], tlen, mesh_token))
+                if (0 != at_check_hex_param(param->argv[15], tlen, mesh_device_id))
                     return AT_PARAM_ERROR;
             }
         }
@@ -507,10 +508,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         {
             mesh_set_enabled(mesh_enabled != 0);
             mesh_set_master(is_master != 0);
-            if (haveToken)
-            {
-                mesh_set_token(mesh_token);
-            }
+            mesh_set_node_device_id(mesh_device_id);
             mesh_config_save();
         }
 
@@ -538,8 +536,8 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         //Check and return error code
         return at_error_code_form_udrv(udrv_code);
     }
-    else if ((param->argc == 13 && !strcmp(param->argv[12],"1"))
-             || (param->argc == 16 && !strcmp(param->argv[15],"1"))) { //for runtime setting
+    else if ((param->argc == 13 || param->argc == 16)
+             && !strcmp(param->argv[0], "1")) { //for runtime setting
         uint32_t frequency,spreading_factor,bandwidth,coding_rate,preamble_length,
 			txpower, low_data_rate_optimize, crc_on, rxgain, drf1268dscompatmode,
             sendack, payload_len;
@@ -548,11 +546,11 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
             o_sendack, o_fix_length_payload;
 		uint8_t o_payload_len;
         uint8_t udrv_code;
-        // Optional trailing <mesh>:<master>[:<token>] parameters (argc >= 16)
+        // argv[0] is the mandatory runtime-config selector (1 = runtime config).
+        // Optional trailing <mesh>:<master>:<deviceid> parameters (argc == 16)
         bool haveMeshParams = (param->argc >= 16);
-        bool haveToken = (param->argc >= 16);
         uint32_t mesh_enabled = 0, is_master = 0;
-        uint8_t mesh_token[MESH_TOKEN_LEN] = {0};
+        uint8_t mesh_device_id[MESH_NODE_DEVICE_ID_LEN] = {0};
         bool o_useRuntimeConfig = get_useRuntimeConfigP2P();
         runtimeConfigP2P_t runtimeConfigP2P;
 
@@ -594,46 +592,46 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 			o_fix_length_payload = service_lora_p2p_get_fix_length_payload();
         }
 
-        // Exchange parameters
-        if (0 != at_check_digital_uint32_t(param->argv[0], &frequency))
+        // Exchange parameters (argv[0] is the runtime-config selector)
+        if (0 != at_check_digital_uint32_t(param->argv[1], &frequency))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[1], &spreading_factor))
+        if (0 != at_check_digital_uint32_t(param->argv[2], &spreading_factor))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[2], &bandwidth))
+        if (0 != at_check_digital_uint32_t(param->argv[3], &bandwidth))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[3], &coding_rate))
+        if (0 != at_check_digital_uint32_t(param->argv[4], &coding_rate))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[4], &preamble_length))
+        if (0 != at_check_digital_uint32_t(param->argv[5], &preamble_length))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[5], &txpower))
+        if (0 != at_check_digital_uint32_t(param->argv[6], &txpower))
             return AT_PARAM_ERROR;
-		if (0 != at_check_digital_uint32_t(param->argv[6], &low_data_rate_optimize))
+		if (0 != at_check_digital_uint32_t(param->argv[7], &low_data_rate_optimize))
             return AT_PARAM_ERROR;
-		if (0 != at_check_digital_uint32_t(param->argv[7], &crc_on))
+		if (0 != at_check_digital_uint32_t(param->argv[8], &crc_on))
             return AT_PARAM_ERROR;
-		if (0 != at_check_digital_uint32_t(param->argv[8], &rxgain))
+		if (0 != at_check_digital_uint32_t(param->argv[9], &rxgain))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[9], &drf1268dscompatmode))
+        if (0 != at_check_digital_uint32_t(param->argv[10], &drf1268dscompatmode))
             return AT_PARAM_ERROR;
-        if (0 != at_check_digital_uint32_t(param->argv[10], &sendack))
+        if (0 != at_check_digital_uint32_t(param->argv[11], &sendack))
             return AT_PARAM_ERROR;
-		if (0 != at_check_digital_uint32_t(param->argv[11], &payload_len))
-            return AT_PARAM_ERROR;	
+		if (0 != at_check_digital_uint32_t(param->argv[12], &payload_len))
+            return AT_PARAM_ERROR;
 
         if (haveMeshParams)
         {
-            if (0 != at_check_digital_uint32_t(param->argv[12], &mesh_enabled))
+            if (0 != at_check_digital_uint32_t(param->argv[13], &mesh_enabled))
                 return AT_PARAM_ERROR;
-            if (0 != at_check_digital_uint32_t(param->argv[13], &is_master))
+            if (0 != at_check_digital_uint32_t(param->argv[14], &is_master))
                 return AT_PARAM_ERROR;
             if (mesh_enabled > 1 || is_master > 1)
                 return AT_PARAM_ERROR;
-            if (haveToken)
+            // The node device id is mandatory whenever the mesh tail is present.
             {
-                uint32_t tlen = (uint32_t)strlen(param->argv[14]);
-                if (tlen != MESH_TOKEN_LEN * 2)
+                uint32_t tlen = (uint32_t)strlen(param->argv[15]);
+                if (tlen != MESH_NODE_DEVICE_ID_LEN * 2)
                     return AT_PARAM_ERROR;
-                if (0 != at_check_hex_param(param->argv[14], tlen, mesh_token))
+                if (0 != at_check_hex_param(param->argv[15], tlen, mesh_device_id))
                     return AT_PARAM_ERROR;
             }
         }
@@ -700,10 +698,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         {
             mesh_set_enabled(mesh_enabled != 0);
             mesh_set_master(is_master != 0);
-            if (haveToken)
-            {
-                mesh_set_token(mesh_token);
-            }
+            mesh_set_node_device_id(mesh_device_id);
             mesh_config_save();
         }
 

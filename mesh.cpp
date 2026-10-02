@@ -27,7 +27,7 @@
 /*  Persistent configuration                                              */
 /* ======================================================================= */
 
-/* Persistent layout: magic, version, flags, address, boot counter, token. */
+/* Persistent layout: magic, version, flags, address, boot counter, device id. */
 struct __attribute__((packed)) mesh_flash_config_t {
     uint8_t  magic;
     uint8_t  version;
@@ -35,7 +35,7 @@ struct __attribute__((packed)) mesh_flash_config_t {
     uint8_t  address;    /* own 4-bit address, MESH_ADDR_NONE when unassigned */
     uint16_t boot_count; /* master boot counter: bumped each boot, used as the
                           * beacon epoch so nodes detect a master restart */
-    uint8_t  token[MESH_TOKEN_LEN]; /* host-provisioned identity token */
+    uint8_t  device_id[MESH_NODE_DEVICE_ID_LEN]; /* host-provisioned device id */
 };
 
 static mesh_flash_config_t s_cfg;
@@ -47,7 +47,7 @@ static void mesh_config_defaults(void)
     s_cfg.flags      = 0;               /* meshing disabled, not master */
     s_cfg.address    = MESH_ADDR_NONE;
     s_cfg.boot_count = 0;
-    memset(s_cfg.token, 0, MESH_TOKEN_LEN);
+    memset(s_cfg.device_id, 0, MESH_NODE_DEVICE_ID_LEN);
 }
 
 static bool mesh_config_load(void)
@@ -188,12 +188,12 @@ static uint32_t mesh_link_ack_timeout_for(uint8_t len);
 static void mesh_beacon_fast(void);
 static bool mesh_is_relay(void);
 
-/* Recompute the join FSM state from the current role / address / token. */
+/* Recompute the join FSM state from the current role / address / device id. */
 static void mesh_update_state(void)
 {
-    if (!mesh_is_enabled() || !mesh_has_token()) {
-        /* Without a host-provisioned token the mesh does not run: no beacons
-         * and no join attempt.  The token is how the master identifies us. */
+    if (!mesh_is_enabled() || !mesh_has_node_device_id()) {
+        /* Without a host-provisioned node device id the mesh does not run: no
+         * beacons and no join attempt.  It is how the master identifies us. */
         s_state = MESH_STATE_UNASSIGNED;
     } else if (mesh_is_master() || mesh_get_address() != MESH_ADDR_NONE) {
         s_state = MESH_STATE_JOINED;
@@ -344,7 +344,7 @@ static void mesh_timer_cb(void *)
 {
     uint32_t now;
 
-    if (!mesh_is_enabled() || !mesh_has_token()) {
+    if (!mesh_is_enabled() || !mesh_has_node_device_id()) {
         return;
     }
     mesh_refresh_radio_params();
@@ -420,7 +420,7 @@ static void mesh_timer_cb(void *)
             /* Ask the master for an address, backing off between attempts. */
             if ((int32_t)(now - s_join_next_ms) >= 0) {
                 mesh_send_broadcast(MESH_TYPE_JOIN_REQ, MESH_DEFAULT_TTL,
-                                    s_cfg.token, MESH_TOKEN_LEN);
+                                    s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN);
                 if (s_join_interval_ms < MESH_JOIN_INTERVAL_MAX_MS) {
                     s_join_interval_ms += MESH_JOIN_INTERVAL_MS;
                     if (s_join_interval_ms > MESH_JOIN_INTERVAL_MAX_MS) {
@@ -635,30 +635,30 @@ void mesh_set_address(uint8_t address)
     s_cfg.address = (uint8_t)(address & MESH_ADDR_MASK);
 }
 
-bool mesh_has_token(void)
+bool mesh_has_node_device_id(void)
 {
-    for (uint8_t i = 0; i < MESH_TOKEN_LEN; i++) {
-        if (s_cfg.token[i] != 0) {
+    for (uint8_t i = 0; i < MESH_NODE_DEVICE_ID_LEN; i++) {
+        if (s_cfg.device_id[i] != 0) {
             return true;
         }
     }
     return false;
 }
 
-void mesh_set_token(const uint8_t *token)
+void mesh_set_node_device_id(const uint8_t *device_id)
 {
-    if (token != NULL) {
-        memcpy(s_cfg.token, token, MESH_TOKEN_LEN);
+    if (device_id != NULL) {
+        memcpy(s_cfg.device_id, device_id, MESH_NODE_DEVICE_ID_LEN);
     } else {
-        memset(s_cfg.token, 0, MESH_TOKEN_LEN);
+        memset(s_cfg.device_id, 0, MESH_NODE_DEVICE_ID_LEN);
     }
-    /* A token appearing can start the join; losing it stops the mesh. */
+    /* A node device id appearing can start the join; losing it stops the mesh. */
     mesh_update_state();
 }
 
-void mesh_get_token(uint8_t out[MESH_TOKEN_LEN])
+void mesh_get_node_device_id(uint8_t out[MESH_NODE_DEVICE_ID_LEN])
 {
-    memcpy(out, s_cfg.token, MESH_TOKEN_LEN);
+    memcpy(out, s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN);
 }
 
 /* ======================================================================= */
@@ -723,7 +723,7 @@ static uint8_t mesh_build_frame(uint8_t *out, uint8_t type, uint8_t flags,
 
 /* Broadcast a control frame (dst = NONE) with an auto-incremented seq.
  * `hops` is the beacon hop-count, or the TTL for flooded control frames. */
-static uint8_t mesh_token_hash8(const uint8_t token[MESH_TOKEN_LEN]);
+static uint8_t mesh_node_device_id_hash8(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN]);
 static void mesh_mark_seen(uint8_t type, uint8_t src, uint8_t seq, const uint8_t *payload);
 
 /* Flood a control frame with an explicit dst (ADDR_ASSIGN carries the assigned
@@ -778,12 +778,12 @@ static void mesh_relay_flood_gated(const mesh_header_t *h,
     }
 }
 
-/* 8-bit hash of a node token, used to dedup JOIN_REQ (whose src is 0). */
-static uint8_t mesh_token_hash8(const uint8_t token[MESH_TOKEN_LEN])
+/* 8-bit hash of a node device id, used to dedup JOIN_REQ (whose src is 0). */
+static uint8_t mesh_node_device_id_hash8(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN])
 {
     uint32_t h = 2166136261u;           /* FNV-1a 32-bit offset basis */
-    for (uint8_t i = 0; i < MESH_TOKEN_LEN; i++) {
-        h ^= token[i];
+    for (uint8_t i = 0; i < MESH_NODE_DEVICE_ID_LEN; i++) {
+        h ^= device_id[i];
         h *= 16777619u;
     }
     return (uint8_t)(h & 0xFF);
@@ -795,26 +795,26 @@ static void mesh_mark_seen(uint8_t type, uint8_t src, uint8_t seq, const uint8_t
 {
     if (type == MESH_TYPE_JOIN_REQ) {
         if (payload != NULL) {
-            (void)mesh_dedup_check(mesh_token_hash8(payload), seq);
+            (void)mesh_dedup_check(mesh_node_device_id_hash8(payload), seq);
         }
     } else if (type != MESH_TYPE_BEACON) {
         (void)mesh_dedup_check(src, seq);
     }
 }
 
-/* Flood ADDR_ASSIGN{ token } so the requesting node learns its address.  The
+/* Flood ADDR_ASSIGN{ devid } so the requesting node learns its address.  The
  * assigned address rides in the header `dst`, so no address byte is needed. */
-static void mesh_send_addr_assign(const uint8_t token[MESH_TOKEN_LEN], uint8_t addr)
+static void mesh_send_addr_assign(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN], uint8_t addr)
 {
     mesh_send_flood(MESH_TYPE_ADDR_ASSIGN, (uint8_t)(addr & MESH_ADDR_MASK),
-                    MESH_DEFAULT_TTL, token, MESH_TOKEN_LEN);
+                    MESH_DEFAULT_TTL, device_id, MESH_NODE_DEVICE_ID_LEN);
 }
 
-/* A joining node asks for an address (payload = token, flooded).  The master
+/* A joining node asks for an address (payload = devid, flooded).  The master
  * allocates and floods ADDR_ASSIGN; every node relays the request onward. */
 static void mesh_rx_join_req(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
-    if (plen < MESH_TOKEN_LEN) {
+    if (plen < MESH_NODE_DEVICE_ID_LEN) {
         return;
     }
     if (mesh_is_master()) {
@@ -830,17 +830,17 @@ static void mesh_rx_join_req(const mesh_header_t *h, const uint8_t *payload, uin
     mesh_relay_flood(h, payload, plen);
 }
 
-/* Node: adopt an address the master assigned to our token (flooded). */
+/* Node: adopt an address the master assigned to our node device id (flooded). */
 static void mesh_rx_addr_assign(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     uint8_t addr;
 
-    if (plen < MESH_TOKEN_LEN) {
+    if (plen < MESH_NODE_DEVICE_ID_LEN) {
         return;
     }
     addr = (uint8_t)(h->dst & MESH_ADDR_MASK);
     if (!mesh_is_master()) {
-        if (memcmp(payload, s_cfg.token, MESH_TOKEN_LEN) == 0) {
+        if (memcmp(payload, s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN) == 0) {
             if (addr >= MESH_FIRST_SLAVE_ADDR) {
                 if (mesh_get_address() != addr) {
                     mesh_set_address(addr);
@@ -1231,8 +1231,8 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
 /* ======================================================================= */
 
 /* Master: apply a node's claim to the RAM-only table.  Adopt the claimed
- * address when it is free, re-assert our existing assignment when the token is
- * already known, and fall back to a fresh allocation when the claimed address
+ * address when it is free, re-assert our existing assignment when the node device
+ * id is already known, and fall back to a fresh allocation when the claimed address
  * is already taken.  Shared by the unicast and flooded claim paths. */
 static void mesh_master_apply_claim(const mesh_header_t *h, const uint8_t *payload)
 {
@@ -1246,7 +1246,7 @@ static void mesh_master_apply_claim(const mesh_header_t *h, const uint8_t *paylo
     if (have == want) {
         /* already known -- nothing to do */
     } else if (have != MESH_ADDR_NONE) {
-        /* token known under another address: re-assert ours */
+        /* node device id known under another address: re-assert ours */
         mesh_send_addr_assign(payload, have);
     } else if (!mesh_alloc_claim(payload, want)) {
         /* claimed address taken by another node: assign a fresh one */
@@ -1259,7 +1259,7 @@ static void mesh_master_apply_claim(const mesh_header_t *h, const uint8_t *paylo
 
 /* Node: re-announce our flash-stored address so a restarted master can rebuild
  * its RAM-only table.  Our address is already in the header `src`; the payload
- * is just our token.
+ * is just our node device id.
  *
  * This is a rootward message: it only has to reach the master, so we send it
  * hop-by-hop toward our parent (same discipline as DATA_UPLINK) rather than
@@ -1279,14 +1279,14 @@ static void mesh_send_claim(void)
     if (s_state != MESH_STATE_JOINED || s_route.parent_addr == MESH_ADDR_NONE) {
         /* No route: flood so the master can still find us. */
         mesh_send_broadcast(MESH_TYPE_ADDR_CLAIM, MESH_DEFAULT_TTL,
-                            s_cfg.token, MESH_TOKEN_LEN);
+                            s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN);
     } else {
         /* Rootward unicast to the parent. */
         seq = s_bcast_seq;
         s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x1F);
         flen = mesh_build_frame(frame, MESH_TYPE_ADDR_CLAIM, 0,
                                 mesh_get_address(), s_route.parent_addr,
-                                MESH_DEFAULT_TTL, seq, s_cfg.token, MESH_TOKEN_LEN);
+                                MESH_DEFAULT_TTL, seq, s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN);
         mesh_send_frame(frame, flen);
     }
     s_claim_next_ms = millis() + MESH_CLAIM_INTERVAL_MS;
@@ -1301,7 +1301,7 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
     uint8_t frame[MESH_MAX_FRAME];
     uint8_t flen;
 
-    if (plen < MESH_TOKEN_LEN) {
+    if (plen < MESH_NODE_DEVICE_ID_LEN) {
         return;
     }
 
@@ -1410,10 +1410,10 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     }
 
     /* Dedup flooded frames on (src,seq).  JOIN_REQ carries src=0 (unassigned)
-     * so it is keyed on a hash of its token instead; beacons are link-local
+     * so it is keyed on a hash of its node device id instead; beacons are link-local
      * and never deduped. */
     if (h.type == MESH_TYPE_JOIN_REQ) {
-        if (plen < MESH_TOKEN_LEN || mesh_dedup_check(mesh_token_hash8(payload), h.seq)) {
+        if (plen < MESH_NODE_DEVICE_ID_LEN || mesh_dedup_check(mesh_node_device_id_hash8(payload), h.seq)) {
             return;                     /* too short or duplicate */
         }
     } else if (h.type != MESH_TYPE_BEACON) {

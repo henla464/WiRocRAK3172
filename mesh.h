@@ -7,7 +7,7 @@
  *  assigned by the master; all nodes route their messages toward the master.
  *
  *  The flash-persisted configuration holds mesh enabled / role / own address
- *  and the host-provisioned 6-byte identity token; the accessors here are used
+ *  and the host-provisioned 6-byte device id; the accessors here are used
  *  by the custom AT commands.
  */
 
@@ -30,11 +30,10 @@
 
 /* Broadcast is expressed as a message type, not as an address. */
 
-/* Node identity token length (bytes). Provisioned by the host (e.g. from the
- * host's own 6-byte device id) and persisted in flash; it rides only the
- * JOIN/ASSIGN/CLAIM control frames, never the data frames. 48 bits over 14
- * nodes gives a collision probability of ~3e-13, so no hashing is needed. */
-#define MESH_TOKEN_LEN          6
+/* Node device id length (bytes). Provisioned by the host from the host's own
+ * Bluetooth address, so it is unique per node, and persisted in flash; it rides
+ * only the JOIN/ASSIGN/CLAIM control frames, never the data frames. */
+#define MESH_NODE_DEVICE_ID_LEN          6
 
 /* --- Join / allocator state --------------------------------------------- */
 /* Join FSM (see "Join / address assignment" in the design). */
@@ -64,11 +63,11 @@ void    mesh_set_master(bool master);
 uint8_t mesh_get_address(void);
 void    mesh_set_address(uint8_t address);
 
-/* Identity token (MESH_TOKEN_LEN bytes), provisioned by the host.  A device
- * without a token never starts the mesh / never joins. */
-bool    mesh_has_token(void);
-void    mesh_set_token(const uint8_t *token);   /* NULL clears it */
-void    mesh_get_token(uint8_t out[MESH_TOKEN_LEN]);
+/* Node device id (MESH_NODE_DEVICE_ID_LEN bytes), provisioned by the host from
+ * its Bluetooth address.  A device without one never starts the mesh / never joins. */
+bool    mesh_has_node_device_id(void);
+void    mesh_set_node_device_id(const uint8_t *device_id);   /* NULL clears it */
+void    mesh_get_node_device_id(uint8_t out[MESH_NODE_DEVICE_ID_LEN]);
 
 /* Persist the current configuration to flash. */
 bool    mesh_config_save(void);

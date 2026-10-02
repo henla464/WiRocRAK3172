@@ -19,23 +19,23 @@ static int g_failures = 0;
         }                                                                  \
     } while (0)
 
-static void make_token(uint8_t token[MESH_TOKEN_LEN], uint8_t id)
+static void make_device_id(uint8_t device_id[MESH_NODE_DEVICE_ID_LEN], uint8_t id)
 {
-    std::memset(token, 0, MESH_TOKEN_LEN);
-    token[0] = id;
-    token[MESH_TOKEN_LEN - 1] = (uint8_t)(id ^ 0xFF);
+    std::memset(device_id, 0, MESH_NODE_DEVICE_ID_LEN);
+    device_id[0] = id;
+    device_id[MESH_NODE_DEVICE_ID_LEN - 1] = (uint8_t)(id ^ 0xFF);
 }
 
 int main(void)
 {
-    uint8_t tA[MESH_TOKEN_LEN], tB[MESH_TOKEN_LEN], tC[MESH_TOKEN_LEN];
-    uint8_t unknown[MESH_TOKEN_LEN];
+    uint8_t tA[MESH_NODE_DEVICE_ID_LEN], tB[MESH_NODE_DEVICE_ID_LEN], tC[MESH_NODE_DEVICE_ID_LEN];
+    uint8_t unknown[MESH_NODE_DEVICE_ID_LEN];
     uint8_t bm[2];
 
-    make_token(tA, 0x11);
-    make_token(tB, 0x22);
-    make_token(tC, 0x33);
-    make_token(unknown, 0xEE);
+    make_device_id(tA, 0x11);
+    make_device_id(tB, 0x22);
+    make_device_id(tC, 0x33);
+    make_device_id(unknown, 0xEE);
 
     mesh_alloc_reset();
     CHECK(mesh_alloc_count() == 0);
@@ -74,8 +74,8 @@ int main(void)
 
     /* Exhaust the pool (14 slaves total; A/B/C already hold 3) -> next fails. */
     for (uint16_t id = 0x40; id < 0x40 + (MESH_MAX_SLAVES - 3); id++) {
-        uint8_t t[MESH_TOKEN_LEN];
-        make_token(t, (uint8_t)id);
+        uint8_t t[MESH_NODE_DEVICE_ID_LEN];
+        make_device_id(t, (uint8_t)id);
         CHECK(mesh_alloc_assign(t) != MESH_ADDR_NONE);
     }
     CHECK(mesh_alloc_count() == MESH_MAX_SLAVES);
@@ -100,7 +100,7 @@ int main(void)
     CHECK(mesh_alloc_claim(tA, 7));                 /* free address: adopt */
     CHECK(mesh_alloc_lookup(tA) == 7);
     CHECK(mesh_alloc_claim(tA, 7));                 /* idempotent */
-    CHECK(!mesh_alloc_claim(tA, 9));                /* token already bound  */
+    CHECK(!mesh_alloc_claim(tA, 9));                /* device_id already bound  */
     CHECK(mesh_alloc_lookup(tA) == 7);
     CHECK(!mesh_alloc_claim(tB, 7));                /* taken by another tok */
     CHECK(mesh_alloc_lookup(tB) == MESH_ADDR_NONE);

@@ -6,7 +6,7 @@
 #include "mesh_alloc.h"
 
 typedef struct {
-    uint8_t token[MESH_TOKEN_LEN];
+    uint8_t device_id[MESH_NODE_DEVICE_ID_LEN];
     uint8_t addr;                       /* MESH_ADDR_NONE == free slot */
 } mesh_alloc_entry_t;
 
@@ -15,11 +15,11 @@ static mesh_alloc_entry_t s_entries[MESH_MAX_SLAVES];
 /* Bumped on every real change of the occupied set (see mesh_alloc_version()). */
 static uint16_t s_version;
 
-static int mesh_alloc_find(const uint8_t token[MESH_TOKEN_LEN])
+static int mesh_alloc_find(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN])
 {
     for (uint8_t i = 0; i < MESH_MAX_SLAVES; i++) {
         if (s_entries[i].addr != MESH_ADDR_NONE &&
-            memcmp(s_entries[i].token, token, MESH_TOKEN_LEN) == 0) {
+            memcmp(s_entries[i].device_id, device_id, MESH_NODE_DEVICE_ID_LEN) == 0) {
             return (int)i;
         }
     }
@@ -58,9 +58,9 @@ uint8_t mesh_alloc_count(void)
     return n;
 }
 
-uint8_t mesh_alloc_lookup(const uint8_t token[MESH_TOKEN_LEN])
+uint8_t mesh_alloc_lookup(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN])
 {
-    int i = mesh_alloc_find(token);
+    int i = mesh_alloc_find(device_id);
     return (i < 0) ? MESH_ADDR_NONE : s_entries[i].addr;
 }
 
@@ -72,10 +72,10 @@ bool mesh_alloc_occupies(uint8_t addr)
     return mesh_alloc_addr_used(addr);
 }
 
-uint8_t mesh_alloc_assign(const uint8_t token[MESH_TOKEN_LEN])
+uint8_t mesh_alloc_assign(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN])
 {
     /* Idempotent: an already-known node keeps its address. */
-    int i = mesh_alloc_find(token);
+    int i = mesh_alloc_find(device_id);
     if (i >= 0) {
         return s_entries[i].addr;
     }
@@ -86,7 +86,7 @@ uint8_t mesh_alloc_assign(const uint8_t token[MESH_TOKEN_LEN])
         }
         for (uint8_t k = 0; k < MESH_MAX_SLAVES; k++) {
             if (s_entries[k].addr == MESH_ADDR_NONE) {
-                memcpy(s_entries[k].token, token, MESH_TOKEN_LEN);
+                memcpy(s_entries[k].device_id, device_id, MESH_NODE_DEVICE_ID_LEN);
                 s_entries[k].addr = addr;
                 s_version++;
                 return addr;
@@ -97,23 +97,23 @@ uint8_t mesh_alloc_assign(const uint8_t token[MESH_TOKEN_LEN])
     return MESH_ADDR_NONE;              /* pool exhausted */
 }
 
-bool mesh_alloc_claim(const uint8_t token[MESH_TOKEN_LEN], uint8_t addr)
+bool mesh_alloc_claim(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN], uint8_t addr)
 {
     int i;
 
     if (addr < MESH_FIRST_SLAVE_ADDR || addr > MESH_ADDR_MAX) {
         return false;
     }
-    i = mesh_alloc_find(token);
+    i = mesh_alloc_find(device_id);
     if (i >= 0) {
         return s_entries[i].addr == addr;       /* already ours (idempotent) */
     }
     if (mesh_alloc_addr_used(addr)) {
-        return false;                           /* held by another token      */
+        return false;                           /* held by another device id     */
     }
     for (uint8_t k = 0; k < MESH_MAX_SLAVES; k++) {
         if (s_entries[k].addr == MESH_ADDR_NONE) {
-            memcpy(s_entries[k].token, token, MESH_TOKEN_LEN);
+            memcpy(s_entries[k].device_id, device_id, MESH_NODE_DEVICE_ID_LEN);
             s_entries[k].addr = addr;
             s_version++;
             return true;
