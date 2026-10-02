@@ -142,7 +142,7 @@ uint32_t mesh_get_link_ack_timeout_ms(void);
 /* --- M5 recovery / robustness ------------------------------------------- */
 #define MESH_BEACON_LEN          1      /* epoch[3] | cost[5]                 */
 #define MESH_BEACON_FAST_MS      1000   /* beacon period while (re)attaching  */
-#define MESH_ALIVE_INTERVAL_MS   300000 /* node liveness aggregate period     */
+#define MESH_ALIVE_INTERVAL_MS   300000 /* relay liveness aggregate period    */
 #define MESH_ALIVE_CHILD_HOLD_MS 610000 /* drop a silent child from our agg   */
 #define MESH_EVICT_MS            610000 /* master frees a silent node's addr  */
 #define MESH_RECOVER_MS          10000  /* master defers new allocs after boot*/
