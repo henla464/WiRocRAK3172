@@ -146,6 +146,13 @@ uint32_t mesh_get_link_ack_timeout_ms(void);
 #define MESH_ALIVE_CHILD_HOLD_MS 610000 /* drop a silent child from our agg   */
 #define MESH_EVICT_MS            610000 /* master frees a silent node's addr  */
 #define MESH_RECOVER_MS          10000  /* master defers new allocs after boot*/
+/* Node liveness monitor (a node at depth >= 2): re-claim if our parent's
+ * liveness aggregate has not carried us for this long.  1.5x the aggregate
+ * interval absorbs normal jitter while still beating the 610 s eviction
+ * window (a full missed aggregate is not distinguishable from a lost parent at
+ * this cadence, and a stray re-claim is harmless and rate-limited). */
+#define MESH_MONITOR_TIMEOUT_MS  (MESH_ALIVE_INTERVAL_MS + \
+                                  MESH_ALIVE_INTERVAL_MS / 2)
 
 /* Master boot epoch last heard (0 while unknown). */
 uint16_t mesh_get_epoch(void);

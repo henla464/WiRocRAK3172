@@ -183,6 +183,14 @@ static uint32_t s_child_heard_ms[MESH_ADDR_MAX + 1]; /* last heard as our child 
  * each address (0 = none).  A dead direct child takes its whole covered set with
  * it -- subtree-scoped eviction. */
 static uint8_t  s_cover[MESH_ADDR_MAX + 1];
+/* Node only (Step 4) liveness monitor, armed at depth >= 2: we overhear our
+ * parent's outgoing ADDR_ALIVE aggregate (a unicast to our grandparent, which
+ * LoRa's shared medium lets us see) to confirm it still carries our bit
+ * upstream.  s_parent_alive_ms = 0 means "no aggregate overheard yet". */
+static uint8_t  s_mon_parent;       /* parent whose aggregate we are watching  */
+static uint32_t s_mon_parent_ms;    /* when we adopted that parent             */
+static uint32_t s_parent_alive_ms;  /* last parent aggregate overheard (0=none)*/
+static uint32_t s_mon_claim_ms;     /* last monitor-triggered re-claim (0=none)*/
 
 /* Defined in the M3 section below; used by the timer. */
 static void mesh_emit_beacon(void);
@@ -197,6 +205,7 @@ static bool mesh_send_broadcast(uint8_t type, uint8_t hops,
 /* Defined in the M5 section below; used by the timer. */
 static void mesh_send_claim(void);
 static void mesh_send_alive(void);
+static void mesh_monitor_tick(uint32_t now);
 
 /* Radio/beacon helpers defined further down; used by the timer. */
 static void mesh_refresh_radio_params(void);
@@ -265,6 +274,10 @@ static void mesh_state_clear(void)
     memset(s_child_bm_ms, 0, sizeof(s_child_bm_ms));
     memset(s_child_heard_ms, 0, sizeof(s_child_heard_ms));
     memset(s_cover, 0, sizeof(s_cover));
+    s_mon_parent      = MESH_ADDR_NONE;
+    s_mon_parent_ms   = 0;
+    s_parent_alive_ms = 0;
+    s_mon_claim_ms    = 0;
 
     mesh_alloc_reset();
     s_table_ver_seen = mesh_alloc_version();    /* no pending flood after reset */
@@ -405,6 +418,7 @@ static void mesh_timer_cb(void *)
         }
     }
     mesh_check_parent_staleness(now);
+    mesh_monitor_tick(now);
     mesh_pending_tick(now);
 
     if (mesh_is_master()) {
@@ -1502,6 +1516,87 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
     mesh_forward_rootward(h, payload, plen);
 }
 
+/* --- Node liveness monitor (Step 4) -------------------------------------- *
+ * A node at depth >= 2 cannot observe the master directly, and under
+ * relay-only liveness a *leaf* sends no aggregate of its own, so its only
+ * upstream proof of life is its parent's aggregate carrying its bit.  The
+ * monitor watches that aggregate -- a single-hop unicast to the grandparent,
+ * which LoRa's shared medium lets us overhear -- and re-claims when the proof
+ * disappears: either the parent stops aggregating altogether (it rebooted and
+ * lost its RAM-only child table, so it is no longer a relay), or it keeps
+ * aggregating but has dropped our bit.  A claim re-registers us at every hop
+ * (mesh_forward_rootward -> mesh_note_relay) and re-adopts our address at the
+ * master, so it is safe even if the eviction timer has already fired.  Steady
+ * state costs nothing; only a node that has actually lost coverage emits. */
+
+/* Fire a re-claim, rate-limited to one per liveness interval so a broken or
+ * marginal parent link cannot turn into a claim storm. */
+static void mesh_monitor_trigger(uint32_t now)
+{
+    if (s_mon_claim_ms != 0 &&
+        (uint32_t)(now - s_mon_claim_ms) < MESH_ALIVE_INTERVAL_MS) {
+        return;
+    }
+    s_mon_claim_ms = now;
+    s_claim_due    = true;              /* re-claim on the next timer tick */
+}
+
+/* Per-tick: (re)arm for the current parent, and fire if its aggregate has gone
+ * missing for too long.  A parent that rebooted and forgot its children stops
+ * aggregating entirely, so we never overhear one and the watchdog catches it. */
+static void mesh_monitor_tick(uint32_t now)
+{
+    uint8_t  parent = s_route.parent_addr;
+    uint32_t last;
+
+    if (mesh_is_master() || s_state != MESH_STATE_JOINED ||
+        parent < MESH_FIRST_SLAVE_ADDR || parent > MESH_ADDR_MAX) {
+        s_mon_parent = MESH_ADDR_NONE;  /* parent is the master / none: exempt */
+        return;
+    }
+    if (parent != s_mon_parent) {
+        s_mon_parent      = parent;     /* adopted a parent: restart the watch */
+        s_mon_parent_ms   = now;
+        s_parent_alive_ms = 0;
+        return;
+    }
+    last = (s_parent_alive_ms != 0) ? s_parent_alive_ms : s_mon_parent_ms;
+    if ((uint32_t)(now - last) > MESH_MONITOR_TIMEOUT_MS) {
+        mesh_monitor_trigger(now);      /* parent went quiet */
+    }
+}
+
+/* We overheard our parent's aggregate (addressed to our grandparent): refresh
+ * the watch, and react if our own bit is missing from it. */
+static void mesh_monitor_alive(const mesh_header_t *h,
+                               const uint8_t *payload, uint8_t plen)
+{
+    uint16_t bm;
+    uint8_t  me  = mesh_get_address();
+    uint32_t now = millis();
+
+    if (plen < 2 || me == MESH_ADDR_NONE ||
+        s_route.parent_addr < MESH_FIRST_SLAVE_ADDR ||
+        s_route.parent_addr > MESH_ADDR_MAX ||
+        h->src != s_route.parent_addr) {
+        return;
+    }
+    if (s_mon_parent != h->src) {       /* first aggregate from a new parent */
+        s_mon_parent    = h->src;
+        s_mon_parent_ms = now;
+    }
+    s_parent_alive_ms = now;            /* parent is still aggregating */
+    bm = (uint16_t)(payload[0] | ((uint16_t)payload[1] << 8));
+    if (bm & (uint16_t)(1u << me)) {
+        return;                         /* still covered */
+    }
+    /* Our bit is missing.  Allow one full interval after (re)attaching so our
+     * own claim can land before we react. */
+    if ((uint32_t)(now - s_mon_parent_ms) > MESH_ALIVE_INTERVAL_MS) {
+        mesh_monitor_trigger(now);
+    }
+}
+
 /* Handle an incoming ADDR_ALIVE: a single-hop subtree-liveness aggregate
  * addressed to us (its parent).  We never forward it.
  *   - master: book liveness for every address the child reported alive (so the
@@ -1515,6 +1610,12 @@ static void mesh_rx_alive(const mesh_header_t *h, const uint8_t *payload, uint8_
     uint8_t  c;
 
     if (h->dst != mesh_get_address()) {
+        /* Not addressed to us.  If it is our parent's own aggregate (a unicast
+         * to our grandparent) we overhear it to monitor whether we are still
+         * covered upstream (see mesh_monitor_alive). */
+        if (!mesh_is_master() && h->src == s_route.parent_addr) {
+            mesh_monitor_alive(h, payload, plen);
+        }
         return;                         /* single-hop aggregate: only the parent acts */
     }
     if (plen < 2) {

@@ -176,7 +176,7 @@ header is **not** repeated in the payload (header-field reuse).
 | 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the master node. Each relay node dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
 | 5 | `DATA_DOWNLINK` | 3 + N | flooded with `dst` = target (relayed by relays only) | WiRoc payload (N bytes) | A WiRoc payload from the master node to one specific node. The target delivers it to its host; any other node that has children relays it one hop further (a leaf node does not relay). |
 | 6 | `LINK_ACK` | 4 | broadcast (single hop) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, emitted only by the master node, which has no next hop whose forward it could overhear; it sends one for every `DATA_UPLINK` it delivers. Relay nodes use the implicit ACK instead. |
-| 7 | `ADDR_CLAIM` | 9 | rootward unicast (flood fallback) | `devid[6]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted master node can rebuild its RAM-only table. **Event-driven** -- sent on a new boot epoch, on boot, and on re-attach, never on a timer. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead. |
+| 7 | `ADDR_CLAIM` | 9 | rootward unicast (flood fallback) | `devid[6]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted master node can rebuild its RAM-only table. **Event-driven** -- sent on a new boot epoch, on boot, on re-attach, and when the depth >= 2 liveness watchdog sees our parent stop covering us; never on a plain timer. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead. |
 | 8 | `ADDR_ALIVE` | 5 | single hop to the parent (absorbed, never forwarded) | `subtree_bitmap[2]` (16-bit; bit `a` = "address `a` is alive in my subtree") | Periodic liveness **aggregate**, so the master node does not evict a deep idle node (whose beacon is link-local and never reaches it). Each node sets its own bit and ORs in the bitmap reported by each of its children, so **one frame covers a whole subtree**; the parent absorbs it and does not forward it, so the union of the master node's direct children's bitmaps covers every non-master node each round. **Only a relay node sends one** (a leaf is covered by its parent from its beacon); the master node refreshes last-heard for **every** set bit. Sent while the node holds a parent. |
 
 All sizes include the fixed 3-byte header. The control types (0, 1, 2, 3, 6, 7, 8) have
@@ -331,6 +331,17 @@ has no neighbour at all it keeps listening until beacons return.
   clear and the `ADDR_TABLE` miss path makes it re-join and re-claim. (Splitting
   liveness from the claim is what lets the claim be event-driven and the liveness
   be aggregated.)
+* **A node at depth >= 2 watches its own coverage, so relay-only liveness cannot
+  strand it.** A deep node (one whose parent is not the master node) **overhears its
+  parent's `ADDR_ALIVE` aggregate** -- a single-hop unicast to the grandparent, which
+  the shared medium lets it see -- and checks whether its own bit is still set. If the
+  parent stops aggregating altogether (it rebooted and lost its RAM-only relay role) or
+  keeps aggregating but drops the bit, the node re-claims. A claim re-registers it at
+  every hop (`mesh_note_relay`) *and* re-adopts its address at the master node, so the
+  watchdog is safe even if eviction has already fired. Steady state costs nothing; a
+  parent aggregate has to be missing for `MESH_MONITOR_TIMEOUT_MS` (1.5x the aggregate
+  interval), and each re-claim is rate-limited to one per interval so a marginal link
+  cannot storm. A depth-1 node is exempt: the master node hears its beacon directly.
 * The master node rebuilds its table from the claims: it adopts the claimed address when
   free, re-asserts its own assignment when the node device id is already known, and
   hands out a fresh address when the claimed one is already taken.
@@ -352,14 +363,16 @@ A relay's bitmap is trusted only while it keeps being refreshed (`s_child_bm_ms`
 child that has stopped aggregating -- because it *became* a leaf -- is reported as just
 itself instead of a stale subtree.
 
-**Trade-off (relay-only liveness).** Because a leaf sends no liveness of its own, its
-place in the tree rests entirely on its event-driven `ADDR_CLAIM` plus the parent's
-beacon-driven refresh of it. So a relay that reboots while its children are all *quiet
-leaves* makes its whole branch invisible to the master node until the eviction timer
-(610 s) plus three `ADDR_TABLE` misses push the children to re-join and re-claim; a lost
-initial claim likewise leaves a leaf invisible until its next re-claim. Both self-heal
-through the existing `ADDR_TABLE` miss path, at the cost of that delay -- the price of
-dropping the leaf frames.
+**Relay-only liveness, and its watchdog.** Because a leaf sends no liveness of its own,
+its place in the tree rests on its event-driven `ADDR_CLAIM` plus the parent's
+beacon-driven refresh of it. A relay that reboots while its children are all *quiet
+leaves* would otherwise make its whole branch invisible to the master node until the
+eviction timer (610 s) plus three `ADDR_TABLE` misses pushed the children to re-join.
+The depth >= 2 watchdog (above) closes that window: a node notices within
+`MESH_MONITOR_TIMEOUT_MS` (450 s) -- before eviction -- and re-claims, and the claim also
+re-registers it with its parent, so the parent becomes a relay again and re-covers the
+branch. The `ADDR_TABLE` miss path stays as the outer backstop (a lost initial claim, or
+a node too far from its parent to overhear the aggregate).
 
 **Duplicate addresses.** If a node hears its own address handed to a different node
 device id it relinquishes it and re-joins, so no duplicate address can persist.
@@ -380,6 +393,7 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_ALIVE_INTERVAL_MS` | 300000 | **relay** liveness **aggregate** period (must stay well under `MESH_EVICT_MS`) |
 | `MESH_ALIVE_CHILD_HOLD_MS` | 610000 | a relay node drops a child from its aggregate after this long without hearing it |
 | `MESH_EVICT_MS` | 610000 | master-node eviction grace |
+| `MESH_MONITOR_TIMEOUT_MS` | 450000 | depth >= 2 node: no parent aggregate for this long -> re-claim (1.5x `MESH_ALIVE_INTERVAL_MS`; must stay under `MESH_EVICT_MS`) |
 | `MESH_RECOVER_MS` | 10000 | master-node post-boot recovery window |
 | `MESH_LINK_RETRIES` | 3 | link retransmits (timeout is derived, see MAC) |
 | `MESH_TX_BACKOFF_MIN_MS` / `MESH_TX_BACKOFF_MAX_MS` | 40 / 1280 | queued-frame backoff after a busy CAD (randomised window, doubles per attempt) |
