@@ -411,9 +411,7 @@ terms (the 3-byte header and the per-uplink ACK) never amortise, while only the
 **fixed-rate** control terms do.
 
 The overhead budget is `[header + per-uplink ACK + beacons + claims + table] / data
-airtime`. At the old defaults (5 s beacons, standalone 5-byte ACKs, 30 slaves) a
-15-byte-payload traffic pattern reached ~235% overhead at SF7 -- far above 10%. The
-M7 design changes cut this several ways: **4-bit addresses (14 slaves max)** roughly
+airtime`. The design cuts it several ways: **4-bit addresses (14 slaves max)** roughly
 halve the beacon term, the **adaptive beacon** back-off plus **leaf suppression**
 (only relays and the master beacon at the full rate) cut the steady-state beacon
 term by the interval ratio, **frame slimming** (1-byte beacons, 2-byte ADDR_TABLE,
