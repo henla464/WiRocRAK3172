@@ -11,8 +11,8 @@
 int main()
 {
     /* --- Exhaustive round-trip over every field range --- */
-    for (unsigned type = 0; type < 8; ++type)
-    for (unsigned flags = 0; flags < 4; ++flags)
+    for (unsigned type = 0; type < MESH_TYPE_COUNT; ++type)
+    for (unsigned flags = 0; flags < 2; ++flags)
     for (unsigned src = 0; src < 16; ++src)
     for (unsigned dst = 0; dst < 16; ++dst)
     for (unsigned hops = 0; hops < 8; ++hops)
@@ -38,7 +38,7 @@ int main()
                       0, 5, 1, 2, 3 };
     uint8_t b[MESH_HEADER_SIZE];
     mesh_wire_encode(b, &h);
-    assert(b[0] == 0x82 && b[1] == 0x8A && b[2] == 0x1A);
+    assert(b[0] == 0x42 && b[1] == 0x8A && b[2] == 0x1B);
     std::printf("known vector: OK (%02X %02X %02X)\n", b[0], b[1], b[2]);
 
     /* --- Path length packing (4-bit addresses: ceil(n/2) bytes) --- */

@@ -8,15 +8,15 @@
  *
  *   bits  field    meaning
  *   ----  -------  --------------------------------------------------
- *     3   type     MESH_TYPE_* (see below)
- *     2   flags    MESH_FLAG_*
+ *     4   type     MESH_TYPE_* (see below)
+ *     1   flags    MESH_FLAG_* (reserved)
  *     4   src      source 4-bit address
  *     4   dst      destination 4-bit address
  *     3   hops     beacon: hop-count to master; data: TTL
  *     5   seq      dedup key (src,seq)
  *     3   version  protocol version
  *
- *   byte0 = type<<5 | flags<<3 | src>>1
+ *   byte0 = type<<4 | flags<<3 | src>>1
  *   byte1 = (src&1)<<7 | dst<<3 | hops
  *   byte2 = seq<<3 | version
  */
@@ -26,10 +26,10 @@
 
 #include <stdint.h>
 
-#define MESH_WIRE_VERSION   2
+#define MESH_WIRE_VERSION   3
 #define MESH_HEADER_SIZE    3
 
-/* Message type (3 bits). Includes the count so it doubles as "invalid" bound. */
+/* Message type (4 bits). Includes the count so it doubles as "invalid" bound. */
 typedef enum {
     MESH_TYPE_BEACON = 0,
     MESH_TYPE_JOIN_REQ,
@@ -38,14 +38,15 @@ typedef enum {
     MESH_TYPE_DATA_UPLINK,
     MESH_TYPE_DATA_DOWNLINK,
     MESH_TYPE_LINK_ACK,
-    MESH_TYPE_ADDR_CLAIM,
+    MESH_TYPE_ADDR_CLAIM,       /* rootward: { devid }, (re)bind addr<->devid  */
+    MESH_TYPE_ALIVE,            /* rootward: no payload, liveness keepalive    */
     MESH_TYPE_COUNT
 } mesh_type_t;
 
-/* Header flags (2 bits).  Both bits are reserved today: the master always
- * answers a delivered uplink with an explicit LINK_ACK, so there is no
- * per-frame "ack requested" flag. */
-#define MESH_FLAG_HAS_PATH  0x02    /* reserved: explicit source path in payload (unused) */
+/* Header flags (1 bit).  Reserved today: the master always answers a delivered
+ * uplink with an explicit LINK_ACK, so there is no per-frame "ack requested"
+ * flag. */
+#define MESH_FLAG_HAS_PATH  0x01    /* reserved: explicit source path in payload (unused) */
 
 typedef struct {
     uint8_t version;    /* 3 bits */

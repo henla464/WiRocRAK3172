@@ -6,8 +6,8 @@
 
 void mesh_wire_encode(uint8_t out[MESH_HEADER_SIZE], const mesh_header_t *h)
 {
-    out[0] = (uint8_t)(((h->type & 0x07) << 5)
-                     | ((h->flags & 0x03) << 3)
+    out[0] = (uint8_t)(((h->type & 0x0F) << 4)
+                     | ((h->flags & 0x01) << 3)
                      | ((h->src & 0x0F) >> 1));
     out[1] = (uint8_t)(((h->src & 0x01) << 7)
                      | ((h->dst & 0x0F) << 3)
@@ -18,8 +18,8 @@ void mesh_wire_encode(uint8_t out[MESH_HEADER_SIZE], const mesh_header_t *h)
 
 void mesh_wire_decode(const uint8_t in[MESH_HEADER_SIZE], mesh_header_t *h)
 {
-    h->type    = (uint8_t)((in[0] >> 5) & 0x07);
-    h->flags   = (uint8_t)((in[0] >> 3) & 0x03);
+    h->type    = (uint8_t)((in[0] >> 4) & 0x0F);
+    h->flags   = (uint8_t)((in[0] >> 3) & 0x01);
     h->src     = (uint8_t)(((in[0] & 0x07) << 1) | ((in[1] >> 7) & 0x01));
     h->dst     = (uint8_t)((in[1] >> 3) & 0x0F);
     h->hops    = (uint8_t)(in[1] & 0x07);
