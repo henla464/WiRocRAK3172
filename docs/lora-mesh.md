@@ -16,8 +16,8 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
   itself always owns address `1`, slaves use `2`-`15` (14 nodes max).
 * **Convergecast** routing: every node forwards toward the master, multi-hop
   (up to `4` hops).
-* Each node has a **host-provisioned 6-byte identity token** used to claim an
-  address; a node with no token never starts the mesh.
+* Each node has a **host-provisioned 6-byte node device id** used to claim an
+  address; a node with no node device id never starts the mesh.
 * The master can send a payload **down** to a specific node (needed for
   application-layer ACKs).
 
@@ -35,44 +35,47 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
 |---------|---------|
 | `ATC+MESH=<0\|1>` | Enable / disable mesh mode (persisted). `ATC+MESH?` reads it. |
 | `ATC+MASTER=<0\|1>` | Designate this node as the master (persisted). `ATC+MASTER?` reads it. |
-| `ATC+MESHTOKEN=<12 hex>` | Set the 6-byte identity token (persisted). `ATC+MESHTOKEN?` reads it back. |
+| `ATC+MESHNODEDEVICEID=<12 hex>` | Set the 6-byte node device id (persisted). `ATC+MESHNODEDEVICEID?` reads it back. |
 | `ATC+MESHMAP=?` | Diagnostics (see below). |
-| `ATC+P2P=...,<mesh>:<master>[:<token>]` | Mesh flags and token as trailing params of the P2P config command. |
+| `ATC+P2P=<runcfg>:...,[:<mesh>:<master>:<deviceid>]` | Mesh flags and node device id as trailing params of the P2P config command. |
 
-A device only joins the network once mesh mode is enabled **and** it has a token
-and it is not the master. A node with **no token** neither beacons nor joins
-(the mesh does not start). Enabling/disabling takes effect immediately (no reboot
-required).
+A device only joins the network once mesh mode is enabled **and** it has a node
+device id and it is not the master. A node with **no node device id** neither
+beacons nor joins (the mesh does not start). Enabling/disabling takes effect
+immediately (no reboot required).
 
-**Token.** The token replaces the old device-derived identity. It is 6 bytes
-(12 hex chars) provisioned by the host -- e.g. the host's own device id -- so
-identity is deterministic and needs no hashing. 48 bits over <=14 nodes gives a
-collision probability of ~3e-13. It rides only the `JOIN_REQ` / `ADDR_ASSIGN` /
-`ADDR_CLAIM` control frames, never the data frames.
+**Node device id.** The node device id is a 6-byte (12 hex chars) identifier
+provisioned by the host from the host's own Bluetooth address, so it is unique
+per node. It rides only the `JOIN_REQ` / `ADDR_ASSIGN` / `ADDR_CLAIM` control
+frames, never the data frames.
 
-**`ATC+P2P` tail.** The legacy 12/13-argument forms are unchanged; the mesh tail
-is:
+**`ATC+P2P` layout.** The runtime-config selector is the **first parameter and
+is mandatory** (`0` = use the flash-stored config, `1` = use the runtime config);
+the 12 radio parameters follow, then the optional mesh tail. `ATC+P2P=?` returns
+the same layout -- its first field is the active selector -- so the query output
+can be fed straight back as a set command.
 
 | argc | params |
 |------|--------|
-| 12 | base only |
-| 13 (`argv[12]=="0"`) | base + runtime-config selector `0` |
-| 14 | base + `<mesh>:<master>` (token unchanged) |
-| 15 | base + `<mesh>:<master>:<token>` |
-| 16 (`argv[15]=="0"`) | base + `<mesh>:<master>:<token>` + runtime-config selector `0` |
-| 13 (`argv[12]=="1"`) / 16 (`argv[15]=="1"`) | as above, with the runtime-config selector `1` |
+| 13 | `<runcfg>` + 12 radio params |
+| 16 | `<runcfg>` + 12 radio params + `<mesh>:<master>:<deviceid>` |
 
-The token is 12 hex chars, so it is trivially distinguishable from the 1-char
-selector.
+`<runcfg>` is a single digit at `argv[0]`; the 12 radio parameters and the mesh
+tail are unchanged from the legacy `ATC+P2P`. Any other argument count is
+rejected. (Mesh can also be enabled and given a device id with the standalone
+`ATC+MESH` / `ATC+MASTER` / `ATC+MESHNODEDEVICEID` commands, which is how a node
+changes one field without resending the whole P2P config.)
 
 `ATC+MESHMAP=?` returns
-`MESHMAP=<enabled>:<master>:<addr>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neigh>:<epoch>:<overhead%>:<ackms>`
+`MESHMAP=<enabled>:<master>:<addr>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>`
 where `state` is `0`=unassigned, `1`=joining, `2`=joined; `alloc` is the number of
 addresses the master has handed out; `parent` is the current next hop (`0`=none);
-`hops`/`cost` are the route to the master; `neigh` is the live neighbour count;
-`epoch` is the master boot epoch last seen; `overhead%` is the measured
-control-plane airtime as a percentage of the data-frame airtime transmitted; and
-`ackms` is the derived per-hop ACK timeout for the current datarate.
+`hops`/`cost` are the route to the master; `neighbour-count` is the live neighbour
+count; `epoch` is the master's **boot number** -- a counter the master increments
+on every boot -- as last seen by this node (only its low 3 bits are advertised;
+see *Recovery*); `overhead%` is the measured control-plane airtime as a
+percentage of the data-frame airtime transmitted; and `ackms` is the derived
+per-hop ACK timeout for the current datarate.
 
 ## Host interface changes
 
@@ -105,12 +108,12 @@ as the sanity gate). The header is **3 bytes** (24 bits, no waste), MSB-first:
 | bits | field | notes |
 |------|-------|-------|
 | 3 | type | message type, `0`-`7` (see **Message types** below) |
-| 2 | flags | `ACK_REQ` (0x01), `HAS_PATH` (0x02, reserved) |
+| 2 | flags | reserved; always `0` today (see **Header flags**) |
 | 4 | src | source address (0-15) |
 | 4 | dst | destination (0-15; also carries the assigned address / acked origin) |
 | 3 | hops | beacon: hop-count to master; data: TTL (max 4) |
 | 5 | seq | dedup key `(src,seq)`, 32-value window |
-| 3 | version | protocol version (currently `1`) |
+| 3 | version | protocol version (currently `2`) |
 
 ```
 byte0 = type<<5 | flags<<3 | src>>1
@@ -118,27 +121,62 @@ byte1 = (src&1)<<7 | dst<<3 | hops
 byte2 = seq<<3 | version
 ```
 
+**Header flags.** The 2-bit `flags` field is **reserved and always `0`** today.
+There is no "ack requested" flag: the master answers **every** delivered uplink
+with an explicit `LINK_ACK`, since it has no next hop whose forward it could
+overhear the way a relay does. The only defined bit, `HAS_PATH` (0x02), is a
+reserved hook for carrying an explicit source path in the payload instead of
+relying on per-hop routing state; encoders send `0` and receivers ignore it.
+
 The WiRoc payload follows verbatim and is stripped of the header before delivery to
 the host. Control beacons carry a **1-byte** control payload after the header:
-`epoch[3]` (bits 7-5) packed over `path cost[5]` (bits 4-0).
+`epoch[3]` (bits 7-5) packed over `path cost[5]` (bits 4-0). The 3-bit `epoch` is
+the low bits of the master's **boot number** -- incremented by the master on each
+boot -- so nodes spot a restart when it changes.
+
+### Duplicate suppression (dedup)
+
+A flooded or multi-hop frame can reach the same node more than once -- a relay
+loop, two paths through the mesh, or a retransmit -- so every receiver drops a
+frame it has already seen. The key is the `(src, seq)` pair: the origin's address
+plus a 5-bit sequence number the origin allocates per frame. Relays copy both
+fields unchanged, so every copy of a frame carries the same key.
+
+The cache is a fixed **32-entry ring** (`MESH_DEDUP_SIZE`). On receive the node
+scans it; if the pair is present the frame is dropped, otherwise the pair is
+recorded (evicting the oldest entry) and the frame is accepted. A key is
+therefore only remembered for the next 32 *received* frames, and `seq` itself
+wraps at 32 (`2^5`); the TTL / hop cap is what keeps a stale duplicate from
+surviving long enough to be re-accepted.
+
+Two frames key differently:
+
+* `JOIN_REQ` is flooded by nodes that have **no address yet**, so its header
+  `src` is `0` for all of them. It is deduped on an 8-bit hash of the node device
+  id instead of `(src, seq)`, so two distinct joiners are not mistaken for each
+  other.
+* `BEACON` is link-local and never relayed, so it is **not** deduped at all.
+
+A node also records its own outbound floods as "seen" the moment it transmits, so
+the copies echoed back to it are ignored and cannot start a loop.
 
 ### Message types
 
-The 3-bit `type` field carries one of the following values. `MESH_TOKEN_LEN` = 6
-(the host-provisioned identity token); the value itself is part of the wire format
-and must not change without a version bump. An address that is already in the
+The 3-bit `type` field carries one of the following values. `MESH_NODE_DEVICE_ID_LEN`
+= 6 (the host-provisioned node device id); the value itself is part of the wire
+format and must not change without a version bump. An address that is already in the
 header is **not** repeated in the payload (header-field reuse).
 
 | id | type | on-air size (B) | delivery | payload | purpose |
 |----|------|-----------------|----------|---------|---------|
 | 0 | `BEACON` | 4 | link-local, not relayed, not deduped | `epoch[3]\|cost[5]` (1 B); header `hops` = hop-count to master | Liveness and routing advertisement. Emitted on an adaptive interval by the master and by any node that has a parent. Neighbours use it to select a parent and to detect a node going quiet. |
-| 1 | `JOIN_REQ` | 9 | flooded | `token[6]`; `src` = 0 | An unassigned node asks the master for an address, retrying with backoff until assigned. Because `src` is 0, it is deduped on a hash of the token instead of `(src,seq)`. |
-| 2 | `ADDR_ASSIGN` | 9 | flooded | `token[6]`; **assigned address in header `dst`** | The master's answer to a `JOIN_REQ` (and its re-assertion after an `ADDR_CLAIM`). The node whose token matches adopts and persists the address. A node that sees its own address given to a *different* token relinquishes it. |
+| 1 | `JOIN_REQ` | 9 | flooded | `devid[6]`; `src` = 0 | An unassigned node asks the master for an address, retrying with backoff until assigned. Because `src` is 0, it is deduped on its node device id instead of `(src,seq)`. |
+| 2 | `ADDR_ASSIGN` | 9 | flooded | `devid[6]`; **assigned address in header `dst`** | The master's answer to a `JOIN_REQ` (and its re-assertion after an `ADDR_CLAIM`). The node whose node device id matches adopts and persists the address. A node that sees its own address given to a *different* node device id relinquishes it. |
 | 3 | `ADDR_TABLE` | 5 | flooded (relayed by relays only) | `occupied_bitmap[2]` (16-bit; the master bit is always set) | The master floods its occupied-address bitmap whenever the table **changes** (debounced) and as a slow periodic backstop, so nodes can reconcile. A node that sees its own bit clear for `MESH_TABLE_MISS_LIMIT` intervals relinquishes its address and re-joins. A *leaf* does not relay it (see "Flood relay"). |
-| 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the master, carrying `ACK_REQ`. Each relay dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
+| 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the master. Each relay dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
 | 5 | `DATA_DOWNLINK` | 3 + N | flooded with `dst` = target (relayed by relays only) | WiRoc payload (N bytes) | A WiRoc payload from the master to one specific node. The target delivers it to its host; any other node that has children relays it one hop further (a *leaf* does not relay). |
-| 6 | `LINK_ACK` | 4 | broadcast (single hop) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, used only by the master (it has no next hop whose forward it could overhear, so relays rely on the implicit ACK instead). |
-| 7 | `ADDR_CLAIM` | 9 | rootward unicast (flood fallback) | `token[6]`; **own address already in header `src`** | A node re-announces its flash-stored address so a restarted master can rebuild its RAM-only table. Sent hop-by-hop toward the parent (on a new boot epoch, on re-attach, and periodically as a safety net); a node with no route yet -- or a relay that has lost its own parent -- floods it instead. |
+| 6 | `LINK_ACK` | 4 | broadcast (single hop) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, emitted only by the master, which has no next hop whose forward it could overhear; it sends one for every `DATA_UPLINK` it delivers. Relays use the implicit ACK instead. |
+| 7 | `ADDR_CLAIM` | 9 | rootward unicast (flood fallback) | `devid[6]`; **own address already in header `src`** | A node re-announces its flash-stored address so a restarted master can rebuild its RAM-only table. Sent hop-by-hop toward the parent (on a new boot epoch, on re-attach, and periodically as a safety net); a node with no route yet -- or a relay that has lost its own parent -- floods it instead. |
 
 All sizes include the fixed 3-byte header. The control types (0, 1, 2, 3, 6, 7) have
 a fixed length; the two data types (4, 5) are `3 + N`, where `N` is the verbatim
@@ -152,13 +190,14 @@ so it is used as the "invalid / out of range" bound when validating a frame.
 ## Join / address assignment
 
 1. A node with no stored address enters **JOINING** and floods
-   `JOIN_REQ{ token[6] }` from the mesh timer (start ~3 s, backing off to 15 s).
-   The `token` is the **6-byte host-provisioned identity token** (see
-   `ATC+MESHTOKEN`), so identity is deterministic and needs no hashing. It is
-   *not* a secret, only used to correlate an assignment back to the requester.
-   A node with no token set never enters JOINING.
-2. The master keeps a RAM-only token->address table, allocates the lowest free
-   address in 2-15 and floods `ADDR_ASSIGN{ token }` (the address is the header `dst`).
+   `JOIN_REQ{ devid[6] }` from the mesh timer (start ~3 s, backing off to 15 s).
+   The `devid` is the **6-byte host-provisioned node device id** (see
+   `ATC+MESHNODEDEVICEID`); it is *not* a secret, only used to correlate an
+   assignment back to the requester. A node with no node device id set never
+   enters JOINING.
+2. The master keeps a RAM-only node-device-id->address table, allocates the
+   lowest free address in 2-15 and floods `ADDR_ASSIGN{ devid }` (the address is
+   the header `dst`).
 3. The matching node adopts and **persists** the address (flash), emits
    `ADDR_CLAIM`, resets its beacon to fast, and becomes **JOINED**.
 4. The master floods `ADDR_TABLE{ occupied_bitmap[2] }` **whenever the table
@@ -198,10 +237,9 @@ Parent switching requires a hysteresis margin to avoid flapping, and a stale par
 
 ### Uplink
 
-The origin builds `DATA_UPLINK{ src, dst=parent, ttl, ACK_REQ, payload }` and
-unicasts it to its parent; each relay dedups `(src,seq)` and forwards to its own
-parent (TTL - 1). The master queues the payload to its host with `srcaddr` = the
-origin.
+The origin builds `DATA_UPLINK{ src, dst=parent, ttl, payload }` and unicasts it
+to its parent; each relay dedups `(src,seq)` and forwards to its own parent
+(TTL - 1). The master queues the payload to its host with `srcaddr` = the origin.
 
 ### Downlink
 
@@ -243,7 +281,7 @@ frame when it **overhears the next hop forward the same `(origin,seq)`** -- an
 implicit ACK -- and otherwise retransmits up to `MESH_LINK_RETRIES` times at the
 per-hop ACK timeout, then gives up. The **master has no next hop to overhear**, so
 it emits an explicit `LINK_ACK` (acked origin in the header `dst`, acked seq in the
-payload) after delivering. The timeout is **derived from the datarate**: it is
+payload) after delivering every uplink. The timeout is **derived from the datarate**: it is
 `~2x` the airtime of the frame being sent plus one timer tick, floored at 500 ms
 (reported as `ackms` by `ATC+MESHMAP?`).
 
@@ -265,7 +303,7 @@ has no neighbour at all it keeps listening until beacons return.
   first. The 3-bit epoch is enough because its only job is *fast* reboot detection;
   a rare miss (the master rebooting a multiple of 8 times while a node was deaf) is
   caught by the periodic `ADDR_CLAIM` safety net.
-* A node re-announces its flash-stored address with an `ADDR_CLAIM{ token }` (its
+* A node re-announces its flash-stored address with an `ADDR_CLAIM{ devid }` (its
   own address is already in the header `src`) when it sees a new epoch (fast
   path), on its first beacon after boot, after re-attaching a lost parent, and
   periodically as a safety net (`MESH_CLAIM_INTERVAL_MS`). The claim is a
@@ -274,8 +312,8 @@ has no neighbour at all it keeps listening until beacons return.
   flood. Only a node with no route yet (just booted / parent lost), or a relay
   that has lost its own parent, falls back to flooding it.
 * The master rebuilds its table from the claims: it adopts the claimed address when
-  free, re-asserts its own assignment when the token is already known, and hands
-  out a fresh address when the claimed one is already taken.
+  free, re-asserts its own assignment when the node device id is already known, and
+  hands out a fresh address when the claimed one is already taken.
 * Routing rebuilds on its own: the master is beaconing again within one interval and
   routing state is node-side.
 
@@ -283,8 +321,8 @@ has no neighbour at all it keeps listening until beacons return.
 from for `MESH_EVICT_MS`. A live node re-claims well inside that window, so an
 idle-but-alive node is never dropped.
 
-**Duplicate addresses.** If a node hears its own address handed to a different token
-it relinquishes it and re-joins, so no duplicate address can persist.
+**Duplicate addresses.** If a node hears its own address handed to a different node
+device id it relinquishes it and re-joins, so no duplicate address can persist.
 
 ## Tunables
 
@@ -345,8 +383,9 @@ not yet have a parent whose relay it could rely on.
 
 The mesh is designed to run at **31.25 kHz bandwidth** (the RAK bandwidth *enum*
 index `7`; "32 kHz" is really 31.25 kHz) with SF5-SF8. Set it with
-`ATC+P2P=<freq>:<sf>:7:<cr>:...` -- `service_lora_p2p_set_bandwidth()` takes the
-raw index, so `7` passes straight through.
+`ATC+P2P=0:<freq>:<sf>:7:<cr>:...` (the leading `0` is the mandatory
+runtime-config selector) -- `service_lora_p2p_set_bandwidth()` takes the raw
+index, so `7` passes straight through.
 
 At 31.25 kHz every frame's airtime is `4x` the 125 kHz value, so the control plane
 dominates. The firmware computes airtimes from the live radio parameters
@@ -535,11 +574,11 @@ throughput).
   (same for `mesh_alloc_test`, `mesh_route_test`).
 * **Build check** against the real target flags: compile the sketch sources with
   `-fsyntax-only` using the generated `compile_commands.json`.
-* **Lab, 2 devices**: set a token on each (`ATC+MESHTOKEN=<12 hex>`), enable mesh,
+* **Lab, 2 devices**: set a node device id on each (`ATC+MESHNODEDEVICEID=<12 hex>`), enable mesh,
   designate one master -> the slave joins and is assigned an address; slave
   `ATC+SEND` arrives at the master `ATC+REC` with `srcaddr` = the slave; an
   app-level ACK sent back with `ATC+SEND=<slave>:...` reaches the slave.
-* **Narrowband**: run two devices at `ATC+P2P=...,7,<SF>,...` (31.25 kHz) for SF5
+* **Narrowband**: run two devices at `ATC+P2P=0:<freq>:<sf>:7:<cr>:...` (31.25 kHz) for SF5
   and SF8; verify join, uplink, downlink, and that `ATC+MESHMAP?` reports the derived
   `ackms` and the measured `overhead%`.
 * **Lab, multi-hop**: three nodes in a line with the far one out of the master's
