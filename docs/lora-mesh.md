@@ -646,7 +646,7 @@ keepalive, liveness no longer scales with it.
 
 **Control-plane occupancy, % of wall-clock time (LINK_ACK and data excluded)**
 
-| topology | nodes | SF5 | SF6 | SF7 | SF8 |
+| topology | nodes (non-master) | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
 | **deep tree**              | 4  | 0.3% | 0.5% | 0.9% | 1.8% |
 |                           | 9  | 0.3% | 0.6% | 1.1% | 2.2% |
@@ -695,7 +695,13 @@ lost hop costs the ACK, which the host then resends).
 **Punches per minute, network-wide** (15-byte uplink / 7-byte downlink; the `LINK_ACK` term is
 included for every origin, so a punch from a direct child is slightly faster than shown).
 
-| topology | nodes | `d_avg` | SF5 | SF6 | SF7 | SF8 |
+`nodes` is the number of **non-master nodes** (the master node, address 1, is not
+counted); `d_avg` is the **mean hop count** from a node to the master node (the
+uplink's hop cost, and -- since the ACK is steered back down the same tree -- the
+downlink's too); and the SF5-SF8 columns are **punches per minute** at that spreading
+factor.
+
+| topology | nodes (non-master) | `d_avg` (mean hops to master) | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|---|
 | **deep tree**              | 4  | 2.5  | 180 | 102 | 57 | 32 |
 |                           | 9  | 3.3  | 139 | 79 | 44 | 25 |
