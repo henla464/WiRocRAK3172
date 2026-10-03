@@ -174,7 +174,7 @@ header is **not** repeated in the payload (header-field reuse).
 | 2 | `ADDR_ASSIGN` | 9 | flooded | `devid[6]`; **assigned address in header `dst`** | The master node's answer to a `JOIN_REQ` (and its re-assertion after an `ADDR_CLAIM`). The node whose node device id matches adopts and persists the address. A node that sees its own address given to a *different* node device id relinquishes it. |
 | 3 | `ADDR_TABLE` | 5 | flooded (relayed by relay nodes only) | `occupied_bitmap[2]` (16-bit; the master-node bit is always set) | The master node floods its occupied-address bitmap whenever the table **changes** (debounced) and as a slow periodic backstop, so nodes can reconcile. A node that sees its own bit clear for `MESH_TABLE_MISS_LIMIT` intervals relinquishes its address and re-joins. A leaf node does not relay it (see "Flood relay"). |
 | 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the master node. Each relay node dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
-| 5 | `DATA_DOWNLINK` | 3 + N | flooded with `dst` = target (relayed by relays only) | WiRoc payload (N bytes) | A WiRoc payload from the master node to one specific node. The target delivers it to its host; any other node that has children relays it one hop further (a leaf node does not relay). |
+| 5 | `DATA_DOWNLINK` | 3 + N | steered hop-by-hop down the tree (`dst` = target) | WiRoc payload (N bytes) | A WiRoc payload from the master node to one specific node. The target delivers it to its host; any other node re-broadcasts it one hop further **only when one of its children's subtree bitmaps covers the target**, so the frame follows the single branch that leads to the target (`depth(target)` transmissions) instead of flooding the tree. Best-effort (no per-hop retry); the host resends if the application-layer ACK does not return. |
 | 6 | `LINK_ACK` | 4 | broadcast (single hop) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, emitted only by the master node, which has no next hop whose forward it could overhear; it sends one for every `DATA_UPLINK` it delivers. Relay nodes use the implicit ACK instead. |
 | 7 | `ADDR_CLAIM` | 9 | rootward unicast (flood fallback) | `devid[6]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted master node can rebuild its RAM-only table. **Event-driven** -- sent on a new boot epoch, on boot, on re-attach, and when the depth >= 2 liveness watchdog sees our parent stop covering us; never on a plain timer. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead. |
 | 8 | `ADDR_ALIVE` | 5 | single hop to the parent (absorbed, never forwarded) | `subtree_bitmap[2]` (16-bit; bit `a` = "address `a` is alive in my subtree") | Periodic liveness **aggregate**, so the master node does not evict a deep idle node (whose beacon is link-local and never reaches it). Each node sets its own bit and ORs in the bitmap reported by each of its children, so **one frame covers a whole subtree**; the parent absorbs it and does not forward it, so the union of the master node's direct children's bitmaps covers every non-master node each round. **Only a relay node sends one** (a leaf is covered by its parent from its beacon); the master node refreshes last-heard for **every** set bit. Sent while the node holds a parent. |
@@ -244,10 +244,17 @@ to its parent; each relay node dedups `(src,seq)` and forwards to its own parent
 
 ### Downlink
 
-The master node floods `DATA_DOWNLINK{ src=master, dst=target, ttl }`; the node whose
-address matches delivers it to its host and any node with children relays it one
-hop further (bounded by TTL and dedup; a leaf node does not relay -- see "Flood
-relay").
+The master node sends `DATA_DOWNLINK{ src=master, dst=target, ttl }`; the node whose
+address matches delivers it to its host, and any other node relays it one hop further
+**only when one of its children's subtree bitmaps contains the target** (bounded by TTL
+and dedup). The subtree bitmaps carried by the `ADDR_ALIVE` aggregates therefore double
+as a routing table: at each hop exactly one node -- the one on the branch that leads to
+the target -- re-broadcasts, so the frame travels a single path of `depth(target)` hops
+instead of flooding. A relay node re-publishes its aggregate promptly when a **new**
+child appears (not just on the periodic interval), so a freshly attached node becomes
+routable without waiting a whole interval. The steer is best-effort (there is no forward
+to overhear at the last hop, so no per-hop retry); the host resends if no
+application-layer ACK comes back.
 
 ## Channel access (listen before talk)
 
@@ -426,11 +433,14 @@ node within one interval, and at the master node -- via that relay node -- regar
 
 **Flood relay.** A flood is re-broadcast once per receiving node (deduped on
 `(src,seq)`), so one flood costs one transmission per relay node. Floods whose
-recipients are all **attached** nodes -- `ADDR_TABLE` and `DATA_DOWNLINK` -- are
+recipients are all **attached** nodes -- `ADDR_TABLE` -- are
 relayed only by **relay nodes** (not leaf nodes, the same signal as leaf suppression): a
 node with no children has no downstream node, so its re-broadcast reaches nobody
 that has not already seen the frame, while the routing tree guarantees every
-attached node still receives the flood from its own parent. Floods that must
+attached node still receives the flood from its own parent. `DATA_DOWNLINK` is not a
+flood at all: it is **steered** down the tree, re-broadcast only by the node whose
+child's subtree bitmap contains the target (see the message table and "Downlink").
+Floods that must
 reach an **unattached** node -- `JOIN_REQ`, `ADDR_ASSIGN` and the flooded
 `ADDR_CLAIM` fallback -- are still relayed by
 **every node**, because the target may
@@ -554,35 +564,37 @@ average-2-hop 14-node tree at SF8, 4.9%).
 A WiRoc *punch* round trip costs: one **uplink** `DATA` (15 B payload -> 18 B frame)
 over `d_avg` hops; one **`LINK_ACK`** (4 B) from the master node (relay nodes use the implicit
 ACK, which costs no frame); and one **downlink** ACK `DATA` (7 B payload -> 10 B
-frame) that is *flooded* back, so it is relayed by every non-leaf node -- `F`
-transmissions. Fitting exchanges into the time left after the control plane (table
-above), assuming an error-free channel (no retransmits) and one exchange at a time,
-gives the network-wide rate below.
+frame) **steered back down the tree**, so it also costs `d_avg` hops rather than one
+transmission per relay node. One exchange is therefore `d_avg*(air18 + air10) + air4`
+of airtime, and the network-wide rate (one exchange at a time, error-free channel, no
+retransmits) is `60 / exchange` punches per minute. Retries, busy backoff and per-hop
+implicit-ACK waits make these figures upper bounds, and the steer is best-effort (a
+lost hop costs the ACK, which the host then resends).
 
 **Punches per minute, network-wide** (15 B up / 7 B down, `LINK_ACK` included).
 
-| topology | nodes | SF5 | SF6 | SF7 | SF8 |
-|---|---|---|---|---|---|
-| **deep tree**              | 4  | 145 | 81 | 45 | 25 |
-|                           | 9  | 126 | 71 | 38 | 20 |
-|                           | 14 | 121 | 67 | 36 | 18 |
-| **average 1.5 hops**       | 4  | 204 | 114 | 64 | 35 |
-|                           | 9  | 148 | 83 | 46 | 25 |
-|                           | 14 | 107 | 59 | 32 | 17 |
-| **average 2 hops**         | 4  | 174 | 98 | 54 | 30 |
-|                           | 9  | 111 | 62 | 34 | 18 |
-|                           | 14 | 85 | 47 | 25 | 13 |
+| topology | nodes | `d_avg` | SF5 | SF6 | SF7 | SF8 |
+|---|---|---|---|---|---|---|
+| **deep tree**              | 4  | 2.5  | 180 | 102 | 57 | 32 |
+|                           | 9  | 3.3  | 139 | 79 | 44 | 25 |
+|                           | 14 | 3.6  | 130 | 74 | 42 | 23 |
+| **average 1.5 hops**       | 4  | 1.5  | 280 | 157 | 88 | 49 |
+|                           | 9  | 1.6  | 271 | 153 | 86 | 47 |
+|                           | 14 | 1.5  | 280 | 157 | 88 | 49 |
+| **average 2 hops**         | 4  | 2.0  | 219 | 124 | 70 | 38 |
+|                           | 9  | 2.0  | 219 | 124 | 70 | 38 |
+|                           | 14 | 2.1  | 210 | 119 | 67 | 37 |
 
-The **downlink ACK flood dominates** once the tree has many relay nodes (see below).
-Retries, busy backoff and per-hop implicit-ACK waits make these figures upper bounds.
+Because the ACK is steered, the **number of relay nodes no longer enters the exchange
+cost** -- only the hop count `d_avg` does (see below).
 
-### Why the deep tree beats the balanced ones
+### Why the balanced trees now win
 
-The two costs move in opposite directions, because the uplink is a **unicast** (one
-frame per hop) while the downlink ACK is a **flood** (one frame per relay node). A
-balanced tree is shallower per node but has many more relay nodes, so its ACK flood is
-bigger even though its uplinks are shorter. The three N=14 shapes (`r` = relay node,
-`l` = leaf node):
+Both legs are **unicasts of `d_avg` hops**, so the exchange cost tracks the hop count
+and nothing else. The flood -- which used to scale with the number of relay nodes and
+so rewarded the deep tree -- is gone. A balanced tree puts most nodes one or two hops
+from the master node, so both the uplink and the steered ACK are short. The three N=14
+shapes (`r` = relay node, `l` = leaf node):
 
 deep tree (max uplink hops):
 
@@ -623,21 +635,22 @@ average 2 hops:
 relay nodes = 10 (M + 4 + 5)   d_avg = 2.1
 ```
 
-| tree | uplink unicast `d_avg x 369 ms` | `LINK_ACK` (master node) | downlink ACK flood `relay nodes x 289 ms` | exchange | punches/min |
+| tree | uplink unicast `d_avg x 369 ms` | `LINK_ACK` (master node) | steered ACK unicast `d_avg x 289 ms` | exchange | punches/min |
 |---|---|---|---|---|---|
-| deep tree | 1317 ms | 246 ms | **4 x 289 = 1156 ms** | 2719 ms | **18** |
-| average 1.5 hops | 554 ms | 246 ms | **8 x 289 = 2312 ms** | 3112 ms | 17 |
-| average 2 hops | 712 ms | 246 ms | **10 x 289 = 2890 ms** | 3848 ms | **13** |
+| deep tree | 1328 ms | 246 ms | **3.6 x 289 = 1040 ms** | 2614 ms | 23 |
+| average 1.5 hops | 554 ms | 246 ms | **1.5 x 289 = 434 ms** | 1234 ms | **49** |
+| average 2 hops | 775 ms | 246 ms | **2.1 x 289 = 607 ms** | 1628 ms | 37 |
 
-(`LINK_ACK` is a single 4 B frame from the master node per uplink -- 246 ms at SF8; the older
-`exchange` figures folded it in silently, which is why they exceed uplink + downlink.)
+(`LINK_ACK` is a single 4 B frame from the master node per uplink -- 246 ms at SF8.)
 
-So the **deep tree** is the *best* case for the downlink flood (fewest relay nodes) even
-though it is the worst case for hops -- and for the idle control plane, where the
-claim term dominates. It is the flood, not the hop count, that caps throughput. A
-reverse source-route ACK (the reserved `HAS_PATH`) would cost `d_avg` hops instead of
-`relay nodes` and flip the ordering back to the intuitive one (shorter tree -> more
-throughput).
+So the **average 1.5-hop tree** is the best case: it has the shortest uplinks *and* the
+shortest steered ACK. The deep tree is now the worst case for throughput (longest paths
+on both legs), even though it stays the best for the idle control plane, where the
+relay-count terms (beacons, aggregates, table flood) dominate -- the two optima differ.
+A flood reversed this relation, because the ACK then cost one frame per relay node.
+Steering the ACK along the subtree bitmaps removes that term with no wire change: the
+bitmaps are already on air in the `ADDR_ALIVE` aggregates, so no reverse source-route
+(`HAS_PATH`) is needed.
 
 ## Files
 
@@ -676,7 +689,9 @@ throughput).
   node's fast adoption) rather than waiting for the backstop; confirm a fresh
   multi-hop node keeps reconciling (no rising table-miss / no spurious re-join),
   i.e. its parent still relays the table. Confirm a leaf node does not re-broadcast
-  `ADDR_TABLE` / `DATA_DOWNLINK` while a relay node does.
+  `ADDR_TABLE` while a relay node does, and that a `DATA_DOWNLINK` is re-broadcast only
+  by the branch whose subtree bitmap contains the target (a relay node off that branch
+  stays silent).
 * **Channel access (CAD / backoff)**: hold the channel busy with a second
   transmitter and confirm a host `ATC+SEND` returns `AT_BUSY_ERROR` with no
   module-side resend, while module-generated traffic (beacons, joins) keeps
@@ -696,7 +711,11 @@ throughput).
 * The beacon epoch is 3 bits, so a master-node reboot that is a multiple of 8 while a
   node was deaf is caught by the `ADDR_TABLE` bitmap miss (the node sees its bit clear
   for `MESH_TABLE_MISS_LIMIT` floods and re-joins), not by a periodic claim.
-* Downlink uses a controlled flood rather than a recorded reverse source-route; the
-  `HAS_PATH` flag is reserved for a future source-route optimisation.
+* Downlink is steered along the tree by the `ADDR_ALIVE` subtree bitmaps rather than a
+  recorded reverse source-route (the `HAS_PATH` flag stays reserved). The steer is
+  best-effort: it needs the bitmaps to be current, so a node whose parent has not yet
+  reported it -- e.g. a relay node that just rebooted and has not heard a silent leaf
+  child re-claim -- is unreachable by downlink until the next aggregate or re-join; the
+  application-layer ACK / retry is the backstop.
 * Mesh and legacy P2P must not share a channel at the same time (mode is exclusive,
   and no magic byte distinguishes the two framings).

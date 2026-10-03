@@ -619,6 +619,13 @@ static void mesh_note_relay(uint8_t child)
         if (s_child_heard_ms[child] == 0) {
             s_child_bm[child]    = (uint16_t)(1u << child); /* at least itself */
             s_child_bm_ms[child] = 0;                       /* no subtree yet  */
+            if (was) {
+                /* A new child under an existing relay: publish the updated
+                 * subtree promptly, so the master (liveness) and our parent
+                 * (downlink steering) can reach it without waiting a whole
+                 * aggregate interval. */
+                s_alive_next_ms = 0;
+            }
         }
         s_child_heard_ms[child] = millis();
     }
@@ -1281,7 +1288,55 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
     }
 }
 
-/* Master: flood a payload down to a specific node. */
+/* --- Downlink routing (M4) ---------------------------------------------- *
+ * The tree the liveness plane already maintains is also a routing table: each
+ * node holds, per child, the bitmap of the addresses alive in that child's
+ * subtree (s_child_bm, refreshed by ADDR_ALIVE).  A downlink can therefore be
+ * steered one hop down the branch that contains its target instead of being
+ * flooded: only the node whose child's bitmap covers the target re-broadcasts,
+ * so a delivery costs depth(target) transmissions, not one per relay node.
+ * The liveness invariants make the lookup exact -- a relay always publishes an
+ * aggregate (so its parent's bitmap of it stays fresh), while a leaf's subtree
+ * is just itself -- so the bits partition the tree with no ambiguity. */
+
+/* The bitmap of a current child's subtree (0 when `a` is not our child).  The
+ * child's own bitmap is trusted only while it is fresh; once stale the child is
+ * reported as just itself, because it may have become a leaf (subtree gone). */
+static uint16_t mesh_child_bitmap(uint8_t a, uint32_t now)
+{
+    if (a < MESH_FIRST_SLAVE_ADDR || a > MESH_ADDR_MAX ||
+        a == mesh_get_address() || s_child_heard_ms[a] == 0 ||
+        (uint32_t)(now - s_child_heard_ms[a]) > MESH_ALIVE_CHILD_HOLD_MS) {
+        return 0;
+    }
+    if (s_child_bm_ms[a] != 0 &&
+        (uint32_t)(now - s_child_bm_ms[a]) <= MESH_ALIVE_CHILD_HOLD_MS) {
+        return s_child_bm[a];
+    }
+    return (uint16_t)(1u << a);
+}
+
+/* The child whose subtree contains `dst`, or MESH_ADDR_NONE.  A direct child
+ * covers itself (its seeded bitmap has its own bit set). */
+static uint8_t mesh_child_for(uint8_t dst)
+{
+    uint32_t now = millis();
+
+    if (dst < MESH_FIRST_SLAVE_ADDR || dst > MESH_ADDR_MAX ||
+        dst == mesh_get_address()) {
+        return MESH_ADDR_NONE;
+    }
+    for (uint8_t c = MESH_FIRST_SLAVE_ADDR; c <= MESH_ADDR_MAX; c++) {
+        if (mesh_child_bitmap(c, now) & (uint16_t)(1u << dst)) {
+            return c;
+        }
+    }
+    return MESH_ADDR_NONE;
+}
+
+/* Master: send a payload down to a specific node.  Steered hop by hop via the
+ * subtree bitmaps, so the frame is on air once per hop instead of once per
+ * relay node. */
 bool mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len)
 {
     uint8_t frame[MESH_MAX_FRAME];
@@ -1305,8 +1360,13 @@ bool mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len)
     return mesh_tx_radio_send(frame, flen);
 }
 
-/* Node: a downlink is flooded; the target delivers it to its host, everyone
- * else relays it one hop further (bounded by TTL and dedup). */
+/* Node: a downlink is steered down the tree.  The target delivers it to its
+ * host; every other node relays it one hop further only when a child's subtree
+ * bitmap covers the target, i.e. only the branch that leads to the target ever
+ * re-broadcasts.  A node off that branch stays silent, so the frame follows a
+ * single path of length depth(target) instead of flooding.  It is best-effort
+ * (no per-hop retry, since the target emits no forward the last relay could
+ * overhear); the host resends if no application-layer ACK comes back. */
 static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     if (h->dst == mesh_get_address()) {
@@ -1316,7 +1376,9 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
     if (mesh_is_master()) {
         return;                         /* the master originates downlinks */
     }
-    mesh_relay_flood_gated(h, payload, plen);
+    if (mesh_child_for(h->dst) != MESH_ADDR_NONE) {
+        mesh_relay_flood(h, payload, plen);
+    }
 }
 
 /* ======================================================================= */
@@ -1433,18 +1495,7 @@ static void mesh_send_alive(void)
     }
     bm = (uint16_t)(1u << mesh_get_address());
     for (uint8_t a = MESH_FIRST_SLAVE_ADDR; a <= MESH_ADDR_MAX; a++) {
-        if (a == mesh_get_address() || s_child_heard_ms[a] == 0) {
-            continue;
-        }
-        if ((uint32_t)(now - s_child_heard_ms[a]) > MESH_ALIVE_CHILD_HOLD_MS) {
-            continue;                   /* child gone */
-        }
-        if (s_child_bm_ms[a] != 0 &&
-            (uint32_t)(now - s_child_bm_ms[a]) <= MESH_ALIVE_CHILD_HOLD_MS) {
-            bm |= s_child_bm[a];        /* trusted subtree bitmap */
-        } else {
-            bm |= (uint16_t)(1u << a);  /* alive, but subtree unknown/stale */
-        }
+        bm |= mesh_child_bitmap(a, now); /* self, plus each current child's subtree */
     }
     payload[0] = (uint8_t)(bm & 0xFF);
     payload[1] = (uint8_t)(bm >> 8);
