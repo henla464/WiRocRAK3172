@@ -690,7 +690,8 @@ of airtime when the origin is not a direct child, and `d_avg*(air18 + air10)` (o
 fewer) when it is. The network-wide rate (one exchange at a time, error-free channel, no
 retransmits) is `60 / exchange` punches per minute. Retries, busy backoff and per-hop
 implicit-ACK waits make these figures upper bounds, and the steer is best-effort (a
-lost hop costs the ACK, which the host then resends).
+lost hop costs the ACK, which the host then resends). They are also **airtime only** --
+the store-and-forward wait between hops is quantified under *Realistic throughput* below.
 
 **Punches per minute, network-wide** (15-byte uplink / 7-byte downlink; the `LINK_ACK` term is
 included for every origin, so a punch from a direct child is slightly faster than shown).
@@ -780,6 +781,49 @@ A flood reversed this relation, because the ACK then cost one frame per relay no
 Steering the ACK along the subtree bitmaps removes that term with no wire change: the
 bitmaps are already on air in the `ADDR_ALIVE` aggregates, so no reverse source-route
 (`HAS_PATH`) is needed.
+
+### Realistic throughput (store-and-forward included)
+
+The tables above count **on-air airtime only** -- an exchange is the frames packed
+edge-to-edge, `d_avg*(air18+air10)+air4`, as if a relay forwarded the instant it
+heard a frame. In practice the dominant extra cost is the **store-and-forward
+wait**: every transmission is queued and sent by the mesh housekeeping timer, **one
+frame per tick** (`MESH_TIMER_PERIOD_MS`, 200 ms -- `mesh_tx_drain()` sends a single
+frame and returns). A relay therefore queues the frame it hears and the *next* tick
+drains it, so **every hop waits on average half a tick (100 ms), uniformly 0-200 ms**,
+plus a CAD listen before the send. The exchange has about `d_avg` hops on the uplink
+and `d_avg` on the steered-ACK leg, so add roughly
+
+```
+T_real  ~=  d_avg*(air18 + air10) + air4  +  d_avg*200 ms
+             \_____ airtime (as tabulated) _____/   \_ store-and-forward, mean _/
+```
+
+The store-and-forward term is a **fixed 200 ms per hop, independent of SF**: it costs
+the most, proportionally, at **SF5** (short frames, small airtime) and matters least at
+**SF8** (long frames already dominate). The result is a **practical upper bound**:
+
+| topology | nodes (non-master) | SF5 | SF6 | SF7 | SF8 |
+|---|---|---|---|---|---|
+| **deep tree**              | 4  | 72 | 55 | 39 | 25 |
+|                           | 9  | 55 | 42 | 30 | 19 |
+|                           | 14 | 51 | 39 | 28 | 18 |
+| **average 1.5 hops**       | 4  | 117 | 88 | 61 | 39 |
+|                           | 9  | 110 | 83 | 58 | 37 |
+|                           | 14 | 117 | 88 | 61 | 39 |
+| **average 2 hops**         | 4  | 89 | 68 | 48 | 31 |
+|                           | 9  | 89 | 68 | 48 | 31 |
+|                           | 14 | 85 | 65 | 45 | 29 |
+
+Like the tables above these are **punches per minute** for a single closed-loop flow
+(the host sends the next punch only after the previous ACK). The tick term is a **mean**:
+an unlucky phase against the 200 ms grid adds up to twice as much, a hop that is retried
+(implicit-ACK timeout `2*airtime + 200 ms`, up to `MESH_LINK_RETRIES` times) adds more,
+and a busy channel (CAD busy -> randomised backoff, 40-1280 ms doubling) adds more again.
+The channel is also shared: CAD plus per-node backoff serialize competitors, so a busy
+network lands below these figures. In short, a half-duplex store-and-forward mesh can
+**never fill the air** -- a relay must finish receiving before it can transmit -- so treat
+these as the practical ceiling, not a guarantee.
 
 ## Files
 
