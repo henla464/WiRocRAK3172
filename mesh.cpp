@@ -1334,9 +1334,15 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
     if (!mesh_tx_radio_send(frame, flen)) {
         return false;
     }
-    /* It is on the air: arm the pending entry so a lost hop is still retried
-     * by the mesh MAC (implicit link ACK), independent of the host. */
-    mesh_set_pending(frame, flen, mesh_get_address(), seq);
+    /* Arm the pending entry so a lost hop is still retried by the mesh MAC
+     * (implicit link ACK), independent of the host.  A direct child of the
+     * master is the exception: its parent is the root, which does not forward,
+     * so there is no forward to overhear and the master sends it no LINK_ACK.
+     * Its single hop is instead confirmed by the application-layer ACK, so it
+     * arms nothing here and the mesh MAC does not retransmit. */
+    if (s_route.parent_addr != MESH_MASTER_ADDR) {
+        mesh_set_pending(frame, flen, mesh_get_address(), seq);
+    }
     return true;
 }
 
@@ -1378,9 +1384,17 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
 
     if (mesh_is_master()) {
         mesh_deliver_to_host(payload, plen, h->src);
-        /* The master has no next hop whose forward it could overhear, so it
-         * always answers the incoming hop with an explicit LINK_ACK. */
-        mesh_send_link_ack(h->src, h->seq);
+        /* A relay node clears its pending on the next hop's forward (implicit
+         * ACK); the master has no next hop to overhear, so it answers with an
+         * explicit LINK_ACK.  The exception is a direct child of the master: its
+         * single hop is confirmed by the application-layer ACK (see
+         * mesh_send_uplink), so the master does not spend a LINK_ACK frame on it.
+         * A direct child's uplink is the only one that arrives at the full TTL
+         * (a relay is only ever in the path of deeper uplinks, which it
+         * decrements), so h->hops identifies it exactly. */
+        if (h->hops < MESH_DEFAULT_TTL) {
+            mesh_send_link_ack(h->src, h->seq);
+        }
         return;
     }
     if (h->dst != mesh_get_address()) {
