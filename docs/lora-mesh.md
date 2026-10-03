@@ -186,7 +186,7 @@ The 4-bit `type` field carries one of the following values. `MESH_NODE_DEVICE_ID
 format and must not change without a version bump. An address that is already in the
 header is **not** repeated in the payload (header-field reuse).
 
-| id | type | on-air size (B) | delivery | payload | purpose |
+| id | type | on-air size (bytes) | delivery | payload | purpose |
 |----|------|-----------------|----------|---------|---------|
 | 0 | `BEACON` | 4 | link-local, not relayed, not deduped | `epoch[3]\|cost[5]` (1 B); header `hops` = hop-count to the master node | Liveness and routing advertisement. Emitted on an adaptive interval by the master node and by any node that has a parent. Neighbours use it to select a parent and to detect a node going quiet. |
 | 1 | `JOIN_REQ` | 9 | flooded | `devid[6]`; `src` = 0 | An unassigned node asks the master node for an address, retrying with backoff until assigned. Because `src` is 0, it is deduped on its node device id instead of `(src,seq)`. |
@@ -572,20 +572,20 @@ dominates. The firmware computes airtimes from the live radio parameters
 (`service_lora_p2p_get_sf()/_get_bandwidth()`) using
 `Tsym = 2^SF / BW` and
 `n = 8 + max(ceil((8L - 4SF + 28 + 16)/(4(SF - 2DE))), 0) * (CR + 4)`.
-For the v3 frame sizes (CR 4/5, preamble 8, CRC on), approximate airtimes in ms are:
+For the v3 frame sizes (CR 4/5, preamble 8, CRC on), approximate airtimes are:
 
-| on-air frame | B | SF5 | SF6 | SF7 | SF8 |
+| on-air frame | bytes | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
-| BEACON | 4 | 36 | 72 | 123 | 246 |
-| LINK_ACK | 4 | 36 | 72 | 123 | 246 |
-| ADDR_TABLE | 5 | 41 | 72 | 123 | 246 |
-| ADDR_ALIVE | 5 | 41 | 72 | 123 | 246 |
-| JOIN_REQ / ADDR_ASSIGN | 9 | 46 | 82 | 164 | 287 |
-| ADDR_CLAIM | 10 | 52 | 93 | 165 | 289 |
-| TOPOLOGY (8 neighbours, worst case) | 20 | 71 | 120 | 219 | 390 |
-| DATA (15 B payload) | 18 | 67 | 113 | 205 | 369 |
-| DATA (7 B payload) | 10 | 52 | 93 | 165 | 289 |
-| DATA (27 B payload) | 30 | 92 | 154 | 287 | 492 |
+| BEACON | 4 | 36 ms | 72 ms | 123 ms | 246 ms |
+| LINK_ACK | 4 | 36 ms | 72 ms | 123 ms | 246 ms |
+| ADDR_TABLE | 5 | 41 ms | 72 ms | 123 ms | 246 ms |
+| ADDR_ALIVE | 5 | 41 ms | 72 ms | 123 ms | 246 ms |
+| JOIN_REQ / ADDR_ASSIGN | 9 | 46 ms | 82 ms | 164 ms | 287 ms |
+| ADDR_CLAIM | 10 | 52 ms | 93 ms | 165 ms | 289 ms |
+| TOPOLOGY (8 neighbours, worst case) | 20 | 71 ms | 120 ms | 219 ms | 390 ms |
+| DATA (15-byte payload) | 18 | 67 ms | 113 ms | 205 ms | 369 ms |
+| DATA (7-byte payload) | 10 | 52 ms | 93 ms | 165 ms | 289 ms |
+| DATA (27-byte payload) | 30 | 92 ms | 154 ms | 287 ms | 492 ms |
 
 Two structural facts matter: the **fixed per-frame cost** (preamble + header symbols
 = 12.25 symbols) is large -- at SF7 a 4-byte ACK spends ~40% of its airtime on the
