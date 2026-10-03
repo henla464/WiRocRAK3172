@@ -479,7 +479,9 @@ than a normal master reboot, so a reboot resets the run and does **not** cause a
 takeover. A separate **backstop** promotes after `MESH_STANDBY_BACKSTOP_MS` without
 *any* frame from the master (a beacon, downlink, ACK or table): this covers an idle
 network and a standby that boots into an already-dead network. The standby never
-beacons or joins, and it is not a member of the tree.
+beacons or joins, and it is not a member of the tree. Because it transmits
+nothing it adds **no channel load**: the control-plane occupancy and punch
+throughput figures elsewhere in this document are unchanged by its presence.
 
 **Takeover.** Promotion bumps the boot epoch (exactly like a master restart), so
 every node detects the change, re-adopts its address and re-claims -- the new master
