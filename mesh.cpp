@@ -22,6 +22,7 @@
 
 #define MESH_FLAG_ENABLED       0x01
 #define MESH_FLAG_MASTER        0x02
+#define MESH_FLAG_STANDBY       0x04    /* passive observer (M7); not the master  */
 
 /* ======================================================================= */
 /*  Persistent configuration                                              */
@@ -199,6 +200,20 @@ static uint8_t  s_topo_cost[MESH_ADDR_MAX + 1][MESH_ADDR_MAX + 1]; /* link cost 
  * the next backstop time. */
 static bool     s_topo_due;
 static uint32_t s_topo_next_ms;
+
+/* --- M7: standby master (passive observer) ----------------------------- */
+/* A standby transmits nothing.  It mirrors overheard uplinks to its host and,
+ * if the active master stops answering, promotes itself (see the M7 section).
+ * s_master_alive_ms is refreshed by every frame from the master and drives the
+ * backstop; the probe tracks one overheard uplink at a time, expecting the
+ * application ACK (a downlink back to the origin) within PROBE_MS. */
+static bool     s_master_seen;      /* a master frame has been heard (gates probe)*/
+static uint32_t s_master_alive_ms;  /* last frame heard from the master         */
+static bool     s_probe_active;     /* an uplink probe is in flight             */
+static uint8_t  s_probe_src;        /* the probed uplink's origin               */
+static uint32_t s_probe_deadline;   /* when an unconfirmed probe becomes a miss  */
+static uint8_t  s_probe_miss;       /* consecutive unacked probes               */
+static uint32_t s_probe_first_ms;   /* when the current miss run started        */
 /* Node only (Step 4) liveness monitor, armed at depth >= 2: we overhear our
  * parent's outgoing ADDR_ALIVE aggregate (a unicast to our grandparent, which
  * LoRa's shared medium lets us see) to confirm it still carries our bit
@@ -224,6 +239,10 @@ static void mesh_send_alive(void);
 static void mesh_send_topology(void);
 static void mesh_monitor_tick(uint32_t now);
 
+/* Defined in the M7 section below; used by the timer. */
+static void mesh_standby_tick(uint32_t now);
+static void mesh_standby_takeover(void);
+
 /* Radio/beacon helpers defined further down; used by the timer. */
 static void mesh_refresh_radio_params(void);
 static uint32_t mesh_frame_airtime_ms(uint8_t len);
@@ -234,9 +253,11 @@ static bool mesh_is_relay(void);
 /* Recompute the join FSM state from the current role / address / device id. */
 static void mesh_update_state(void)
 {
-    if (!mesh_is_enabled() || !mesh_has_node_device_id()) {
+    if (!mesh_is_enabled() || !mesh_has_node_device_id() ||
+        (s_cfg.flags & MESH_FLAG_STANDBY)) {
         /* Without a host-provisioned node device id the mesh does not run: no
-         * beacons and no join attempt.  It is how the master identifies us. */
+         * beacons and no join attempt.  It is how the master identifies us.
+         * A standby master (M7) is an observer, not a member of the tree. */
         s_state = MESH_STATE_UNASSIGNED;
     } else if (mesh_is_master() || mesh_get_address() != MESH_ADDR_NONE) {
         s_state = MESH_STATE_JOINED;
@@ -297,6 +318,17 @@ static void mesh_state_clear(void)
     memset(s_topo_cost, MESH_TOPO_NO_LINK, sizeof(s_topo_cost));
     s_topo_due        = false;
     s_topo_next_ms    = 0;
+
+    /* M7 standby state.  s_master_alive_ms starts at the boot reference so the
+     * backstop also fires for a standby that boots into a dead network. */
+    s_master_seen     = false;
+    s_master_alive_ms = millis();
+    s_probe_active    = false;
+    s_probe_src       = MESH_ADDR_NONE;
+    s_probe_deadline  = 0;
+    s_probe_miss      = 0;
+    s_probe_first_ms  = 0;
+
     s_mon_parent      = MESH_ADDR_NONE;
     s_mon_parent_ms   = 0;
     s_parent_alive_ms = 0;
@@ -403,12 +435,19 @@ static void mesh_timer_cb(void *)
     uint32_t now;
 
     if (!mesh_is_enabled() || !mesh_has_node_device_id()) {
-        return;
+        return;                         /* every mesh device carries a device id */
     }
     mesh_refresh_radio_params();
     mesh_tx_drain();
 
     now = millis();
+
+    /* Standby master (M7): observe only -- never emit a beacon or join, and run
+     * the liveness detector instead of the master / node branches below. */
+    if (mesh_is_standby()) {
+        mesh_standby_tick(now);
+        return;
+    }
 
     /* Beacons: the master and every routable node advertise periodically so
      * neighbours can pick parents and detect a node going down.  The interval
@@ -738,10 +777,30 @@ void mesh_set_master(bool master)
 {
     if (master) {
         s_cfg.flags |= MESH_FLAG_MASTER;
+        s_cfg.flags &= (uint8_t)~MESH_FLAG_STANDBY; /* roles are exclusive */
     } else {
         s_cfg.flags &= (uint8_t)~MESH_FLAG_MASTER;
     }
     mesh_apply_role();
+    mesh_update_state();
+}
+
+bool mesh_is_standby(void)
+{
+    return (s_cfg.flags & MESH_FLAG_STANDBY) != 0;
+}
+
+void mesh_set_standby(bool standby)
+{
+    if (standby) {
+        s_cfg.flags |= MESH_FLAG_STANDBY;
+        s_cfg.flags &= (uint8_t)~MESH_FLAG_MASTER;  /* roles are exclusive */
+        /* An observer holds no address and is not a tree member. */
+        s_cfg.address = MESH_ADDR_NONE;
+        mesh_state_clear();
+    } else {
+        s_cfg.flags &= (uint8_t)~MESH_FLAG_STANDBY;
+    }
     mesh_update_state();
 }
 
@@ -1382,6 +1441,20 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
     uint8_t frame[MESH_MAX_FRAME];
     uint8_t flen;
 
+    if (mesh_is_standby()) {
+        /* Passive observer (M7): mirror the uplink to our own host exactly as
+         * the master delivers the uplinks it receives, then probe for the
+         * master's application ACK.  Only one probe is in flight at a time, so
+         * a node's two quick uplinks are not counted as two independent trials. */
+        mesh_deliver_to_host(payload, plen, h->src);
+        if (!s_probe_active && s_master_seen &&
+            s_rx_snr >= MESH_STANDBY_MIN_SNR) {
+            s_probe_active   = true;
+            s_probe_src      = h->src;
+            s_probe_deadline = millis() + MESH_STANDBY_PROBE_MS;
+        }
+        return;                         /* never forward / ack: an observer is silent */
+    }
     if (mesh_is_master()) {
         mesh_deliver_to_host(payload, plen, h->src);
         /* A relay node clears its pending on the next hop's forward (implicit
@@ -1494,6 +1567,16 @@ bool mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len)
  * overhear); the host resends if no application-layer ACK comes back. */
 static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
+    if (mesh_is_standby()) {
+        /* The application ACK we are waiting for is a downlink from the master
+         * back to the origin of the probed uplink: a live, responsive master.
+         * Confirm the probe and reset the consecutive-miss run. */
+        if (s_probe_active && h->src == MESH_MASTER_ADDR && h->dst == s_probe_src) {
+            s_probe_active = false;
+            s_probe_miss   = 0;
+        }
+        return;                         /* never relay: an observer is not in the tree */
+    }
     if (h->dst == mesh_get_address()) {
         mesh_deliver_to_host(payload, plen, h->src);
         return;
@@ -1955,6 +2038,58 @@ static void mesh_rx_alive(const mesh_header_t *h, const uint8_t *payload, uint8_
     }
 }
 
+/* ======================================================================= */
+/*  M7: standby master (passive observer)                                 */
+/* ======================================================================= */
+
+/* Per-tick liveness check for the standby.  Two independent ways to declare the
+ * active master dead:
+ *   - the application-ACK probe: an uplink we probed got no downlink back to its
+ *     origin within MESH_STANDBY_PROBE_MS -> a miss.  MESH_STANDBY_MISS_LIMIT
+ *     misses in a row, spread over at least MESH_STANDBY_MIN_WINDOW_MS (so a
+ *     reboot shorter than that window does not promote), is "dead".
+ *   - the backstop: no frame from the master for MESH_STANDBY_BACKSTOP_MS (covers
+ *     an idle network and a standby that boots into a dead one -- the clock runs
+ *     from boot until the first master frame, because s_master_alive_ms starts
+ *     there). */
+static void mesh_standby_tick(uint32_t now)
+{
+    if (s_probe_active && (int32_t)(now - s_probe_deadline) >= 0) {
+        s_probe_active = false;         /* expired unconfirmed: a miss */
+        s_probe_miss++;
+        if (s_probe_miss == 1) {
+            s_probe_first_ms = now;
+        }
+        if (s_probe_miss >= MESH_STANDBY_MISS_LIMIT &&
+            (uint32_t)(now - s_probe_first_ms) >= MESH_STANDBY_MIN_WINDOW_MS) {
+            mesh_standby_takeover();
+            return;
+        }
+    }
+    if ((uint32_t)(now - s_master_alive_ms) >= MESH_STANDBY_BACKSTOP_MS) {
+        mesh_standby_takeover();
+    }
+}
+
+/* Promote the standby to master.  Clearing the standby role stops the observer
+ * paths; mesh_set_master(true) gives us address 1 and -- via mesh_apply_role --
+ * a fresh boot epoch, so every node sees the restart, re-adopts its address and
+ * re-claims (the master's table is RAM-only).  mesh_state_clear() drops the
+ * observer state and schedules the first beacon / ADDR_TABLE immediately, and
+ * the save persists the promotion across a power-cycle. */
+static void mesh_standby_takeover(void)
+{
+    s_cfg.flags &= (uint8_t)~MESH_FLAG_STANDBY;
+    /* Force a fresh epoch even if this device was an active master earlier in the
+     * power cycle (mesh_apply_role only bumps while s_boot_epoch is still 0), so
+     * the nodes always see a change and re-claim. */
+    s_boot_epoch = 0;
+    mesh_set_master(true);
+    mesh_state_clear();
+    mesh_update_state();
+    mesh_config_save();
+}
+
 uint16_t mesh_get_epoch(void)
 {
     return mesh_is_master() ? s_boot_epoch : s_master_epoch;
@@ -2000,6 +2135,12 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     if (mesh_is_master() && h.src >= MESH_FIRST_SLAVE_ADDR && h.src <= MESH_ADDR_MAX) {
         s_heard_ms[h.src] = millis();
     }
+    /* Standby master (M7): any frame from the master (beacon, downlink, ACK,
+     * table) refreshes the backstop heartbeat. */
+    if (mesh_is_standby() && h.src == MESH_MASTER_ADDR) {
+        s_master_alive_ms = millis();
+        s_master_seen     = true;
+    }
 
     payload = buf + MESH_HEADER_SIZE;
     plen    = (uint8_t)(len - MESH_HEADER_SIZE);
@@ -2033,6 +2174,18 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
         if (mesh_dedup_check(h.src, h.seq)) {
             return;                     /* duplicate */
         }
+    }
+
+    if (mesh_is_standby()) {
+        /* Passive observer (M7): dispatch only the two data types and return.
+         * Routing / forwarding handlers are skipped entirely so a standby can
+         * never enqueue a frame for the timer to transmit -- it stays silent. */
+        if (h.type == MESH_TYPE_DATA_UPLINK) {
+            mesh_rx_data_uplink(&h, payload, plen);
+        } else if (h.type == MESH_TYPE_DATA_DOWNLINK) {
+            mesh_rx_data_downlink(&h, payload, plen);
+        }
+        return;
     }
 
     switch (h.type) {

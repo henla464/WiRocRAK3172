@@ -34,7 +34,8 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
 | Command | Meaning |
 |---------|---------|
 | `ATC+MESH=<0\|1>` | Enable / disable mesh mode (persisted). `ATC+MESH?` reads it. |
-| `ATC+MASTER=<0\|1>` | Designate this node as the master node (persisted). `ATC+MASTER?` reads it. |
+| `ATC+ACTIVEMASTER=<0\|1>` | Designate this node as the active master node / gateway (persisted). `ATC+ACTIVEMASTER?` reads it. |
+| `ATC+STANDBYMASTER=<0\|1>` | Designate this node as a passive standby master (persisted). `ATC+STANDBYMASTER?` reads it. |
 | `ATC+MESHNODEDEVICEID=<12 hex>` | Set the 6-byte node device id (persisted). `ATC+MESHNODEDEVICEID?` reads it back. |
 | `ATC+MESHMAP=?` | Diagnostics (see below). |
 | `ATC+MESHTOPO=?` | Dump the topology map this node knows, one line per node (see below). |
@@ -64,19 +65,20 @@ can be fed straight back as a set command.
 `<runcfg>` is a single digit at `argv[0]`; the 12 radio parameters and the mesh
 tail are unchanged from the legacy `ATC+P2P`. Any other argument count is
 rejected. (Mesh can also be enabled and given a device id with the standalone
-`ATC+MESH` / `ATC+MASTER` / `ATC+MESHNODEDEVICEID` commands, which is how a node
+`ATC+MESH` / `ATC+ACTIVEMASTER` / `ATC+MESHNODEDEVICEID` commands, which is how a node
 changes one field without resending the whole P2P config.)
 
 `ATC+MESHMAP=?` returns
-`MESHMAP=<enabled>:<master>:<addr>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>`
+`MESHMAP=<enabled>:<master>:<addr>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>`
 where `state` is `0`=unassigned, `1`=joining, `2`=joined; `alloc` is the number of
 addresses the master node has handed out; `parent` is the current next hop (`0`=none);
 `hops`/`cost` are the route to the master node; `neighbour-count` is the live neighbour
 count; `epoch` is the master node's **boot number** -- a counter the master node increments
 on every boot -- as last seen by this node (only its low 3 bits are advertised;
 see *Recovery*); `overhead%` is the measured control-plane airtime as a
-percentage of the data-frame airtime transmitted; and `ackms` is the derived
-per-hop ACK timeout for the current datarate.
+percentage of the data-frame airtime transmitted; `ackms` is the derived
+per-hop ACK timeout for the current datarate; and `standby` is `1` when this node
+is a passive standby master (see *Standby master* below).
 
 `ATC+MESHTOPO=?` returns the topology map **this node** knows, one line per known
 node:
@@ -440,6 +442,51 @@ The map is a **diagnostic**: links are measured one-way and are noisy/asymmetric
 and the reports are best-effort (a missed report is recovered by the backstop).
 Nothing in the routing path depends on it.
 
+## Standby master
+
+A **standby master** is a node configured with `ATC+STANDBYMASTER=1` that acts as a
+shadow gateway: it **transmits nothing**, mirrors the uplinks it overhears to its
+own host over `ATC+REC` (exactly the payloads an active master would deliver from
+the uplinks it receives), and **auto-promotes** itself to active master if the
+active master stops answering. The standby role and the active-master role are
+mutually exclusive (`ATC+ACTIVEMASTER=1` clears standby and vice-versa).
+
+**Placement.** Put the standby within earshot of the active master *and* of the
+master's direct children -- there it hears every uplink as it converges on the
+master, plus the master's own responses. The forwarding and the failure detection
+both depend on that: a standby that can hear uplinks but not the master's
+downlinks cannot distinguish "the master is dead" from "I am out of range".
+
+**Liveness probe.** The standby judges the master alive on the **application-layer
+ACK only** -- the downlink the master's host sends back to an uplink's origin
+(`DATA_DOWNLINK` with `src` = master and `dst` = the uplink's source). A `LINK_ACK`
+does **not** count, because a direct child of the master is never sent one (its
+single hop is confirmed by the app ACK instead). Requiring the app ACK also means a
+master whose radio still beacons but whose **host has hung** is caught.
+
+For each uplink it overhears (deduplicated to one per `(src,seq)`):
+
+* only uplinks heard at an SNR of at least `MESH_STANDBY_MIN_SNR` are probed, so a
+  marginal reception does not read as a missed ACK;
+* only **one probe is in flight at a time**, so one node's two quick uplinks are
+  not counted as two independent trials; and
+* the app ACK must arrive within `MESH_STANDBY_PROBE_MS`, else the probe is a
+  **miss**.
+
+The standby promotes itself after `MESH_STANDBY_MISS_LIMIT` consecutive misses
+**spread over at least `MESH_STANDBY_MIN_WINDOW_MS`** (70 s). The window is longer
+than a normal master reboot, so a reboot resets the run and does **not** cause a
+takeover. A separate **backstop** promotes after `MESH_STANDBY_BACKSTOP_MS` without
+*any* frame from the master (a beacon, downlink, ACK or table): this covers an idle
+network and a standby that boots into an already-dead network. The standby never
+beacons or joins, and it is not a member of the tree.
+
+**Takeover.** Promotion bumps the boot epoch (exactly like a master restart), so
+every node detects the change, re-adopts its address and re-claims -- the new master
+rebuilds its RAM-only allocator from those claims, then routes and delivers
+uplinks as any master does. The promotion is persisted, so it survives a power
+cycle. The `ATC+MESHMAP` field `standby` reports the role.
+
 ## Tunables
 
 All intervals live in `mesh.h` and can be adjusted without touching logic:
@@ -466,6 +513,11 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_TOPO_INTERVAL_MS` | 300000 | topology-report backstop period (a re-parent also triggers an immediate report) |
 | `MESH_TOPO_HOLD_MS` | 900000 | the master node drops a node's map row after this long without a report |
 | `MESH_TOPO_MAX_NEIGH` | 8 | max neighbours carried in one `TOPOLOGY` report (= `MESH_NEIGHBOR_MAX`) |
+| `MESH_STANDBY_PROBE_MS` | 5000 | standby master: how long to wait for the app ACK after an uplink |
+| `MESH_STANDBY_MISS_LIMIT` | 2 | standby master: consecutive unacked uplinks before the master is deemed dead |
+| `MESH_STANDBY_MIN_WINDOW_MS` | 70000 | standby master: the misses must span at least this long (a shorter reboot does not promote) |
+| `MESH_STANDBY_BACKSTOP_MS` | 270000 | standby master: no frame from the master for this long -> promote (3x `MESH_BEACON_MAX_MS`) |
+| `MESH_STANDBY_MIN_SNR` | -6 | standby master: only uplinks heard at least this well (dB) are probed |
 
 **Adaptive beacon.** Each node's beacon interval starts at `MESH_BEACON_FAST_MS`
 and **doubles per stable interval** up to `MESH_BEACON_MAX_MS`, and is **reset to
@@ -723,11 +775,11 @@ bitmaps are already on air in the `ADDR_ALIVE` aggregates, so no reverse source-
 
 | File | Role |
 |------|------|
-| `mesh.h` / `mesh.cpp` | mesh engine: config, join, routing, MAC, recovery, topology map |
+| `mesh.h` / `mesh.cpp` | mesh engine: config, join, routing, MAC, recovery, topology map, standby master |
 | `mesh_wire.h` / `mesh_wire.cpp` | pure 3-byte header codec (host-tested) |
 | `mesh_alloc.h` / `mesh_alloc.cpp` | pure master-node address allocator (host-tested) |
 | `mesh_route.h` / `mesh_route.cpp` | pure link metric + parent selection (host-tested) |
-| `custom_at.cpp` | AT integration (`MESH`/`MASTER`/`MESHMAP`/`MESHTOPO`, `SEND`/`REC`) |
+| `custom_at.cpp` | AT integration (`MESH`/`ACTIVEMASTER`/`STANDBYMASTER`/`MESHMAP`/`MESHTOPO`, `SEND`/`REC`) |
 | `MessageQueue.h` | `SourceAddr` carried from RX to `ATC+REC` |
 | `test/` | host `g++` unit tests for the pure modules |
 
@@ -758,6 +810,16 @@ bitmaps are already on air in the `ADDR_ALIVE` aggregates, so no reverse source-
 * **Failure / recovery**: power off a relay node -> its children re-attach; reboot the
   master node -> nodes re-claim on the new epoch and are back within one or two beacon
   intervals. Reboot a non-master node -> it keeps / re-joins its address.
+* **Standby master**: set `ATC+STANDBYMASTER=1` on a node placed near the master node
+  and confirm (a) it forwards the uplink traffic to its own `ATC+REC`, (b) it emits
+  nothing (sniff; no beacon/join), (c) `ATC+MESHMAP?` reports `standby=1` while
+  `ACTIVEMASTER`/address are 0, and (d) it does **not** promote while the master node
+  answers. Power off the master node: confirm it keeps forwarding for
+  `MESH_STANDBY_MIN_WINDOW_MS` and then promotes (epoch bump), and the other nodes
+  re-claim and re-attach to it. Power-cycle the master node (a reboot shorter than the
+  window): confirm **no** promotion. Also confirm a reboot of the master node's **host**
+  (radio still up) eventually promotes -- the app-ACK probe, not the beacon, is what
+  detects it.
 * **Flood pruning / change-triggered table**: add a node and confirm the master node
   emits an `ADDR_TABLE` within ~`MESH_TABLE_DEBOUNCE_MS` (sniff, or watch the new
   node's fast adoption) rather than waiting for the backstop; confirm a fresh
@@ -776,7 +838,15 @@ bitmaps are already on air in the `ADDR_ALIVE` aggregates, so no reverse source-
 
 ## Limitations
 
-* The master node is a single point of failure by design.
+* The active master node is a single point of failure unless a **standby master** is
+  deployed. The standby makes the recovery automatic but is itself constrained: it
+  must be placed where it hears both the uplinks and the master's downlinks; its
+  probe is blind to traffic that is legitimately never acknowledged at the
+  application layer (such traffic is read as a missed ACK); and the
+  `MESH_STANDBY_MIN_WINDOW_MS` guard only **bounds** split-brain -- a genuine outage
+  means the promoted node owns address 1 thereafter, and recovery from an
+  unexpected reappearance of the old master (or from the two hosts both now holding
+  a gateway feed) is manual.
 * A **direct child** of the master node gets no `LINK_ACK`, so it does not retransmit
   its uplink at the mesh layer -- it relies entirely on the application-layer ACK
   (and retry). This is safe only because WiRoc's protocol acknowledges its messages; a

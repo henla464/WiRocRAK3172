@@ -60,6 +60,11 @@ void    mesh_set_enabled(bool enabled);
 bool    mesh_is_master(void);
 void    mesh_set_master(bool master);
 
+/* A standby master is a passive observer (see "M7 standby master" below).  It is
+ * mutually exclusive with the master role: setting one clears the other. */
+bool    mesh_is_standby(void);
+void    mesh_set_standby(bool standby);
+
 uint8_t mesh_get_address(void);
 void    mesh_set_address(uint8_t address);
 
@@ -177,6 +182,31 @@ typedef struct {
  * part of the tree it is on the path for.  Rows age out after MESH_TOPO_HOLD_MS. */
 uint8_t mesh_topo_row_count(void);
 bool    mesh_topo_row(uint8_t index, mesh_topo_row_t *out);
+
+/* --- M7 standby master -------------------------------------------------- */
+/* A standby master is a passive observer placed within earshot of the active
+ * master and of the master's direct children.  It transmits nothing: it mirrors
+ * the uplink payloads it overhears to its host (ATC+REC) exactly as the master
+ * delivers the uplinks it receives, and -- if the master stops answering -- it
+ * promotes itself to master (address 1, fresh boot epoch), after which the nodes
+ * re-claim and rebuild the tree.
+ *
+ * Liveness is probed on the application-layer ACK only.  After overhearing an
+ * uplink the standby expects a DATA_DOWNLINK addressed back to that uplink's
+ * origin within MESH_STANDBY_PROBE_MS; a LINK_ACK does not count (a direct child
+ * of the master gets none), so this also catches a master whose host has hung
+ * while its radio still beacons.  Only uplinks heard at >= MESH_STANDBY_MIN_SNR
+ * are probed, one probe is in flight at a time (so a node's two quick uplinks are
+ * not two independent trials), and the misses must span MESH_STANDBY_MIN_WINDOW_MS
+ * (longer than a normal reboot) before the takeover fires.  Any frame from the
+ * master refreshes the backstop; MESH_STANDBY_BACKSTOP_MS of silence also
+ * promotes (this covers an idle network and a standby booting into a dead one). */
+#define MESH_STANDBY_PROBE_MS        5000    /* wait for the app ACK after an uplink */
+#define MESH_STANDBY_MISS_LIMIT      2       /* consecutive unacked uplinks -> dead  */
+#define MESH_STANDBY_MIN_WINDOW_MS   70000   /* misses must span at least this long  */
+#define MESH_STANDBY_BACKSTOP_MS     270000  /* no master frame -> dead (3x beacon)  */
+#define MESH_STANDBY_MIN_SNR         (-6)    /* only probe uplinks heard at least this
+                                              * well (dB) */
 
 /* Master boot epoch last heard (0 while unknown). */
 uint16_t mesh_get_epoch(void);

@@ -24,7 +24,8 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int config_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int receive_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int mesh_handler(SERIAL_PORT port, char *cmd, stParam *param);
-int master_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int activemaster_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int standbymaster_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param);
@@ -80,9 +81,13 @@ bool init_mesh_at(void)
 								(char *)"Enable/disable LoRa mesh mode. Usage: ATC+MESH=<0|1>",
 								(char *)"MESH", mesh_handler,
 								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
-	ok &= api.system.atMode.add((char *)"MASTER",
-								(char *)"Set this node as mesh master/gateway. Usage: ATC+MASTER=<0|1>",
-								(char *)"MASTER", master_handler,
+	ok &= api.system.atMode.add((char *)"ACTIVEMASTER",
+								(char *)"Set this node as the mesh master/gateway. Usage: ATC+ACTIVEMASTER=<0|1>",
+								(char *)"ACTIVEMASTER", activemaster_handler,
+								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
+	ok &= api.system.atMode.add((char *)"STANDBYMASTER",
+								(char *)"Set this node as a passive standby master (listens, forwards uplinks to the host and takes over if the active master dies). Usage: ATC+STANDBYMASTER=<0|1>",
+								(char *)"STANDBYMASTER", standbymaster_handler,
 								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
 	ok &= api.system.atMode.add((char *)"MESHMAP",
 								(char *)"Get mesh state. Usage: ATC+MESHMAP=?",
@@ -184,9 +189,10 @@ int mesh_handler(SERIAL_PORT port, char *cmd, stParam *param)
 }
 
 /**
- * @brief Set this node as mesh master/gateway. Usage: ATC+MASTER=<0|1> / ATC+MASTER=?
+ * @brief Set this node as the mesh master/gateway.
+ *        Usage: ATC+ACTIVEMASTER=<0|1> / ATC+ACTIVEMASTER=?
  */
-int master_handler(SERIAL_PORT port, char *cmd, stParam *param)
+int activemaster_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if (param->argc == 1 && !strcmp(param->argv[0], "?"))
 	{
@@ -201,6 +207,33 @@ int master_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		if (master > 1)
 			return AT_PARAM_ERROR;
 		mesh_set_master(master != 0);
+		mesh_config_save();
+		return AT_OK;
+	}
+	return AT_PARAM_ERROR;
+}
+
+/**
+ * @brief Set this node as a passive standby master.  It transmits nothing: it
+ *        mirrors the uplinks it overhears to its host (ATC+REC) and promotes
+ *        itself to active master if the active master stops answering.
+ *        Usage: ATC+STANDBYMASTER=<0|1> / ATC+STANDBYMASTER=?
+ */
+int standbymaster_handler(SERIAL_PORT port, char *cmd, stParam *param)
+{
+	if (param->argc == 1 && !strcmp(param->argv[0], "?"))
+	{
+		atcmd_printf("%s=%d", cmd, mesh_is_standby() ? 1 : 0);
+		return AT_NO_STATUS;
+	}
+	else if (param->argc == 1)
+	{
+		uint32_t standby;
+		if (0 != at_check_digital_uint32_t(param->argv[0], &standby))
+			return AT_PARAM_ERROR;
+		if (standby > 1)
+			return AT_PARAM_ERROR;
+		mesh_set_standby(standby != 0);
 		mesh_config_save();
 		return AT_OK;
 	}
@@ -246,7 +279,7 @@ int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param)
 /**
  * @brief Get mesh state. Usage: ATC+MESHMAP=?
  *        Returns
- *        '<enabled>:<is master>:<own address>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>'
+ *        '<enabled>:<is master>:<own address>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>'
  *        where <state> is 0=unassigned 1=joining 2=joined, <alloc> is the number
  *        of addresses the master has allocated, <parent> is the current parent
  *        address (0 = none), <hops>/<cost> are the route to the master,
@@ -254,14 +287,15 @@ int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param)
  *        boot number (incremented on every boot; only its low 3 bits ride the
  *        beacon) as last seen by this node,
  *        <overhead%> is the measured control-plane airtime as a percentage of
- *        the data-frame airtime transmitted and <ackms> is the derived per-hop
- *        ACK timeout (datarate dependent).
+ *        the data-frame airtime transmitted, <ackms> is the derived per-hop
+ *        ACK timeout (datarate dependent) and <standby> is 1 when this node is
+ *        a passive standby master (M7).
  */
 int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if ((param->argc == 1 && !strcmp(param->argv[0], "?")) || param->argc == 0)
 	{
-		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d", cmd,
+		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d", cmd,
 					 mesh_is_enabled() ? 1 : 0,
 					 mesh_is_master() ? 1 : 0,
 					 mesh_get_address(),
@@ -274,7 +308,8 @@ int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
 					 mesh_get_neighbor_count(),
 					 mesh_get_epoch(),
 					 mesh_get_overhead_pct(),
-					 (int)mesh_get_link_ack_timeout_ms());
+					 (int)mesh_get_link_ack_timeout_ms(),
+					 mesh_is_standby() ? 1 : 0);
 		return AT_NO_STATUS;
 	}
 	return AT_PARAM_ERROR;
