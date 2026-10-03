@@ -137,6 +137,17 @@ bool    mesh_send_uplink(const uint8_t *payload, uint8_t len);
 #define MESH_TX_BACKOFF_MIN_MS   40     /* smallest randomised window (ms)    */
 #define MESH_TX_BACKOFF_MAX_MS   1280   /* ceiling of the doubling backoff    */
 
+/* Fast forward path: a point-to-point frame (data, link-ack, claim, topology)
+ * is drained by a one-shot timer a few ms after it is queued, rather than
+ * waiting up to one MESH_TIMER_PERIOD_MS housekeeping tick.  This removes most
+ * of the per-hop store-and-forward latency from the data path (see "Realistic
+ * throughput" in the design).  A small random jitter keeps two nodes that heard
+ * the same frame from keying up together.  Broadcasts / floods (dst = NONE)
+ * stay on the periodic tick, whose distinct per-node phase spreads their
+ * forwarders -- that decorrelation is worth more than the latency there. */
+#define MESH_TX_FAST_MS          10     /* base delay before an immediate drain */
+#define MESH_TX_FAST_JITTER_MS   30     /* random extra, decorrelates forwarders */
+
 /* Master only: flood a payload down to a specific node (0 on failure). */
 bool    mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len);
 

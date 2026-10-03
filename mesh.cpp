@@ -147,6 +147,7 @@ static uint32_t s_air_data;
 static uint32_t s_tx_next_ms;                   /* earliest next drain attempt */
 static uint32_t s_tx_backoff_ms;                /* current backoff window      */
 static uint32_t s_rand_state;                   /* xorshift PRNG state         */
+static bool     s_tx_fast_armed;                /* fast-drain one-shot is armed */
 
 /* Last unicast frame awaiting an implicit hop ACK (M4). */
 typedef struct {
@@ -243,6 +244,11 @@ static void mesh_monitor_tick(uint32_t now);
 static void mesh_standby_tick(uint32_t now);
 static void mesh_standby_takeover(void);
 
+/* Fast forward path: a point-to-point frame is drained by a one-shot timer
+ * rather than waiting for the next housekeeping tick (see mesh_tx_schedule). */
+static void mesh_tx_schedule(void);
+static void mesh_tx_fast_cb(void *);
+
 /* Radio/beacon helpers defined further down; used by the timer. */
 static void mesh_refresh_radio_params(void);
 static uint32_t mesh_frame_airtime_ms(uint8_t len);
@@ -291,6 +297,7 @@ static void mesh_state_clear(void)
     s_air_data       = 0;
     s_tx_next_ms     = 0;
     s_tx_backoff_ms  = MESH_TX_BACKOFF_MIN_MS;
+    s_tx_fast_armed  = false;
     s_rand_state     = 0x9E3779B9u ^ millis();  /* per-node, non-zero */
     if (s_rand_state == 0) {
         s_rand_state = 0x1234567u;
@@ -428,6 +435,39 @@ static void mesh_tx_drain(void)
             s_tx_backoff_ms = MESH_TX_BACKOFF_MAX_MS;
         }
     }
+}
+
+/* Arm the fast-drain one-shot when there is queued point-to-point work.  Called
+ * when such a frame is queued, and again after every fast drain (to send the
+ * rest of the queue, or to wait out a busy backoff).  Broadcasts never reach
+ * here -- they stay on the periodic tick, whose per-node phase spreads the
+ * relays.  Arming is idempotent: a second queued frame does not push the
+ * already-scheduled drain further out. */
+static void mesh_tx_schedule(void)
+{
+    uint32_t now, delay;
+
+    if (s_tx_fast_armed || !mesh_is_enabled() || mesh_is_standby() ||
+        s_txq_count == 0) {
+        return;
+    }
+    now = millis();
+    if ((int32_t)(now - s_tx_next_ms) < 0) {
+        delay = (uint32_t)(s_tx_next_ms - now);   /* hold off: channel was busy */
+    } else {
+        delay = MESH_TX_FAST_MS + (mesh_rand() % MESH_TX_FAST_JITTER_MS);
+    }
+    if (api.system.timer.create(RAK_TIMER_3, mesh_tx_fast_cb, RAK_TIMER_ONESHOT) &&
+        api.system.timer.start(RAK_TIMER_3, delay, NULL)) {
+        s_tx_fast_armed = true;
+    }
+}
+
+static void mesh_tx_fast_cb(void *)
+{
+    s_tx_fast_armed = false;
+    mesh_tx_drain();            /* one frame, or a fresh busy backoff          */
+    mesh_tx_schedule();         /* more queued, or the backoff to wait out     */
 }
 
 static void mesh_timer_cb(void *)
@@ -586,6 +626,10 @@ static void mesh_timer_start(void)
 static void mesh_timer_stop(void)
 {
     api.system.timer.stop(RAK_TIMER_2);
+    if (s_tx_fast_armed) {
+        api.system.timer.stop(RAK_TIMER_3);
+        s_tx_fast_armed = false;
+    }
 }
 
 /* ======================================================================= */
@@ -846,6 +890,8 @@ void mesh_get_node_device_id(uint8_t out[MESH_NODE_DEVICE_ID_LEN])
 
 bool mesh_send_frame(const uint8_t *frame, uint8_t len)
 {
+    mesh_header_t h;
+
     if (!mesh_is_enabled() || len == 0 || len > MESH_MAX_FRAME) {
         return false;
     }
@@ -856,6 +902,16 @@ bool mesh_send_frame(const uint8_t *frame, uint8_t len)
     memcpy(s_txq[s_txq_tail].buf, frame, len);
     s_txq_tail = (uint8_t)((s_txq_tail + 1) % MESH_TX_QUEUE_SIZE);
     s_txq_count++;
+
+    /* A point-to-point frame (dst set: data, link-ack, claim, topology) skips
+     * the housekeeping tick and is drained by a one-shot timer a few ms from
+     * now.  Broadcasts / floods (dst = NONE) stay on the tick -- its per-node
+     * phase is what spreads their forwarders, and control latency does not
+     * matter. */
+    mesh_wire_decode(frame, &h);
+    if (h.dst != MESH_ADDR_NONE) {
+        mesh_tx_schedule();
+    }
     return true;
 }
 

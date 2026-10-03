@@ -290,12 +290,17 @@ frame is **not** put on the air (`psend` returns false).
 How a busy channel is handled depends on who wants the transmission:
 
 * **Module-generated traffic** (beacons, joins, claims, table floods, relay forwards,
-  link ACKs and link retransmits) is queued and re-tried by the mesh timer. After
-  a busy verdict the drain holds off for a **randomised backoff** that starts at
-  `MESH_TX_BACKOFF_MIN_MS` and **doubles per consecutive busy attempt** up to
-  `MESH_TX_BACKOFF_MAX_MS`, resetting after a clean send. The random draw (from a
-  per-node xorshift PRNG) stops nodes that just collided from retrying in lockstep
-  on the 200 ms tick.
+  link ACKs and link retransmits) is queued and drained by the mesh TX queue. A
+  **point-to-point** frame (data, link-ack, claim, topology) is drained by a **fast
+  one-shot timer** -- `MESH_TX_FAST_MS` (10 ms) + up to `MESH_TX_FAST_JITTER_MS`
+  (30 ms) after it is queued -- so a hop forwards almost immediately instead of
+  waiting for the housekeeping tick; a **broadcast/flood** frame (dst = NONE) waits
+  for the next `MESH_TIMER_PERIOD_MS` (200 ms) tick, whose distinct per-node phase
+  spreads competing relay forwarders (that decorrelation is worth more than the
+  latency there). After a busy verdict the drain holds off for a **randomised backoff**
+  that starts at `MESH_TX_BACKOFF_MIN_MS` and **doubles per consecutive busy attempt**
+  up to `MESH_TX_BACKOFF_MAX_MS`, resetting after a clean send. The random draw (from a
+  per-node xorshift PRNG) stops nodes that just collided from retrying in lockstep.
 * **Host-originated traffic** (`ATC+SEND`, i.e. an uplink or a master-node downlink) is
   **not queued**. The frame is tried **once, immediately**: if the channel is busy
   the AT handler returns `AT_BUSY_ERROR` and the **host owns the backoff and
@@ -509,6 +514,7 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_RECOVER_MS` | 10000 | master-node post-boot recovery window |
 | `MESH_LINK_RETRIES` | 3 | link retransmits (timeout is derived, see MAC) |
 | `MESH_TX_BACKOFF_MIN_MS` / `MESH_TX_BACKOFF_MAX_MS` | 40 / 1280 | queued-frame backoff after a busy CAD (randomised window, doubles per attempt) |
+| `MESH_TX_FAST_MS` / `MESH_TX_FAST_JITTER_MS` | 10 / 30 | fast drain delay for a point-to-point frame (base + random jitter) before it is sent, instead of waiting for the 200 ms housekeeping tick |
 | `MESH_DEFAULT_TTL` | 4 | max hops |
 | `MESH_NEIGHBOR_MAX` | 8 | tracked neighbours per node |
 | `MESH_PARENT_HYSTERESIS` | 1 | cost margin required to switch parent |
@@ -786,44 +792,54 @@ bitmaps are already on air in the `ADDR_ALIVE` aggregates, so no reverse source-
 
 The tables above count **on-air airtime only** -- an exchange is the frames packed
 edge-to-edge, `d_avg*(air18+air10)+air4`, as if a relay forwarded the instant it
-heard a frame. In practice the dominant extra cost is the **store-and-forward
-wait**: every transmission is queued and sent by the mesh housekeeping timer, **one
-frame per tick** (`MESH_TIMER_PERIOD_MS`, 200 ms -- `mesh_tx_drain()` sends a single
-frame and returns). A relay therefore queues the frame it hears and the *next* tick
-drains it, so **every hop waits on average half a tick (100 ms), uniformly 0-200 ms**,
-plus a CAD listen before the send. The exchange has about `d_avg` hops on the uplink
-and `d_avg` on the steered-ACK leg, so add roughly
+heard a frame. In practice each hop also pays a **store-and-forward wait**: every
+transmission is queued and drained later, so the gap between hearing a frame and
+forwarding it is dead air. That wait is set by whichever drains the queue first:
+
+* the **fast forward path** -- a point-to-point frame (data, link-ack, claim,
+  topology) arms a one-shot timer that drains it `MESH_TX_FAST_MS` (10 ms) plus a
+  random jitter of up to `MESH_TX_FAST_JITTER_MS` (30 ms) later; and
+* the **housekeeping tick** -- a broadcast/flood frame (dst = NONE) waits for the
+  next `MESH_TIMER_PERIOD_MS` (200 ms) tick, whose per-node phase is what spreads
+  competing flood relays.
+
+The punch exchange is point-to-point, so its relayed hops -- and the master's
+`LINK_ACK` -- ride the fast path (the origin's uplink and the master's downlink
+first hop are host-originated and sent immediately). **Every relayed hop waits on
+average 25 ms** (`10 + 30/2`), uniformly 10-40 ms, instead of half a tick. The
+exchange has about `d_avg` hops on the uplink and `d_avg` on the steered-ACK leg,
+so add roughly
 
 ```
-T_real  ~=  d_avg*(air18 + air10) + air4  +  d_avg*200 ms
-             \_____ airtime (as tabulated) _____/   \_ store-and-forward, mean _/
+T_real  ~=  d_avg*(air18 + air10) + air4  +  2*d_avg*25 ms
+             \_____ airtime (as tabulated) _____/   \_ fast store-and-forward, mean _/
 ```
 
-The store-and-forward term is a **fixed 200 ms per hop, independent of SF**: it costs
-the most, proportionally, at **SF5** (short frames, small airtime) and matters least at
-**SF8** (long frames already dominate). The result is a **practical upper bound**:
+Because the fixed per-hop term is now small (25 ms), it is **no longer SF-scaling-
+dominated**: it is a modest, roughly constant penalty that the long SF8 frames
+already dwarf. The result is a **practical upper bound**:
 
 | topology | nodes (non-master) | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
-| **deep tree**              | 4  | 72 | 55 | 39 | 25 |
-|                           | 9  | 55 | 42 | 30 | 19 |
-|                           | 14 | 51 | 39 | 28 | 18 |
-| **average 1.5 hops**       | 4  | 117 | 88 | 61 | 39 |
-|                           | 9  | 110 | 83 | 58 | 37 |
-|                           | 14 | 117 | 88 | 61 | 39 |
-| **average 2 hops**         | 4  | 89 | 68 | 48 | 31 |
-|                           | 9  | 89 | 68 | 48 | 31 |
-|                           | 14 | 85 | 65 | 45 | 29 |
+| **deep tree**              | 4  | 131 | 84 | 51 | 30 |
+|                           | 9  | 101 | 65 | 40 | 23 |
+|                           | 14 | 93 | 60 | 37 | 21 |
+| **average 1.5 hops**       | 4  | 207 | 132 | 80 | 46 |
+|                           | 9  | 196 | 125 | 75 | 44 |
+|                           | 14 | 207 | 132 | 80 | 46 |
+| **average 2 hops**         | 4  | 160 | 103 | 62 | 36 |
+|                           | 9  | 160 | 103 | 62 | 36 |
+|                           | 14 | 153 | 98 | 60 | 35 |
 
 Like the tables above these are **punches per minute** for a single closed-loop flow
-(the host sends the next punch only after the previous ACK). The tick term is a **mean**:
-an unlucky phase against the 200 ms grid adds up to twice as much, a hop that is retried
-(implicit-ACK timeout `2*airtime + 200 ms`, up to `MESH_LINK_RETRIES` times) adds more,
-and a busy channel (CAD busy -> randomised backoff, 40-1280 ms doubling) adds more again.
-The channel is also shared: CAD plus per-node backoff serialize competitors, so a busy
-network lands below these figures. In short, a half-duplex store-and-forward mesh can
-**never fill the air** -- a relay must finish receiving before it can transmit -- so treat
-these as the practical ceiling, not a guarantee.
+(the host sends the next punch only after the previous ACK). The per-hop term is a
+**mean**: a hop that is retried (implicit-ACK timeout `2*airtime + 200 ms`, up to
+`MESH_LINK_RETRIES` times) adds more, and a busy channel (CAD busy -> randomised
+backoff, 40-1280 ms doubling) adds more again. A CAD listen before each send is not
+counted. The channel is also shared: CAD plus per-node backoff serialize competitors,
+so a busy network lands below these figures. In short, a half-duplex store-and-forward
+mesh can **never fill the air** -- a relay must finish receiving before it can transmit
+-- so treat these as the practical ceiling, not a guarantee.
 
 ## Files
 
