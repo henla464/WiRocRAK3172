@@ -183,6 +183,22 @@ static uint32_t s_child_heard_ms[MESH_ADDR_MAX + 1]; /* last heard as our child 
  * each address (0 = none).  A dead direct child takes its whole covered set with
  * it -- subtree-scoped eviction. */
 static uint8_t  s_cover[MESH_ADDR_MAX + 1];
+
+/* M6 topology map (master only): each node reports its parent and the
+ * neighbours it hears, rootward along the tree, so the master can stitch the
+ * whole graph together.  A node with no report yet (age 0) is absent from the
+ * map; a row older than MESH_TOPO_HOLD_MS is dropped.  The master's own row
+ * (addr 1) comes from its live neighbour table, not from a report. */
+#define MESH_TOPO_NO_LINK   0xFF                    /* s_topo_cost: no link */
+static uint8_t  s_topo_parent[MESH_ADDR_MAX + 1];   /* reported parent (0=none) */
+static uint32_t s_topo_age_ms[MESH_ADDR_MAX + 1];   /* when the report arrived */
+static uint16_t s_topo_link[MESH_ADDR_MAX + 1];     /* bit b = "hears addr b"   */
+static uint8_t  s_topo_cost[MESH_ADDR_MAX + 1][MESH_ADDR_MAX + 1]; /* link cost */
+
+/* Node only (M6): a topology report is pending (parent / neighbour change) and
+ * the next backstop time. */
+static bool     s_topo_due;
+static uint32_t s_topo_next_ms;
 /* Node only (Step 4) liveness monitor, armed at depth >= 2: we overhear our
  * parent's outgoing ADDR_ALIVE aggregate (a unicast to our grandparent, which
  * LoRa's shared medium lets us see) to confirm it still carries our bit
@@ -205,6 +221,7 @@ static bool mesh_send_broadcast(uint8_t type, uint8_t hops,
 /* Defined in the M5 section below; used by the timer. */
 static void mesh_send_claim(void);
 static void mesh_send_alive(void);
+static void mesh_send_topology(void);
 static void mesh_monitor_tick(uint32_t now);
 
 /* Radio/beacon helpers defined further down; used by the timer. */
@@ -274,6 +291,12 @@ static void mesh_state_clear(void)
     memset(s_child_bm_ms, 0, sizeof(s_child_bm_ms));
     memset(s_child_heard_ms, 0, sizeof(s_child_heard_ms));
     memset(s_cover, 0, sizeof(s_cover));
+    memset(s_topo_parent, 0, sizeof(s_topo_parent));
+    memset(s_topo_age_ms, 0, sizeof(s_topo_age_ms));
+    memset(s_topo_link, 0, sizeof(s_topo_link));
+    memset(s_topo_cost, MESH_TOPO_NO_LINK, sizeof(s_topo_cost));
+    s_topo_due        = false;
+    s_topo_next_ms    = 0;
     s_mon_parent      = MESH_ADDR_NONE;
     s_mon_parent_ms   = 0;
     s_parent_alive_ms = 0;
@@ -504,6 +527,12 @@ static void mesh_timer_cb(void *)
              * (MESH_EVICT_MS) must stay comfortably above. */
             if ((int32_t)(now - s_alive_next_ms) >= 0) {
                 mesh_send_alive();
+            }
+            /* Topology report: event-driven (attach / parent change) and a
+             * slow backstop, so the master's node/link map stays current. */
+            if (s_topo_due || (int32_t)(now - s_topo_next_ms) >= 0) {
+                mesh_send_topology();
+                s_topo_due = false;
             }
         }
     }
@@ -1033,6 +1062,82 @@ uint8_t mesh_get_neighbor_count(void)
     return n;
 }
 
+/* --- M6: master topology map accessors ---------------------------------- */
+
+/* A row exists for our own address (fed live from the neighbour table) and for
+ * any node whose report has not aged out. */
+static bool mesh_topo_row_valid(uint8_t addr, uint32_t now)
+{
+    if (addr == MESH_MASTER_ADDR) {
+        return true;
+    }
+    return s_topo_age_ms[addr] != 0 &&
+           (uint32_t)(now - s_topo_age_ms[addr]) <= MESH_TOPO_HOLD_MS;
+}
+
+uint8_t mesh_topo_row_count(void)
+{
+    uint32_t now;
+    uint8_t  n = 0;
+
+    if (!mesh_is_master()) {
+        return 0;
+    }
+    now = millis();
+    for (uint8_t a = MESH_MASTER_ADDR; a <= MESH_ADDR_MAX; a++) {
+        if (mesh_topo_row_valid(a, now)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+bool mesh_topo_row(uint8_t index, mesh_topo_row_t *out)
+{
+    uint32_t now;
+    uint8_t  seen = 0;
+
+    if (!mesh_is_master() || out == NULL) {
+        return false;
+    }
+    now = millis();
+    for (uint8_t a = MESH_MASTER_ADDR; a <= MESH_ADDR_MAX; a++) {
+        if (!mesh_topo_row_valid(a, now)) {
+            continue;
+        }
+        if (seen++ < index) {
+            continue;
+        }
+        memset(out, 0, sizeof(*out));
+        out->addr = a;
+        if (a == MESH_MASTER_ADDR) {
+            /* Our own row: pull the links from the live neighbour table. */
+            out->parent = MESH_ADDR_NONE;
+            for (uint8_t i = 0; i < MESH_NEIGHBOR_MAX; i++) {
+                if (s_neigh[i].addr == MESH_ADDR_NONE || s_neigh[i].addr == a) {
+                    continue;
+                }
+                out->neighbor[out->count] = s_neigh[i].addr;
+                out->cost[out->count]     = s_neigh[i].link_cost;
+                out->count++;
+            }
+        } else {
+            out->parent = s_topo_parent[a];
+            for (uint8_t b = MESH_FIRST_SLAVE_ADDR;
+                 b <= MESH_ADDR_MAX && out->count <= MESH_TOPO_MAX_NEIGH; b++) {
+                if (!(s_topo_link[a] & (uint16_t)(1u << b))) {
+                    continue;
+                }
+                out->neighbor[out->count] = b;
+                out->cost[out->count]     = s_topo_cost[a][b];
+                out->count++;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 /* Recompute the best parent from the neighbour table (with hysteresis). */
 static void mesh_select_parent(void)
 {
@@ -1155,10 +1260,14 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
         mesh_beacon_fast();
     }
 
-    /* If we re-attached after losing our parent, re-announce our address. */
-    if (!mesh_is_master() && s_route.parent_addr != MESH_ADDR_NONE) {
-        if (!s_had_parent && mesh_get_address() != MESH_ADDR_NONE) {
+    /* Any (re)attachment -- a fresh one or a switch to a better parent --
+     * re-announces our address so the master re-binds us and learns our new
+     * parent, and queues a topology report so the map follows the move. */
+    if (!mesh_is_master() && s_route.parent_addr != MESH_ADDR_NONE &&
+        mesh_get_address() != MESH_ADDR_NONE) {
+        if (!s_had_parent || s_route.parent_addr != old_parent) {
             s_claim_due = true;
+            s_topo_due  = true;
         }
         s_had_parent = true;
     }
@@ -1389,13 +1498,18 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
  * address when it is free, re-assert our existing assignment when the node device
  * id is already known, and fall back to a fresh allocation when the claimed address
  * is already taken.  Shared by the unicast and flooded claim paths. */
-static void mesh_master_apply_claim(const mesh_header_t *h, const uint8_t *payload)
+static void mesh_master_apply_claim(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     uint8_t want = (uint8_t)(h->src & MESH_ADDR_MASK);  /* node's own address */
     uint8_t have;
 
     if (want < MESH_FIRST_SLAVE_ADDR || want > MESH_ADDR_MAX) {
         return;
+    }
+    /* A claim also reports the node's parent (the topology map's tree edge). */
+    if (plen >= MESH_NODE_DEVICE_ID_LEN + 1) {
+        s_topo_parent[want] = (uint8_t)(payload[MESH_NODE_DEVICE_ID_LEN] & MESH_ADDR_MASK);
+        s_topo_age_ms[want] = millis();
     }
     have = mesh_alloc_lookup(payload);
     if (have == want) {
@@ -1428,28 +1542,73 @@ static void mesh_master_apply_claim(const mesh_header_t *h, const uint8_t *paylo
 static void mesh_send_claim(void)
 {
     uint8_t frame[MESH_MAX_FRAME];
+    uint8_t claim[MESH_NODE_DEVICE_ID_LEN + 1];
     uint8_t flen;
     uint8_t seq;
 
     if (mesh_is_master() || mesh_get_address() == MESH_ADDR_NONE) {
         return;
     }
+    /* Payload is our device id plus our current parent, so the master learns
+     * both the address binding and the tree edge (its topology map) in one
+     * message.  Parent 0 when we have no route yet. */
+    memcpy(claim, s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN);
+    claim[MESH_NODE_DEVICE_ID_LEN] = s_route.parent_addr;
     if (s_state != MESH_STATE_JOINED || s_route.parent_addr == MESH_ADDR_NONE) {
         /* No route: flood so the master can still find us. */
         mesh_send_broadcast(MESH_TYPE_ADDR_CLAIM, MESH_DEFAULT_TTL,
-                            s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN);
+                            claim, sizeof(claim));
     } else {
         /* Rootward unicast to the parent. */
         seq = s_bcast_seq;
         s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x1F);
         flen = mesh_build_frame(frame, MESH_TYPE_ADDR_CLAIM, 0,
                                 mesh_get_address(), s_route.parent_addr,
-                                MESH_DEFAULT_TTL, seq, s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN);
+                                MESH_DEFAULT_TTL, seq, claim, sizeof(claim));
         mesh_send_frame(frame, flen);
     }
     /* The claim is itself a liveness signal; don't follow it immediately with
      * a redundant aggregate. */
     s_alive_next_ms = millis() + MESH_ALIVE_INTERVAL_MS;
+}
+
+/* Node: topology report.  Rootward (to the master) it carries our current
+ * parent and every neighbour we hear, with its link cost, so the master can
+ * assemble the whole node/link graph.  The header `src` is our address, so the
+ * payload is `parent(1) | {addr(1), cost(1)}*` (no count: the length implies
+ * it).  Event-driven (attach, parent change) plus a slow backstop; sent only
+ * once we hold a parent, so it is an O(hops) rootward unicast, never a flood.
+ * Best-effort -- the backstop recovers a lost report. */
+static void mesh_send_topology(void)
+{
+    uint8_t frame[MESH_MAX_FRAME];
+    uint8_t payload[1 + 2 * MESH_NEIGHBOR_MAX];
+    uint8_t flen;
+    uint8_t plen = 1;
+    uint8_t seq;
+
+    s_topo_next_ms = millis() + MESH_TOPO_INTERVAL_MS;
+
+    if (mesh_is_master() || mesh_get_address() == MESH_ADDR_NONE) {
+        return;
+    }
+    if (s_state != MESH_STATE_JOINED || s_route.parent_addr == MESH_ADDR_NONE) {
+        return;                         /* no route yet: the claim flood covers us */
+    }
+    payload[0] = s_route.parent_addr;
+    for (uint8_t i = 0; i < MESH_NEIGHBOR_MAX; i++) {
+        if (s_neigh[i].addr == MESH_ADDR_NONE || s_neigh[i].addr == mesh_get_address()) {
+            continue;
+        }
+        payload[plen++] = s_neigh[i].addr;
+        payload[plen++] = s_neigh[i].link_cost;
+    }
+    seq = s_bcast_seq;
+    s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x1F);
+    flen = mesh_build_frame(frame, MESH_TYPE_TOPOLOGY, 0, mesh_get_address(),
+                            s_route.parent_addr, MESH_DEFAULT_TTL, seq,
+                            payload, plen);
+    mesh_send_frame(frame, flen);
 }
 
 /* Node: periodic liveness **aggregate**.  A single-hop unicast to our parent
@@ -1550,7 +1709,7 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
      * and the master rebuilds. */
     if (h->dst == MESH_ADDR_NONE) {
         if (mesh_is_master()) {
-            mesh_master_apply_claim(h, payload);
+            mesh_master_apply_claim(h, payload, plen);
         }
         mesh_relay_flood(h, payload, plen);
         return;
@@ -1561,7 +1720,70 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
         return;                         /* not addressed to us */
     }
     if (mesh_is_master()) {
-        mesh_master_apply_claim(h, payload);
+        mesh_master_apply_claim(h, payload, plen);
+        return;
+    }
+    mesh_forward_rootward(h, payload, plen);
+}
+
+/* Master: absorb a node's topology report -- its parent plus the neighbours it
+ * hears and their link costs.  A report replaces that node's whole row. */
+static void mesh_master_apply_topology(uint8_t src, const uint8_t *payload, uint8_t plen)
+{
+    uint8_t n;
+
+    if (src < MESH_FIRST_SLAVE_ADDR || src > MESH_ADDR_MAX || plen < 1) {
+        return;
+    }
+    s_topo_parent[src] = (uint8_t)(payload[0] & MESH_ADDR_MASK);
+    if (s_topo_parent[src] == src) {
+        s_topo_parent[src] = MESH_ADDR_NONE;    /* a node is never its own parent */
+    }
+    s_topo_age_ms[src] = millis();
+    s_topo_link[src]   = 0;
+    memset(s_topo_cost[src], MESH_TOPO_NO_LINK, sizeof(s_topo_cost[src]));
+
+    n = (uint8_t)((plen - 1) / 2);              /* entries implied by the length */
+    if (n > MESH_TOPO_MAX_NEIGH) {
+        n = MESH_TOPO_MAX_NEIGH;
+    }
+    for (uint8_t i = 0; i < n; i++) {
+        uint8_t a = (uint8_t)(payload[1 + i * 2] & MESH_ADDR_MASK);
+        uint8_t c = payload[2 + i * 2];
+        if (a < MESH_FIRST_SLAVE_ADDR || a > MESH_ADDR_MAX || a == src) {
+            continue;
+        }
+        s_topo_link[src]   |= (uint16_t)(1u << a);
+        s_topo_cost[src][a] = c;
+    }
+    /* A parent is by definition a neighbour: make sure the tree edge shows up
+     * even if the neighbour list was truncated. */
+    if (s_topo_parent[src] >= MESH_FIRST_SLAVE_ADDR &&
+        s_topo_parent[src] <= MESH_ADDR_MAX) {
+        s_topo_link[src] |= (uint16_t)(1u << s_topo_parent[src]);
+    }
+}
+
+/* Handle an incoming topology report.  The master absorbs it; an intermediate
+ * node forwards a rootward unicast one hop toward its parent; the flooded
+ * fallback (a relay that lost its own parent) is relayed by everyone. */
+static void mesh_rx_topology(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
+{
+    if (plen < 1) {
+        return;
+    }
+    if (h->dst == MESH_ADDR_NONE) {
+        if (mesh_is_master()) {
+            mesh_master_apply_topology(h->src, payload, plen);
+        }
+        mesh_relay_flood(h, payload, plen);
+        return;
+    }
+    if (h->dst != mesh_get_address()) {
+        return;                         /* not addressed to us */
+    }
+    if (mesh_is_master()) {
+        mesh_master_apply_topology(h->src, payload, plen);
         return;
     }
     mesh_forward_rootward(h, payload, plen);
@@ -1786,6 +2008,7 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     case MESH_TYPE_LINK_ACK:      /* implicit ACK only (M4) */             break;
     case MESH_TYPE_ADDR_CLAIM:    mesh_rx_addr_claim(&h, payload, plen);   break;
     case MESH_TYPE_ALIVE:         mesh_rx_alive(&h, payload, plen);        break;
+    case MESH_TYPE_TOPOLOGY:      mesh_rx_topology(&h, payload, plen);     break;
     default:                                                               break;
     }
 }

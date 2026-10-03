@@ -154,6 +154,27 @@ uint32_t mesh_get_link_ack_timeout_ms(void);
 #define MESH_MONITOR_TIMEOUT_MS  (MESH_ALIVE_INTERVAL_MS + \
                                   MESH_ALIVE_INTERVAL_MS / 2)
 
+/* --- M6 topology map ---------------------------------------------------- */
+#define MESH_TOPO_INTERVAL_MS   300000  /* topology-report backstop period     */
+#define MESH_TOPO_HOLD_MS       900000  /* drop a node's map row when this old */
+#define MESH_TOPO_MAX_NEIGH     MESH_NEIGHBOR_MAX
+
+/* One row of the master's topology map: a node, its reported parent, and the
+ * neighbours it reported hearing (0 = none). */
+typedef struct {
+    uint8_t addr;
+    uint8_t parent;
+    uint8_t count;
+    uint8_t neighbor[MESH_TOPO_MAX_NEIGH + 1];  /* +1: parent may not be listed */
+    uint8_t cost[MESH_TOPO_MAX_NEIGH + 1];
+} mesh_topo_row_t;
+
+/* Master topology map: number of rows available and the row at `index`
+ * (0-based).  Returns false when `index` is out of range or we are not the
+ * master.  Rows age out after MESH_TOPO_HOLD_MS. */
+uint8_t mesh_topo_row_count(void);
+bool    mesh_topo_row(uint8_t index, mesh_topo_row_t *out);
+
 /* Master boot epoch last heard (0 while unknown). */
 uint16_t mesh_get_epoch(void);
 

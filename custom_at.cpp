@@ -26,6 +26,7 @@ int receive_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int mesh_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int master_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param);
 void send_cb(void);
 void cad_cb(bool detect);
@@ -86,6 +87,10 @@ bool init_mesh_at(void)
 	ok &= api.system.atMode.add((char *)"MESHMAP",
 								(char *)"Get mesh state. Usage: ATC+MESHMAP=?",
 								(char *)"MESHMAP", meshmaps_handler,
+								RAK_ATCMD_PERM_READ);
+	ok &= api.system.atMode.add((char *)"MESHTOPO",
+								(char *)"Get the master node topology map. Usage: ATC+MESHTOPO=?",
+								(char *)"MESHTOPO", meshtopo_handler,
 								RAK_ATCMD_PERM_READ);
 	ok &= api.system.atMode.add((char *)"MESHNODEDEVICEID",
 								(char *)"Set the 6-byte mesh node device id (12 hex chars). Usage: ATC+MESHNODEDEVICEID=<12 hex> / ATC+MESHNODEDEVICEID=?",
@@ -270,6 +275,43 @@ int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
 					 mesh_get_epoch(),
 					 mesh_get_overhead_pct(),
 					 (int)mesh_get_link_ack_timeout_ms());
+		return AT_NO_STATUS;
+	}
+	return AT_PARAM_ERROR;
+}
+
+
+/**
+ * @brief Get the master node's topology map: one line per known node.
+ *        Usage: ATC+MESHTOPO=?
+ *
+ *        Master node only (output is empty on any other node).  Each line is
+ *        'ATC+MESHTOPO=<addr>:<parent>:<nbr>=<cost>,<nbr>=<cost>,...'
+ *        where <parent> is the node's reported parent address (0 = none) and the
+ *        trailing list is the neighbours it reported hearing, with their link
+ *        costs (omitted when none).  The master node's own row (addr 1) is filled
+ *        live from its neighbour table.  A node's row ages out after
+ *        MESH_TOPO_HOLD_MS; topology reports are best-effort, refreshed
+ *        event-driven and by a slow backstop.
+ */
+int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param)
+{
+	if ((param->argc == 1 && !strcmp(param->argv[0], "?")) || param->argc == 0)
+	{
+		mesh_topo_row_t row;
+		uint8_t n = mesh_topo_row_count();
+		for (uint8_t i = 0; i < n; i++)
+		{
+			if (!mesh_topo_row(i, &row))
+				continue;
+			atcmd_printf("%s=%d:%d", cmd, row.addr, row.parent);
+			for (uint8_t j = 0; j < row.count; j++)
+			{
+				atcmd_printf("%s%d=%d", (j == 0) ? ":" : ",",
+							 row.neighbor[j], row.cost[j]);
+			}
+			atcmd_printf("\r\n");
+		}
 		return AT_NO_STATUS;
 	}
 	return AT_PARAM_ERROR;

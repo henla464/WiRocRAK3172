@@ -37,6 +37,7 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
 | `ATC+MASTER=<0\|1>` | Designate this node as the master node (persisted). `ATC+MASTER?` reads it. |
 | `ATC+MESHNODEDEVICEID=<12 hex>` | Set the 6-byte node device id (persisted). `ATC+MESHNODEDEVICEID?` reads it back. |
 | `ATC+MESHMAP=?` | Diagnostics (see below). |
+| `ATC+MESHTOPO=?` | Master node: dump the node/link topology map, one line per node (see below). |
 | `ATC+P2P=<runcfg>:...,[:<mesh>:<master>:<deviceid>]` | Mesh flags and node device id as trailing params of the P2P config command. |
 
 A device only joins the network once mesh mode is enabled **and** it has a node
@@ -77,6 +78,18 @@ see *Recovery*); `overhead%` is the measured control-plane airtime as a
 percentage of the data-frame airtime transmitted; and `ackms` is the derived
 per-hop ACK timeout for the current datarate.
 
+`ATC+MESHTOPO=?` (master node only; empty elsewhere) returns the node/link map,
+one line per known node:
+
+```
+ATC+MESHTOPO=<addr>:<parent>:<nbr>=<cost>,<nbr>=<cost>,...
+```
+
+`addr` is the node, `parent` is the parent address it last reported (`0` = none),
+and the trailing list is the neighbours it reported hearing with their link costs
+(omitted when none). The master node's own row (`addr` = 1) is filled live from its
+neighbour table. See *Topology map* below.
+
 ## Host interface changes
 
 Addresses travel in the AT interface, so the host is updated in lock-step:
@@ -107,7 +120,7 @@ as the sanity gate). The header is **3 bytes** (24 bits, no waste), MSB-first:
 
 | bits | field | notes |
 |------|-------|-------|
-| 4 | type | message type, `0`-`8` (see **Message types** below) |
+| 4 | type | message type, `0`-`9` (see **Message types** below) |
 | 1 | flags | reserved; always `0` today (see **Header flags**) |
 | 4 | src | source address (0-15) |
 | 4 | dst | destination (0-15; also carries the assigned address / acked origin) |
@@ -176,16 +189,18 @@ header is **not** repeated in the payload (header-field reuse).
 | 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the master node. Each relay node dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
 | 5 | `DATA_DOWNLINK` | 3 + N | steered hop-by-hop down the tree (`dst` = target) | WiRoc payload (N bytes) | A WiRoc payload from the master node to one specific node. The target delivers it to its host; any other node re-broadcasts it one hop further **only when one of its children's subtree bitmaps covers the target**, so the frame follows the single branch that leads to the target (`depth(target)` transmissions) instead of flooding the tree. Best-effort (no per-hop retry); the host resends if the application-layer ACK does not return. |
 | 6 | `LINK_ACK` | 4 | broadcast (single hop) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, emitted only by the master node, which has no next hop whose forward it could overhear; it sends one for every `DATA_UPLINK` it delivers. Relay nodes use the implicit ACK instead. |
-| 7 | `ADDR_CLAIM` | 9 | rootward unicast (flood fallback) | `devid[6]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted master node can rebuild its RAM-only table. **Event-driven** -- sent on a new boot epoch, on boot, on re-attach, and when the depth >= 2 liveness watchdog sees our parent stop covering us; never on a plain timer. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead. |
+| 7 | `ADDR_CLAIM` | 10 | rootward unicast (flood fallback) | `devid[6]\|parent[1]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted master node can rebuild its RAM-only table; the trailing byte reports its **current parent** (`0`=none), so a claim doubles as a parent report for the master node's topology map. **Event-driven** -- sent on a new boot epoch, on boot, on re-attach, on a parent change, and when the depth >= 2 liveness watchdog sees our parent stop covering us; never on a plain timer. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead. |
 | 8 | `ADDR_ALIVE` | 5 | single hop to the parent (absorbed, never forwarded) | `subtree_bitmap[2]` (16-bit; bit `a` = "address `a` is alive in my subtree") | Periodic liveness **aggregate**, so the master node does not evict a deep idle node (whose beacon is link-local and never reaches it). Each node sets its own bit and ORs in the bitmap reported by each of its children, so **one frame covers a whole subtree**; the parent absorbs it and does not forward it, so the union of the master node's direct children's bitmaps covers every non-master node each round. **Only a relay node sends one** (a leaf is covered by its parent from its beacon); the master node refreshes last-heard for **every** set bit. Sent while the node holds a parent. |
+| 9 | `TOPOLOGY` | 4 + 2K | rootward unicast (`dst` = parent) | `parent[1]\|{addr[1]\|cost[1]}*` (K neighbours) | The reporting node's view of the graph: its current parent and the neighbours it hears, each with its link cost. **Event-driven** (attach / re-parent) plus a slow backstop; **best-effort** (the backstop recovers a loss). A relay node forwards it one hop rootward; the master node absorbs it into its node/link map (read via `ATC+MESHTOPO?`). |
 
 All sizes include the fixed 3-byte header. The control types (0, 1, 2, 3, 6, 7, 8) have
 a fixed length; the two data types (4, 5) are `3 + N`, where `N` is the verbatim
 WiRoc payload (WiRoc punch payloads are typically 15 or 27 bytes, giving 18 or 30
-bytes on air). A frame cannot exceed `MESH_MAX_FRAME` = 64 bytes, so `N` <= 61 for
+bytes on air), and `TOPOLOGY` (9) is `4 + 2K` for `K` neighbours. A frame cannot
+exceed `MESH_MAX_FRAME` = 64 bytes, so `N` <= 61 for
 data frames (and the control payloads above are well within that).
 
-`MESH_TYPE_COUNT` (= 9) is not a wire value: the 4-bit field encodes only `0`-`8`,
+`MESH_TYPE_COUNT` (= 10) is not a wire value: the 4-bit field encodes only `0`-`9`,
 so it is used as the "invalid / out of range" bound when validating a frame.
 
 ## Join / address assignment
@@ -313,9 +328,10 @@ has no neighbour at all it keeps listening until beacons return.
   is caught instead by the `ADDR_TABLE` bitmap -- the rebooted master forgets the
   node, its bit stays clear for `MESH_TABLE_MISS_LIMIT` floods, and the node
   relinquishes its address and re-joins.
-* A node (re)binds its flash-stored address with an `ADDR_CLAIM{ devid }` (its
-  own address is already in the header `src`) when it sees a new epoch (fast
-  path), on its first beacon after boot, and after re-attaching a lost parent.
+* A node (re)binds its flash-stored address with an `ADDR_CLAIM{ devid, parent }`
+  (its own address is already in the header `src`) when it sees a new epoch (fast
+  path), on its first beacon after boot, and after re-attaching a lost parent (and
+  on switching to a better parent).
   Claims are **event-driven, not periodic**. The claim is a **rootward unicast**:
   it travels hop-by-hop toward the parent (like an uplink), so the network-wide
   cost is `O(hops)` per claim rather than the `O(N)` of a flood. Only a node with
@@ -384,6 +400,26 @@ a node too far from its parent to overhear the aggregate).
 **Duplicate addresses.** If a node hears its own address handed to a different node
 device id it relinquishes it and re-joins, so no duplicate address can persist.
 
+## Topology map
+
+The master node keeps a **node/link map**, assembled from two reports:
+
+* every `ADDR_CLAIM` (sent when a node (re)attaches or re-parents) carries the
+  sender's **parent**, so the master node learns each tree edge the moment a node
+  attaches; and
+* a dedicated rootward `TOPOLOGY` frame carries the sender's **parent and the
+  neighbours it hears** (with link costs), so the master node learns the off-tree
+  links too.
+
+The map has one row per node: its reported parent (`0`=none) and the set of
+neighbours it hears, each with the link cost that node measured. A report
+**replaces** that node's whole row. A row is dropped after `MESH_TOPO_HOLD_MS`
+without a report; `MESH_TOPO_INTERVAL_MS` is the backstop and a re-parent reports
+immediately. The master node's **own** row is not reported -- it is filled live
+from the master node's own neighbour table. The map is a **diagnostic**: links are
+measured one-way and are noisy/asymmetric, and the reports are best-effort (a
+missed report is recovered by the backstop). Read it with `ATC+MESHTOPO?`.
+
 ## Tunables
 
 All intervals live in `mesh.h` and can be adjusted without touching logic:
@@ -407,6 +443,9 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_DEFAULT_TTL` | 4 | max hops |
 | `MESH_NEIGHBOR_MAX` | 8 | tracked neighbours per node |
 | `MESH_PARENT_HYSTERESIS` | 1 | cost margin required to switch parent |
+| `MESH_TOPO_INTERVAL_MS` | 300000 | topology-report backstop period (a re-parent also triggers an immediate report) |
+| `MESH_TOPO_HOLD_MS` | 900000 | the master node drops a node's map row after this long without a report |
+| `MESH_TOPO_MAX_NEIGH` | 8 | max neighbours carried in one `TOPOLOGY` report (= `MESH_NEIGHBOR_MAX`) |
 
 **Adaptive beacon.** Each node's beacon interval starts at `MESH_BEACON_FAST_MS`
 and **doubles per stable interval** up to `MESH_BEACON_MAX_MS`, and is **reset to
@@ -467,7 +506,9 @@ For the v3 frame sizes (CR 4/5, preamble 8, CRC on), approximate airtimes in ms 
 | LINK_ACK | 4 | 36 | 72 | 123 | 246 |
 | ADDR_TABLE | 5 | 41 | 72 | 123 | 246 |
 | ADDR_ALIVE | 5 | 41 | 72 | 123 | 246 |
-| JOIN_REQ / ADDR_ASSIGN / ADDR_CLAIM | 9 | 46 | 82 | 164 | 287 |
+| JOIN_REQ / ADDR_ASSIGN | 9 | 46 | 82 | 164 | 287 |
+| ADDR_CLAIM | 10 | 52 | 93 | 165 | 289 |
+| TOPOLOGY (8 neighbours, worst case) | 20 | 71 | 120 | 219 | 390 |
 | DATA (15 B payload) | 18 | 67 | 113 | 205 | 369 |
 | DATA (7 B payload) | 10 | 52 | 93 | 165 | 289 |
 | DATA (27 B payload) | 30 | 92 | 154 | 287 | 492 |
@@ -499,8 +540,9 @@ The tables above are per-frame costs; these measure how much of the channel the
 percentage of wall-clock time -- i.e. the fraction of the time the single channel is
 busy with mesh housekeeping. They count **beacons, `ADDR_ALIVE` aggregates and the
 `ADDR_TABLE` flood**, and exclude `LINK_ACK` (which only exists alongside an uplink) and
-application data. `ADDR_CLAIM`s are event-driven and contribute negligibly in steady
-state, so they are not counted. Everything is derived from the airtimes above and the
+application data. `ADDR_CLAIM`s and `TOPOLOGY` reports are event-driven (plus a slow
+backstop) and contribute negligibly in steady state, so they are not counted.
+Everything is derived from the airtimes above and the
 live tunables: relay nodes and the master node beacon every `MESH_BEACON_MAX_MS` (90 s),
 a leaf node every `3x` that (270 s); every **relay** node sends a single-hop `ADDR_ALIVE`
 aggregate (5 B) once per `MESH_ALIVE_INTERVAL_MS` (300 s) -- **one frame per relay node,
@@ -656,11 +698,11 @@ bitmaps are already on air in the `ADDR_ALIVE` aggregates, so no reverse source-
 
 | File | Role |
 |------|------|
-| `mesh.h` / `mesh.cpp` | mesh engine: config, join, routing, MAC, recovery |
+| `mesh.h` / `mesh.cpp` | mesh engine: config, join, routing, MAC, recovery, topology map |
 | `mesh_wire.h` / `mesh_wire.cpp` | pure 3-byte header codec (host-tested) |
 | `mesh_alloc.h` / `mesh_alloc.cpp` | pure master-node address allocator (host-tested) |
 | `mesh_route.h` / `mesh_route.cpp` | pure link metric + parent selection (host-tested) |
-| `custom_at.cpp` | AT integration (`MESH`/`MASTER`/`MESHMAP`, `SEND`/`REC`) |
+| `custom_at.cpp` | AT integration (`MESH`/`MASTER`/`MESHMAP`/`MESHTOPO`, `SEND`/`REC`) |
 | `MessageQueue.h` | `SourceAddr` carried from RX to `ATC+REC` |
 | `test/` | host `g++` unit tests for the pure modules |
 
@@ -681,6 +723,11 @@ bitmaps are already on air in the `ADDR_ALIVE` aggregates, so no reverse source-
 * **Lab, multi-hop**: three nodes in a line with the far one out of the master node's
   range -> it reaches the master node through the middle relay node; perturb SNR and confirm
   the cost-based parent choice and hysteresis.
+* **Topology map**: confirm `ATC+MESHTOPO?` on the master node lists every attached
+  node with its parent and heard neighbours; force a node to re-parent (move it or
+  perturb SNR) and confirm its row's parent updates within one report (immediately,
+  via the re-claim), and that a powered-off node's row disappears after
+  `MESH_TOPO_HOLD_MS`. A non-master `ATC+MESHTOPO?` prints nothing.
 * **Failure / recovery**: power off a relay node -> its children re-attach; reboot the
   master node -> nodes re-claim on the new epoch and are back within one or two beacon
   intervals. Reboot a non-master node -> it keeps / re-joins its address.
@@ -717,5 +764,10 @@ bitmaps are already on air in the `ADDR_ALIVE` aggregates, so no reverse source-
   reported it -- e.g. a relay node that just rebooted and has not heard a silent leaf
   child re-claim -- is unreachable by downlink until the next aggregate or re-join; the
   application-layer ACK / retry is the backstop.
+* The master node's topology map is **diagnostic only**: it is built from
+  best-effort reports, its links are measured one-way (each node reports what *it*
+  hears, so the graph is directed and may be asymmetric), and only the master
+  node's own row is live -- every other row is as fresh as that node's last report
+  (until `MESH_TOPO_HOLD_MS`). Nothing in the routing path depends on it.
 * Mesh and legacy P2P must not share a channel at the same time (mode is exclusive,
   and no magic byte distinguishes the two framings).

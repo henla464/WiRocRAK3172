@@ -38,8 +38,9 @@ typedef enum {
     MESH_TYPE_DATA_UPLINK,
     MESH_TYPE_DATA_DOWNLINK,
     MESH_TYPE_LINK_ACK,
-    MESH_TYPE_ADDR_CLAIM,       /* rootward: { devid }, (re)bind addr<->devid  */
-    MESH_TYPE_ALIVE,            /* rootward: no payload, liveness keepalive    */
+    MESH_TYPE_ADDR_CLAIM,       /* rootward: { devid, parent }, bind addr<->devid */
+    MESH_TYPE_ALIVE,            /* single hop: { subtree_bitmap }, liveness      */
+    MESH_TYPE_TOPOLOGY,         /* rootward: { parent, {addr,cost}* }, map      */
     MESH_TYPE_COUNT
 } mesh_type_t;
 
@@ -50,8 +51,8 @@ typedef enum {
 
 typedef struct {
     uint8_t version;    /* 3 bits */
-    uint8_t type;       /* 3 bits */
-    uint8_t flags;      /* 2 bits */
+    uint8_t type;       /* 4 bits */
+    uint8_t flags;      /* 1 bit */
     uint8_t src;        /* 4 bits */
     uint8_t dst;        /* 4 bits */
     uint8_t hops;       /* 3 bits */
