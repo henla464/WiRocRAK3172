@@ -1062,14 +1062,19 @@ uint8_t mesh_get_neighbor_count(void)
     return n;
 }
 
-/* --- M6: master topology map accessors ---------------------------------- */
+/* --- M6: topology map accessors ----------------------------------------- *
+ * Every node keeps a partial map: its own row (fed live from the neighbour
+ * table) plus a row for each node whose report has passed through it, i.e. its
+ * descendants -- the part of the tree it is on the path for.  The master node
+ * is on the path for every report (and also absorbs the flooded fallback and
+ * the tree edge carried by claims), so it sees the whole graph. */
 
-/* A row exists for our own address (fed live from the neighbour table) and for
- * any node whose report has not aged out. */
+/* A row exists for our own address (live) and for any node whose report has
+ * not aged out. */
 static bool mesh_topo_row_valid(uint8_t addr, uint32_t now)
 {
-    if (addr == MESH_MASTER_ADDR) {
-        return true;
+    if (addr == mesh_get_address()) {
+        return true;                    /* our own row is always present */
     }
     return s_topo_age_ms[addr] != 0 &&
            (uint32_t)(now - s_topo_age_ms[addr]) <= MESH_TOPO_HOLD_MS;
@@ -1077,13 +1082,9 @@ static bool mesh_topo_row_valid(uint8_t addr, uint32_t now)
 
 uint8_t mesh_topo_row_count(void)
 {
-    uint32_t now;
+    uint32_t now = millis();
     uint8_t  n = 0;
 
-    if (!mesh_is_master()) {
-        return 0;
-    }
-    now = millis();
     for (uint8_t a = MESH_MASTER_ADDR; a <= MESH_ADDR_MAX; a++) {
         if (mesh_topo_row_valid(a, now)) {
             n++;
@@ -1097,7 +1098,7 @@ bool mesh_topo_row(uint8_t index, mesh_topo_row_t *out)
     uint32_t now;
     uint8_t  seen = 0;
 
-    if (!mesh_is_master() || out == NULL) {
+    if (out == NULL) {
         return false;
     }
     now = millis();
@@ -1110,9 +1111,10 @@ bool mesh_topo_row(uint8_t index, mesh_topo_row_t *out)
         }
         memset(out, 0, sizeof(*out));
         out->addr = a;
-        if (a == MESH_MASTER_ADDR) {
-            /* Our own row: pull the links from the live neighbour table. */
-            out->parent = MESH_ADDR_NONE;
+        if (a == mesh_get_address()) {
+            /* Our own row: live parent and links from the neighbour table. */
+            out->parent = (a == MESH_MASTER_ADDR) ? MESH_ADDR_NONE
+                                                  : mesh_get_parent();
             for (uint8_t i = 0; i < MESH_NEIGHBOR_MAX; i++) {
                 if (s_neigh[i].addr == MESH_ADDR_NONE || s_neigh[i].addr == a) {
                     continue;
@@ -1494,6 +1496,22 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
 /*  M5: recovery / robustness                                             */
 /* ======================================================================= */
 
+/* Record one node's reported parent (the tree edge).  Shared by the master (a
+ * claim it absorbs) and by any relay on a claim's rootward path, so every node
+ * learns its descendants' tree edges, not just the master. */
+static void mesh_topo_note_parent(uint8_t addr, uint8_t parent)
+{
+    if (addr < MESH_FIRST_SLAVE_ADDR || addr > MESH_ADDR_MAX) {
+        return;
+    }
+    parent = (uint8_t)(parent & MESH_ADDR_MASK);
+    if (parent == addr) {
+        parent = MESH_ADDR_NONE;        /* a node is never its own parent */
+    }
+    s_topo_parent[addr] = parent;
+    s_topo_age_ms[addr] = millis();
+}
+
 /* Master: apply a node's claim to the RAM-only table.  Adopt the claimed
  * address when it is free, re-assert our existing assignment when the node device
  * id is already known, and fall back to a fresh allocation when the claimed address
@@ -1508,8 +1526,7 @@ static void mesh_master_apply_claim(const mesh_header_t *h, const uint8_t *paylo
     }
     /* A claim also reports the node's parent (the topology map's tree edge). */
     if (plen >= MESH_NODE_DEVICE_ID_LEN + 1) {
-        s_topo_parent[want] = (uint8_t)(payload[MESH_NODE_DEVICE_ID_LEN] & MESH_ADDR_MASK);
-        s_topo_age_ms[want] = millis();
+        mesh_topo_note_parent(want, payload[MESH_NODE_DEVICE_ID_LEN]);
     }
     have = mesh_alloc_lookup(payload);
     if (have == want) {
@@ -1723,24 +1740,26 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
         mesh_master_apply_claim(h, payload, plen);
         return;
     }
+    /* We are on the claim's rootward path: record its tree edge, then forward. */
+    if (plen >= MESH_NODE_DEVICE_ID_LEN + 1) {
+        mesh_topo_note_parent(h->src, payload[MESH_NODE_DEVICE_ID_LEN]);
+    }
     mesh_forward_rootward(h, payload, plen);
 }
 
-/* Master: absorb a node's topology report -- its parent plus the neighbours it
- * hears and their link costs.  A report replaces that node's whole row. */
-static void mesh_master_apply_topology(uint8_t src, const uint8_t *payload, uint8_t plen)
+/* Absorb one node's topology report -- its parent plus the neighbours it hears
+ * and their link costs.  A report replaces that node's whole row.  Called by
+ * any node on the reporter's rootward path: the master node (which sees every
+ * report) and each relay ancestor (which sees its own descendants). */
+static void mesh_apply_topology(uint8_t src, const uint8_t *payload, uint8_t plen)
 {
     uint8_t n;
 
     if (src < MESH_FIRST_SLAVE_ADDR || src > MESH_ADDR_MAX || plen < 1) {
         return;
     }
-    s_topo_parent[src] = (uint8_t)(payload[0] & MESH_ADDR_MASK);
-    if (s_topo_parent[src] == src) {
-        s_topo_parent[src] = MESH_ADDR_NONE;    /* a node is never its own parent */
-    }
-    s_topo_age_ms[src] = millis();
-    s_topo_link[src]   = 0;
+    mesh_topo_note_parent(src, payload[0]);
+    s_topo_link[src] = 0;
     memset(s_topo_cost[src], MESH_TOPO_NO_LINK, sizeof(s_topo_cost[src]));
 
     n = (uint8_t)((plen - 1) / 2);              /* entries implied by the length */
@@ -1764,9 +1783,12 @@ static void mesh_master_apply_topology(uint8_t src, const uint8_t *payload, uint
     }
 }
 
-/* Handle an incoming topology report.  The master absorbs it; an intermediate
- * node forwards a rootward unicast one hop toward its parent; the flooded
- * fallback (a relay that lost its own parent) is relayed by everyone. */
+/* Handle an incoming topology report.  Every node the report passes through on
+ * its rootward path absorbs it -- so the master node learns the whole graph and
+ * a relay learns its own subtree -- and a non-master forwards it one hop toward
+ * its parent.  The flooded fallback (a relay that lost its own parent) is
+ * absorbed only by the master (everyone else would pollute its map with nodes
+ * that are not its descendants) and relayed by everyone. */
 static void mesh_rx_topology(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     if (plen < 1) {
@@ -1774,7 +1796,7 @@ static void mesh_rx_topology(const mesh_header_t *h, const uint8_t *payload, uin
     }
     if (h->dst == MESH_ADDR_NONE) {
         if (mesh_is_master()) {
-            mesh_master_apply_topology(h->src, payload, plen);
+            mesh_apply_topology(h->src, payload, plen);
         }
         mesh_relay_flood(h, payload, plen);
         return;
@@ -1782,8 +1804,9 @@ static void mesh_rx_topology(const mesh_header_t *h, const uint8_t *payload, uin
     if (h->dst != mesh_get_address()) {
         return;                         /* not addressed to us */
     }
+    /* We are a hop on the reporter's rootward path: absorb its row. */
+    mesh_apply_topology(h->src, payload, plen);
     if (mesh_is_master()) {
-        mesh_master_apply_topology(h->src, payload, plen);
         return;
     }
     mesh_forward_rootward(h, payload, plen);

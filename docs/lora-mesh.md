@@ -37,7 +37,7 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
 | `ATC+MASTER=<0\|1>` | Designate this node as the master node (persisted). `ATC+MASTER?` reads it. |
 | `ATC+MESHNODEDEVICEID=<12 hex>` | Set the 6-byte node device id (persisted). `ATC+MESHNODEDEVICEID?` reads it back. |
 | `ATC+MESHMAP=?` | Diagnostics (see below). |
-| `ATC+MESHTOPO=?` | Master node: dump the node/link topology map, one line per node (see below). |
+| `ATC+MESHTOPO=?` | Dump the topology map this node knows, one line per node (see below). |
 | `ATC+P2P=<runcfg>:...,[:<mesh>:<master>:<deviceid>]` | Mesh flags and node device id as trailing params of the P2P config command. |
 
 A device only joins the network once mesh mode is enabled **and** it has a node
@@ -78,17 +78,19 @@ see *Recovery*); `overhead%` is the measured control-plane airtime as a
 percentage of the data-frame airtime transmitted; and `ackms` is the derived
 per-hop ACK timeout for the current datarate.
 
-`ATC+MESHTOPO=?` (master node only; empty elsewhere) returns the node/link map,
-one line per known node:
+`ATC+MESHTOPO=?` returns the topology map **this node** knows, one line per known
+node:
 
 ```
 ATC+MESHTOPO=<addr>:<parent>:<nbr>=<cost>,<nbr>=<cost>,...
 ```
 
-`addr` is the node, `parent` is the parent address it last reported (`0` = none),
-and the trailing list is the neighbours it reported hearing with their link costs
-(omitted when none). The master node's own row (`addr` = 1) is filled live from its
-neighbour table. See *Topology map* below.
+`addr` is the node, `parent` is its parent address (`0` = none), and the trailing
+list is the neighbours it hears with their link costs (omitted when none). Every
+node serves its **own** row (live from its neighbour table) plus a row for each
+**descendant** whose report it has passed rootward, so the master node -- being the
+root -- covers the whole network while any other node sees only the part of the
+tree it is on the path for. See *Topology map* below.
 
 ## Host interface changes
 
@@ -189,9 +191,9 @@ header is **not** repeated in the payload (header-field reuse).
 | 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the master node. Each relay node dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
 | 5 | `DATA_DOWNLINK` | 3 + N | steered hop-by-hop down the tree (`dst` = target) | WiRoc payload (N bytes) | A WiRoc payload from the master node to one specific node. The target delivers it to its host; any other node re-broadcasts it one hop further **only when one of its children's subtree bitmaps covers the target**, so the frame follows the single branch that leads to the target (`depth(target)` transmissions) instead of flooding the tree. Best-effort (no per-hop retry); the host resends if the application-layer ACK does not return. |
 | 6 | `LINK_ACK` | 4 | broadcast (single hop) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, emitted only by the master node, which has no next hop whose forward it could overhear; it sends one for every `DATA_UPLINK` it delivers. Relay nodes use the implicit ACK instead. |
-| 7 | `ADDR_CLAIM` | 10 | rootward unicast (flood fallback) | `devid[6]\|parent[1]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted master node can rebuild its RAM-only table; the trailing byte reports its **current parent** (`0`=none), so a claim doubles as a parent report for the master node's topology map. **Event-driven** -- sent on a new boot epoch, on boot, on re-attach, on a parent change, and when the depth >= 2 liveness watchdog sees our parent stop covering us; never on a plain timer. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead. |
+| 7 | `ADDR_CLAIM` | 10 | rootward unicast (flood fallback) | `devid[6]\|parent[1]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted master node can rebuild its RAM-only table; the trailing byte reports its **current parent** (`0`=none), so a claim doubles as a parent report for the topology map. **Event-driven** -- sent on a new boot epoch, on boot, on re-attach, on a parent change, and when the depth >= 2 liveness watchdog sees our parent stop covering us; never on a plain timer. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead. |
 | 8 | `ADDR_ALIVE` | 5 | single hop to the parent (absorbed, never forwarded) | `subtree_bitmap[2]` (16-bit; bit `a` = "address `a` is alive in my subtree") | Periodic liveness **aggregate**, so the master node does not evict a deep idle node (whose beacon is link-local and never reaches it). Each node sets its own bit and ORs in the bitmap reported by each of its children, so **one frame covers a whole subtree**; the parent absorbs it and does not forward it, so the union of the master node's direct children's bitmaps covers every non-master node each round. **Only a relay node sends one** (a leaf is covered by its parent from its beacon); the master node refreshes last-heard for **every** set bit. Sent while the node holds a parent. |
-| 9 | `TOPOLOGY` | 4 + 2K | rootward unicast (`dst` = parent) | `parent[1]\|{addr[1]\|cost[1]}*` (K neighbours) | The reporting node's view of the graph: its current parent and the neighbours it hears, each with its link cost. **Event-driven** (attach / re-parent) plus a slow backstop; **best-effort** (the backstop recovers a loss). A relay node forwards it one hop rootward; the master node absorbs it into its node/link map (read via `ATC+MESHTOPO?`). |
+| 9 | `TOPOLOGY` | 4 + 2K | rootward unicast (`dst` = parent) | `parent[1]\|{addr[1]\|cost[1]}*` (K neighbours) | The reporting node's view of the graph: its current parent and the neighbours it hears, each with its link cost. **Event-driven** (attach / re-parent) plus a slow backstop; **best-effort** (the backstop recovers a loss). Every node on its rootward path absorbs it, so the master node sees the whole network and a relay node sees its own subtree; a relay node also forwards it one hop rootward. Read the local view with `ATC+MESHTOPO?`. |
 
 All sizes include the fixed 3-byte header. The control types (0, 1, 2, 3, 6, 7, 8) have
 a fixed length; the two data types (4, 5) are `3 + N`, where `N` is the verbatim
@@ -402,23 +404,31 @@ device id it relinquishes it and re-joins, so no duplicate address can persist.
 
 ## Topology map
 
-The master node keeps a **node/link map**, assembled from two reports:
+The node/link map is assembled from two reports, both travelling **rootward**
+toward the master node:
 
 * every `ADDR_CLAIM` (sent when a node (re)attaches or re-parents) carries the
-  sender's **parent**, so the master node learns each tree edge the moment a node
-  attaches; and
+  sender's **parent**, so a tree edge is learned the moment a node attaches; and
 * a dedicated rootward `TOPOLOGY` frame carries the sender's **parent and the
-  neighbours it hears** (with link costs), so the master node learns the off-tree
-  links too.
+  neighbours it hears** (with link costs), so the off-tree links are learned too.
 
 The map has one row per node: its reported parent (`0`=none) and the set of
 neighbours it hears, each with the link cost that node measured. A report
-**replaces** that node's whole row. A row is dropped after `MESH_TOPO_HOLD_MS`
-without a report; `MESH_TOPO_INTERVAL_MS` is the backstop and a re-parent reports
-immediately. The master node's **own** row is not reported -- it is filled live
-from the master node's own neighbour table. The map is a **diagnostic**: links are
-measured one-way and are noisy/asymmetric, and the reports are best-effort (a
-missed report is recovered by the backstop). Read it with `ATC+MESHTOPO?`.
+**replaces** that node's whole row; a row is dropped after `MESH_TOPO_HOLD_MS`
+without a report (`MESH_TOPO_INTERVAL_MS` is the backstop, and a re-parent reports
+immediately).
+
+Both report types are hop-by-hop **unicasts along the tree**, so each one is
+absorbed by every node on the reporter's rootward path -- the reporter's parent,
+grandparent, and so on up to the master node -- and by no one else. It follows
+that **each node sees the part of the tree it is on the path for**: its own row
+(live) plus a row for every **descendant** (whose reports pass through it). The
+**master node**, being the root, is on every report's path and so covers the whole
+network. Read the local view with `ATC+MESHTOPO?` on any node.
+
+The map is a **diagnostic**: links are measured one-way and are noisy/asymmetric,
+and the reports are best-effort (a missed report is recovered by the backstop).
+Nothing in the routing path depends on it.
 
 ## Tunables
 
@@ -727,7 +737,9 @@ bitmaps are already on air in the `ADDR_ALIVE` aggregates, so no reverse source-
   node with its parent and heard neighbours; force a node to re-parent (move it or
   perturb SNR) and confirm its row's parent updates within one report (immediately,
   via the re-claim), and that a powered-off node's row disappears after
-  `MESH_TOPO_HOLD_MS`. A non-master `ATC+MESHTOPO?` prints nothing.
+  `MESH_TOPO_HOLD_MS`. On a non-master node `ATC+MESHTOPO?` shows its own row plus
+  its descendants' rows and nothing outside its subtree; on the master node it shows
+  every node.
 * **Failure / recovery**: power off a relay node -> its children re-attach; reboot the
   master node -> nodes re-claim on the new epoch and are back within one or two beacon
   intervals. Reboot a non-master node -> it keeps / re-joins its address.
@@ -764,10 +776,12 @@ bitmaps are already on air in the `ADDR_ALIVE` aggregates, so no reverse source-
   reported it -- e.g. a relay node that just rebooted and has not heard a silent leaf
   child re-claim -- is unreachable by downlink until the next aggregate or re-join; the
   application-layer ACK / retry is the backstop.
-* The master node's topology map is **diagnostic only**: it is built from
-  best-effort reports, its links are measured one-way (each node reports what *it*
-  hears, so the graph is directed and may be asymmetric), and only the master
-  node's own row is live -- every other row is as fresh as that node's last report
-  (until `MESH_TOPO_HOLD_MS`). Nothing in the routing path depends on it.
+* The topology map is **diagnostic only** and, on a non-master node, **partial**: a
+  node learns its own row plus its descendants' rows (the reports it forwards
+  rootward), while the master node -- being on every report's path -- sees the whole
+  graph. It is built from best-effort reports, its links are measured one-way (each
+  node reports what *it* hears, so the graph is directed and may be asymmetric), and
+  only a node's own row is live -- every other row is as fresh as that node's last
+  report (until `MESH_TOPO_HOLD_MS`). Nothing in the routing path depends on it.
 * Mesh and legacy P2P must not share a channel at the same time (mode is exclusive,
   and no magic byte distinguishes the two framings).

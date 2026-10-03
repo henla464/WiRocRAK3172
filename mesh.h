@@ -159,8 +159,8 @@ uint32_t mesh_get_link_ack_timeout_ms(void);
 #define MESH_TOPO_HOLD_MS       900000  /* drop a node's map row when this old */
 #define MESH_TOPO_MAX_NEIGH     MESH_NEIGHBOR_MAX
 
-/* One row of the master's topology map: a node, its reported parent, and the
- * neighbours it reported hearing (0 = none). */
+/* One row of the topology map: a node, its reported parent, and the neighbours
+ * it reported hearing with their link costs (0 = none). */
 typedef struct {
     uint8_t addr;
     uint8_t parent;
@@ -169,9 +169,12 @@ typedef struct {
     uint8_t cost[MESH_TOPO_MAX_NEIGH + 1];
 } mesh_topo_row_t;
 
-/* Master topology map: number of rows available and the row at `index`
- * (0-based).  Returns false when `index` is out of range or we are not the
- * master.  Rows age out after MESH_TOPO_HOLD_MS. */
+/* Topology map: number of rows available and the row at `index` (0-based).
+ * Returns false when `index` is out of range.  Every node serves what it knows:
+ * its own row (live from the neighbour table) plus a row for each descendant
+ * whose report it has passed rootward -- the master node, being the root, sees
+ * every report and so covers the whole network; any other node sees only the
+ * part of the tree it is on the path for.  Rows age out after MESH_TOPO_HOLD_MS. */
 uint8_t mesh_topo_row_count(void);
 bool    mesh_topo_row(uint8_t index, mesh_topo_row_t *out);
 

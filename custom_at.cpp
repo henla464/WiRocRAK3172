@@ -89,7 +89,7 @@ bool init_mesh_at(void)
 								(char *)"MESHMAP", meshmaps_handler,
 								RAK_ATCMD_PERM_READ);
 	ok &= api.system.atMode.add((char *)"MESHTOPO",
-								(char *)"Get the master node topology map. Usage: ATC+MESHTOPO=?",
+								(char *)"Get the topology map this node knows. Usage: ATC+MESHTOPO=?",
 								(char *)"MESHTOPO", meshtopo_handler,
 								RAK_ATCMD_PERM_READ);
 	ok &= api.system.atMode.add((char *)"MESHNODEDEVICEID",
@@ -282,17 +282,19 @@ int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
 
 
 /**
- * @brief Get the master node's topology map: one line per known node.
+ * @brief Get the topology map this node knows: one line per known node.
  *        Usage: ATC+MESHTOPO=?
  *
- *        Master node only (output is empty on any other node).  Each line is
+ *        Every node serves what it knows: its own row (live from the neighbour
+ *        table) plus a row for each descendant whose report it has passed
+ *        rootward.  The master node, being the root, covers the whole network;
+ *        any other node sees only the part of the tree it is on the path for.
+ *        Each line is
  *        'ATC+MESHTOPO=<addr>:<parent>:<nbr>=<cost>,<nbr>=<cost>,...'
- *        where <parent> is the node's reported parent address (0 = none) and the
- *        trailing list is the neighbours it reported hearing, with their link
- *        costs (omitted when none).  The master node's own row (addr 1) is filled
- *        live from its neighbour table.  A node's row ages out after
- *        MESH_TOPO_HOLD_MS; topology reports are best-effort, refreshed
- *        event-driven and by a slow backstop.
+ *        where <parent> is the node's parent address (0 = none) and the trailing
+ *        list is the neighbours it hears, with their link costs (omitted when
+ *        none).  A row ages out after MESH_TOPO_HOLD_MS; the reports are
+ *        best-effort, refreshed event-driven and by a slow backstop.
  */
 int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
