@@ -1980,7 +1980,7 @@ static void mesh_send_alive(void)
     payload[1] = (uint8_t)(bm >> 8);
     seq = s_bcast_seq;
     s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x1F);
-    flen = mesh_build_frame(frame, MESH_TYPE_ALIVE,
+    flen = mesh_build_frame(frame, MESH_TYPE_ADDR_ALIVE,
                             mesh_get_address(), s_route.parent_addr,
                             MESH_DEFAULT_TTL, seq, payload, 2);
     mesh_send_frame(frame, flen);
@@ -2527,7 +2527,7 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     case MESH_TYPE_DATA_DOWNLINK: mesh_rx_data_downlink(&h, payload, plen);break;
     case MESH_TYPE_LINK_ACK:      /* cleared the pending above; nothing else */ break;
     case MESH_TYPE_ADDR_CLAIM:    mesh_rx_addr_claim(&h, payload, plen);   break;
-    case MESH_TYPE_ALIVE:         mesh_rx_alive(&h, payload, plen);        break;
+    case MESH_TYPE_ADDR_ALIVE:    mesh_rx_alive(&h, payload, plen);        break;
     case MESH_TYPE_TOPOLOGY:      mesh_rx_topology(&h, payload, plen);     break;
     case MESH_TYPE_MASTER_QUERY:  mesh_rx_master_query(&h, payload, plen);    break;
     case MESH_TYPE_MASTER_ANNOUNCE: mesh_rx_master_announce(&h, payload, plen);break;

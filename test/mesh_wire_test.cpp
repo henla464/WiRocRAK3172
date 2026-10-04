@@ -44,16 +44,6 @@ int main()
            b[1] == 0x51 && b[2] == 0x43);
     std::printf("known vector: OK (%02X %02X %02X)\n", b[0], b[1], b[2]);
 
-    /* --- Path length packing (4-bit addresses: ceil(n/2) bytes) --- */
-    assert(mesh_wire_path_bytes(0) == 0);
-    assert(mesh_wire_path_bytes(1) == 1);
-    assert(mesh_wire_path_bytes(2) == 1);
-    assert(mesh_wire_path_bytes(3) == 2);
-    assert(mesh_wire_path_bytes(4) == 2);
-    assert(mesh_wire_path_bytes(8) == 4);
-    assert(mesh_wire_path_bytes(16) == 8);
-    std::printf("path bytes: OK\n");
-
     /* --- Hop-level ACK keying: which received frame clears which pending --- */
     {
         uint8_t ack_src, ack_seq;

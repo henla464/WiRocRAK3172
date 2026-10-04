@@ -24,11 +24,6 @@ void mesh_wire_decode(const uint8_t in[MESH_HEADER_SIZE], mesh_header_t *h)
     h->seq     = (uint8_t)(in[2] & 0x1F);
 }
 
-uint8_t mesh_wire_path_bytes(uint8_t n)
-{
-    return (uint8_t)(((uint16_t)n * 4 + 7) / 8);
-}
-
 bool mesh_wire_ack_key(const mesh_header_t *h, const uint8_t *payload, uint8_t plen,
                        uint8_t self_addr, uint8_t *ack_src, uint8_t *ack_seq)
 {

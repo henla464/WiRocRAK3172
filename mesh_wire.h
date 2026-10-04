@@ -39,7 +39,7 @@ typedef enum {
     MESH_TYPE_DATA_DOWNLINK,
     MESH_TYPE_LINK_ACK,
     MESH_TYPE_ADDR_CLAIM,       /* rootward: { devid, parent }, bind addr<->devid */
-    MESH_TYPE_ALIVE,            /* single hop: { subtree_bitmap }, liveness      */
+    MESH_TYPE_ADDR_ALIVE,       /* single hop: { subtree_bitmap }, liveness      */
     MESH_TYPE_TOPOLOGY,         /* rootward: { parent, {addr,cost}* }, map      */
     MESH_TYPE_MASTER_QUERY,     /* broadcast: { devid }, "who is master?", see M8 */
     MESH_TYPE_MASTER_ANNOUNCE,  /* broadcast: { devid }, a master states its id  */
@@ -60,9 +60,6 @@ void mesh_wire_encode(uint8_t out[MESH_HEADER_SIZE], const mesh_header_t *h);
 
 /* Decode MESH_HEADER_SIZE bytes into a header. */
 void mesh_wire_decode(const uint8_t in[MESH_HEADER_SIZE], mesh_header_t *h);
-
-/* Bytes required to pack an `n`-address (4-bit) source route: ceil(4n/8) = ceil(n/2). */
-uint8_t mesh_wire_path_bytes(uint8_t n);
 
 /* The frame's hop-level acknowledgement, if it carries one: write the (origin,
  * seq) it confirms to `ack_src`/`ack_seq` and return true, else return false.

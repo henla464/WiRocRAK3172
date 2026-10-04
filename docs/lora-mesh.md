@@ -11,7 +11,9 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
 ## Model
 
 * **Exactly one master node** (gateway), designated by configuration -- there is no
-  election. The master node is the only node that feeds its host.
+  election. The master node is the network's sink: the only node that feeds
+  **uplinks** to its host. (A node that is the target of a downlink feeds that
+  payload to its host too, and a standby master mirrors the uplinks it overhears.)
 * **4-bit addresses (0-15)** assigned automatically by the master node; the master node
   itself always owns address `1`, all other nodes use `2`-`15` (14 nodes max).
 * **Convergecast** routing: every node forwards toward the master node, multi-hop
@@ -164,7 +166,7 @@ as the sanity gate). The header is **3 bytes** (24 bits, no waste), MSB-first:
 
 | bits | field | notes |
 |------|-------|-------|
-| 4 | type | message type, `0`-`9` (see **Message types** below) |
+| 4 | type | message type, `0`-`11` (see **Message types** below) |
 | 4 | version | protocol version (currently `1`) |
 | 4 | src | source address (0-15) |
 | 4 | dst | destination (0-15; also carries the assigned address / acked origin) |
@@ -247,7 +249,7 @@ bytes on air), and `TOPOLOGY` (9) is `4 + 2K` for `K` neighbours. A frame cannot
 exceed `MESH_MAX_FRAME` = 64 bytes, so `N` <= 61 for
 data frames (and the control payloads above are well within that).
 
-`MESH_TYPE_COUNT` (= 10) is not a wire value: the 4-bit field encodes only `0`-`9`,
+`MESH_TYPE_COUNT` (= 12) is not a wire value: the 4-bit field encodes only `0`-`11`,
 so it is used as the "invalid / out of range" bound when validating a frame.
 
 ## Join / address assignment
@@ -345,9 +347,11 @@ How a busy channel is handled depends on who wants the transmission:
   waiting for the housekeeping tick; a **broadcast/flood** frame (dst = NONE) waits
   for the next `MESH_TIMER_PERIOD_MS` (200 ms) tick, whose distinct per-node phase
   spreads competing relay forwarders (that decorrelation is worth more than the
-  latency there). After a busy verdict the drain holds off for a **randomised backoff**
-  that starts at `MESH_TX_BACKOFF_MIN_MS` and **doubles per consecutive busy attempt**
-  up to `MESH_TX_BACKOFF_MAX_MS`, resetting after a clean send. The random draw stops
+  latency there). After a busy verdict the drain holds off for a **randomised backoff**:
+  the backoff *window* starts at `MESH_TX_BACKOFF_MIN_MS` and **doubles per consecutive
+  busy attempt** up to `MESH_TX_BACKOFF_MAX_MS`, resetting after a clean send, and the
+  delay actually waited is drawn from the window's **upper half** -- 20-40 ms on the
+  first attempt, widening to 640-1280 ms at the cap. The random draw stops
   nodes that just collided from retrying in lockstep; it comes from a per-node
   **xorshift PRNG** -- a *pseudo-random number generator*, a tiny deterministic
   shift-and-XOR routine seeded per node from its boot time.
@@ -599,7 +603,7 @@ answers:
   booting master compares, finds the rival senior, and demotes.
 
 If no rival answers within the window, the booting master asserts and serves. The
-same comparison runs continuously: a **serving** master that hears any frame
+same comparison runs continuously: a **serving** master that hears a **beacon**
 sourced from address 1 that it did not send (it never hears its own frames) answers
 with its identity, so two masters that were booted apart and only later came into
 range resolve the moment they hear each other. Because "lowest device id wins" is a
@@ -628,7 +632,7 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_MONITOR_TIMEOUT_MS` | 450000 | depth >= 2 node: no parent aggregate for this long -> re-claim (1.5x `MESH_ALIVE_INTERVAL_MS`; must stay under `MESH_EVICT_MS`) |
 | `MESH_RECOVER_MS` | 10000 | master-node post-boot recovery window |
 | `MESH_LINK_RETRIES` | 3 | link retransmits (timeout is derived, see MAC) |
-| `MESH_TX_BACKOFF_MIN_MS` / `MESH_TX_BACKOFF_MAX_MS` | 40 / 1280 | queued-frame backoff after a busy CAD (randomised window, doubles per attempt) |
+| `MESH_TX_BACKOFF_MIN_MS` / `MESH_TX_BACKOFF_MAX_MS` | 40 / 1280 | queued-frame backoff after a busy CAD (window bounds, doubles per attempt; the delay waited is drawn from the window's upper half, so 20-40 ms at first) |
 | `MESH_TX_FAST_MS` / `MESH_TX_FAST_JITTER_MS` | 10 / 30 | fast drain delay for a point-to-point frame (base + random jitter) before it is sent, instead of waiting for the 200 ms housekeeping tick |
 | `MESH_DEFAULT_TTL` | 4 | max hops |
 | `MESH_NEIGHBOR_MAX` | 8 | tracked neighbours per node |
@@ -829,15 +833,15 @@ factor.
 
 | topology | nodes (non-master) | `d_avg` (mean hops to master) | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|---|
-| **deep tree**              | 4  | 2.5  | 180 | 102 | 57 | 32 |
-|                           | 9  | 3.3  | 139 | 79 | 44 | 25 |
-|                           | 14 | 3.6  | 130 | 74 | 42 | 23 |
-| **average 1.5 hops**       | 4  | 1.5  | 280 | 157 | 88 | 49 |
-|                           | 9  | 1.6  | 271 | 153 | 86 | 47 |
-|                           | 14 | 1.5  | 280 | 157 | 88 | 49 |
-| **average 2 hops**         | 4  | 2.0  | 219 | 124 | 70 | 38 |
-|                           | 9  | 2.0  | 219 | 124 | 70 | 38 |
-|                           | 14 | 2.1  | 210 | 119 | 67 | 37 |
+| **deep tree**              | 4  | 2.5  | 162 | 91 | 51 | 28 |
+|                           | 9  | 3.3  | 129 | 73 | 41 | 23 |
+|                           | 14 | 3.6  | 120 | 68 | 38 | 21 |
+| **average 1.5 hops**       | 4  | 1.5  | 240 | 132 | 75 | 41 |
+|                           | 9  | 1.6  | 229 | 127 | 72 | 39 |
+|                           | 14 | 1.5  | 240 | 132 | 75 | 41 |
+| **average 2 hops**         | 4  | 2.0  | 194 | 108 | 61 | 33 |
+|                           | 9  | 2.0  | 194 | 108 | 61 | 33 |
+|                           | 14 | 2.1  | 186 | 104 | 59 | 32 |
 
 Because the ACK is steered, the **exchange cost depends only on the hop count
 `d_avg`**, not on the number of relay nodes (see below).
@@ -939,21 +943,21 @@ The result is a **practical upper bound**:
 
 | topology | nodes (non-master) | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
-| **deep tree**              | 4  | 121 | 76 | 46 | 27 |
-|                           | 9  | 95 | 60 | 37 | 21 |
-|                           | 14 | 88 | 56 | 34 | 19 |
-| **average 1.5 hops**       | 4  | 184 | 114 | 69 | 39 |
-|                           | 9  | 175 | 109 | 65 | 37 |
-|                           | 14 | 184 | 114 | 69 | 39 |
-| **average 2 hops**         | 4  | 146 | 92 | 55 | 31 |
-|                           | 9  | 146 | 92 | 55 | 31 |
-|                           | 14 | 140 | 88 | 53 | 31 |
+| **deep tree**              | 4  | 121 | 77 | 46 | 27 |
+|                           | 9  | 95 | 61 | 37 | 21 |
+|                           | 14 | 88 | 56 | 34 | 20 |
+| **average 1.5 hops**       | 4  | 184 | 114 | 68 | 39 |
+|                           | 9  | 175 | 108 | 65 | 37 |
+|                           | 14 | 184 | 114 | 68 | 39 |
+| **average 2 hops**         | 4  | 146 | 91 | 55 | 31 |
+|                           | 9  | 146 | 91 | 55 | 31 |
+|                           | 14 | 141 | 88 | 53 | 30 |
 
 Like the tables above these are **punches per minute** for a single closed-loop flow
 (the host sends the next punch only after the previous ACK). The per-hop term is a
 **mean**: a hop that is retried (implicit-ACK timeout `2*airtime + 200 ms`, up to
 `MESH_LINK_RETRIES` times) adds more, and a busy channel (CAD busy -> randomised
-backoff, 40-1280 ms doubling) adds more again. A CAD listen before each send is not
+backoff drawn from a doubling window, 20-40 ms at first) adds more again. A CAD listen before each send is not
 counted. The channel is also shared: CAD plus per-node backoff serialize competitors,
 so a busy network lands below these figures. In short, a half-duplex store-and-forward
 mesh can **never fill the air** -- a relay must finish receiving before it can transmit
@@ -974,7 +978,7 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
 ## Testing
 
 * **Host unit tests** (no target needed):
-  `g++ -std=c++11 -Wall -Wextra -I. test/mesh_wire_test.cpp mesh_wire.cpp -o /tmp/t && /tmp/t`
+  `g++ -std=c++17 -Wall -Wextra -I. test/mesh_wire_test.cpp mesh_wire.cpp -o /tmp/t && /tmp/t`
   (same for `mesh_alloc_test`, `mesh_route_test`).
 * **Build check** against the real target flags: compile the sketch sources with
   `-fsyntax-only` using the generated `compile_commands.json`.
