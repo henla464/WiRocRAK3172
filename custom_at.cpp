@@ -325,7 +325,7 @@ int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
  *        rootward.  The master node, being the root, covers the whole network;
  *        any other node sees only the part of the tree it is on the path for.
  *        Each line is
- *        'ATC+MESHTOPO=<addr>:<parent>:<nbr>=<cost>,<nbr>=<cost>,...'
+ *        'ATC+MESHTOPO=<addr>:<parent>:<neighbour addr>=<cost>,<neighbour addr>=<cost>,...'
  *        where <parent> is the node's parent address (0 = none) and the trailing
  *        list is the neighbours it hears, with their link costs (omitted when
  *        none).  A row ages out after MESH_TOPO_HOLD_MS; the reports are

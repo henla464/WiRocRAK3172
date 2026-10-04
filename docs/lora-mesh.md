@@ -87,11 +87,11 @@ is a passive standby master (see *Standby master* below).
 node:
 
 ```
-ATC+MESHTOPO=<addr>:<parent>:<nbr>=<cost>,<nbr>=<cost>,...
+ATC+MESHTOPO=<addr>:<parent>:<neighbour addr>=<cost>,<neighbour addr>=<cost>,...
 ```
 
 `addr` is the node, `parent` is its parent address (`0` = none), and the trailing
-list is the neighbours it hears with their link costs (omitted when none). Every
+list is the neighbours it hears as `<neighbour addr>=<cost>` (omitted when none). Every
 node serves its **own** row (live from its neighbour table) plus a row for each
 **descendant** whose report it has passed rootward, so the master node -- being the
 root -- covers the whole network while any other node sees only the part of the
