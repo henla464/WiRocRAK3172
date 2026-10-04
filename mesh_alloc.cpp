@@ -64,6 +64,20 @@ uint8_t mesh_alloc_lookup(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN])
     return (i < 0) ? MESH_ADDR_NONE : s_entries[i].addr;
 }
 
+bool mesh_alloc_device_id(uint8_t addr, uint8_t out[MESH_NODE_DEVICE_ID_LEN])
+{
+    if (addr == MESH_ADDR_NONE) {
+        return false;                   /* 0 is a free slot / unknown, never bound */
+    }
+    for (uint8_t i = 0; i < MESH_MAX_SLAVES; i++) {
+        if (s_entries[i].addr == addr) {
+            memcpy(out, s_entries[i].device_id, MESH_NODE_DEVICE_ID_LEN);
+            return true;
+        }
+    }
+    return false;
+}
+
 bool mesh_alloc_occupies(uint8_t addr)
 {
     if (addr == MESH_ADDR_NONE) {

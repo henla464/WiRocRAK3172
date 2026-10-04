@@ -884,6 +884,21 @@ void mesh_get_node_device_id(uint8_t out[MESH_NODE_DEVICE_ID_LEN])
     memcpy(out, s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN);
 }
 
+bool mesh_lookup_device_id(uint8_t addr, uint8_t out[MESH_NODE_DEVICE_ID_LEN])
+{
+    if (!mesh_is_master()) {
+        return false;                   /* only the master holds the addr <-> id map */
+    }
+    if (addr == MESH_MASTER_ADDR) {
+        if (!mesh_has_node_device_id()) {
+            return false;
+        }
+        mesh_get_node_device_id(out);
+        return true;
+    }
+    return mesh_alloc_device_id(addr, out);
+}
+
 /* ======================================================================= */
 /*  RX / TX plumbing                                                      */
 /* ======================================================================= */

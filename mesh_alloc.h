@@ -28,6 +28,10 @@ uint8_t mesh_alloc_count(void);
 /* Address assigned to `device_id`, or MESH_ADDR_NONE when unknown. */
 uint8_t mesh_alloc_lookup(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN]);
 
+/* Reverse lookup: copy the device id bound to `addr` into `out` and return true,
+ * or return false (leaving `out` untouched) when `addr` is free / out of range. */
+bool    mesh_alloc_device_id(uint8_t addr, uint8_t out[MESH_NODE_DEVICE_ID_LEN]);
+
 /* Return the existing address for `device_id`, or allocate the lowest free slave
  * address.  Returns MESH_ADDR_NONE when the pool is exhausted. */
 uint8_t mesh_alloc_assign(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN]);

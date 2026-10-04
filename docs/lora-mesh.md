@@ -113,15 +113,20 @@ Addresses travel in the AT interface, so the host is updated in lock-step:
   stays valid (`dest=0`).
   In **both** modes a busy channel (CAD) is reported back as `AT_BUSY_ERROR`; the
   host backs off and resends (see "Channel access").
-* **`ATC+REC`** appends one **source-address** byte to both response forms:
+* **`ATC+REC`** appends a **source address** and the origin's **6-byte Bluetooth
+  address** to both response forms:
 
   ```
-  hex:    OK:<hex>:<rssi>:<snr>:<status>:<srcaddr>
-  binary: OK + data + rssiH + rssiL + snr + status + srcaddr
+  hex:    OK:<hex>:<rssi>:<snr>:<status>:<srcaddr>:<btaddr>
+  binary: OK + data + rssiH + rssiL + snr + status + srcaddr + btaddr(6)
   ```
 
-  `srcaddr` is the mesh source of the delivered frame (the node that injected it).
-  In P2P mode it is `0`. The master node uses it to learn which node to ACK.
+  `srcaddr` is the mesh source of the delivered frame (the node that injected it);
+  in P2P mode it is `0`. `btaddr` is that node's full 48-bit device id (12 hex
+  chars, MSB first). **Only the master node can resolve it** -- it holds the
+  address <-> device-id map (`mesh_lookup_device_id`) -- so on a non-master, on
+  the standby master, and in P2P mode `btaddr` is six zero bytes. The master node
+  uses `srcaddr` to learn which node to ACK.
 
 ## Wire format
 

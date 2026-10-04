@@ -1220,11 +1220,16 @@ int receive_handler(SERIAL_PORT port, char *cmd, stParam *param)
             LoraMeessage_t msg;
             if (MessageQueue_deQueue(&incomingMessageQueue, &msg))
             {
+                /* Origin's full BT address; zeros unless this node (the master)
+                 * can resolve the source address. */
+                uint8_t srcBt[MESH_NODE_DEVICE_ID_LEN] = {0};
+                mesh_lookup_device_id(msg.SourceAddr, srcBt);
                 atcmd_printf("OK");
                 if (hexFormat) {
                     atcmd_printf(":");
                     p2p_printf_hex(msg.Buffer, msg.BufferSize);
-                    atcmd_printf(":%d:%d:%d:%d", msg.Rssi, msg.Snr, msg.Status, msg.SourceAddr);
+                    atcmd_printf(":%d:%d:%d:%d:", msg.Rssi, msg.Snr, msg.Status, msg.SourceAddr);
+                    p2p_printf_hex(srcBt, sizeof(srcBt));
                     return AT_NO_STATUS;
                 } else {
                     HardwareSerial* serialX;
@@ -1247,6 +1252,10 @@ int receive_handler(SERIAL_PORT port, char *cmd, stParam *param)
                     serialX->write(msg.Snr);
                     serialX->write(msg.Status);
                     serialX->write(msg.SourceAddr);
+                    for (uint8_t i=0; i<sizeof(srcBt); i++)
+                    {
+                        serialX->write(srcBt[i]);
+                    }
                     return AT_NO_STATUS;
                 }
             }

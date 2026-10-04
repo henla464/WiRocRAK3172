@@ -74,6 +74,13 @@ bool    mesh_has_node_device_id(void);
 void    mesh_set_node_device_id(const uint8_t *device_id);   /* NULL clears it */
 void    mesh_get_node_device_id(uint8_t out[MESH_NODE_DEVICE_ID_LEN]);
 
+/* Full 6-byte device id for a mesh address, for ATC+REC to report a delivered
+ * frame's origin.  Only the **master node** can resolve it -- it holds the
+ * address <-> device-id map, and its own id for MESH_MASTER_ADDR.  Returns false
+ * (leaving `out` untouched) on any other node and for an unknown address, so the
+ * caller emits six zero bytes. */
+bool    mesh_lookup_device_id(uint8_t addr, uint8_t out[MESH_NODE_DEVICE_ID_LEN]);
+
 /* Persist the current configuration to flash. */
 bool    mesh_config_save(void);
 
