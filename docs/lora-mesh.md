@@ -39,7 +39,7 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
 | `ATC+MESHNODEDEVICEID=<12 hex>` | Set the 6-byte node device id (persisted). `ATC+MESHNODEDEVICEID?` reads it back. |
 | `ATC+MESHMAP=?` | Diagnostics (see below). |
 | `ATC+MESHTOPO=?` | Dump the topology map this node knows, one line per node (see below). |
-| `ATC+P2P=<runcfg>:...,[:<mesh>:<master>:<deviceid>]` | Mesh flags and node device id as trailing params of the P2P config command. |
+| `ATC+P2P=<runcfg>:...,[:<mesh>:<master>:<standby>:<deviceid>]` | Mesh flags and node device id as trailing params of the P2P config command. |
 
 A device only joins the network once mesh mode is enabled **and** it has a node
 device id and it is not the master node. A node with **no node device id** neither
@@ -60,13 +60,18 @@ can be fed straight back as a set command.
 | argc | params |
 |------|--------|
 | 13 | `<runcfg>` + 12 radio params |
-| 16 | `<runcfg>` + 12 radio params + `<mesh>:<master>:<deviceid>` |
+| 16 | `<runcfg>` + 12 radio params + `<mesh>:<master>:<deviceid>` (legacy tail) |
+| 17 | `<runcfg>` + 12 radio params + `<mesh>:<master>:<standby>:<deviceid>` |
 
-`<runcfg>` is a single digit at `argv[0]`; the 12 radio parameters and the mesh
-tail are unchanged from the legacy `ATC+P2P`. Any other argument count is
-rejected. (Mesh can also be enabled and given a device id with the standalone
-`ATC+MESH` / `ATC+ACTIVEMASTER` / `ATC+MESHNODEDEVICEID` commands, which is how a node
-changes one field without resending the whole P2P config.)
+`<runcfg>` is a single digit at `argv[0]`; the 12 radio parameters are unchanged
+from the legacy `ATC+P2P`. In the mesh tail the **device id is always the last
+parameter**; `<master>` and `<standby>` are 0/1 flags and are **mutually
+exclusive** (sending both as 1 is rejected with `AT_PARAM_ERROR`). The 16-argument
+form (no `<standby>`) is the legacy tail and leaves the standby flag untouched.
+Any other argument count is rejected. (Mesh can also be enabled and its roles/id
+set with the standalone `ATC+MESH` / `ATC+ACTIVEMASTER` / `ATC+STANDBYMASTER` /
+`ATC+MESHNODEDEVICEID` commands, which is how a node changes one field without
+resending the whole P2P config.)
 
 `ATC+MESHMAP=?` returns
 `MESHMAP=<enabled>:<master>:<addr>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>`
