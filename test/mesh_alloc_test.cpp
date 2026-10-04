@@ -1,5 +1,5 @@
 /*
- * Host unit test for the master-side mesh address allocator (mesh_alloc.cpp).
+ * Host unit test for the root-side mesh address allocator (mesh_alloc.cpp).
  *
  * Build:
  *   g++ -std=c++17 -Wall -Wextra -I. test/mesh_alloc_test.cpp mesh_alloc.cpp -o /tmp/mesh_alloc_test
@@ -63,40 +63,40 @@ int main(void)
     CHECK(!mesh_alloc_occupies(5));
     CHECK(!mesh_alloc_occupies(MESH_ADDR_NONE));
 
-    /* Bitmap: master bit + allocated slaves set, everything else clear. */
+    /* Bitmap: root bit + allocated non-root nodes set, everything else clear. */
     mesh_alloc_bitmap(bm);
-    CHECK(bm[0] & (1u << MESH_MASTER_ADDR));
+    CHECK(bm[0] & (1u << MESH_ROOT_ADDR));
     CHECK(bm[0] & (1u << 2));
     CHECK(bm[0] & (1u << 3));
     CHECK(bm[0] & (1u << 4));
     CHECK(!(bm[0] & (1u << 5)));
     CHECK(bm[1] == 0);
 
-    /* Exhaust the pool (14 slaves total; A/B/C already hold 3) -> next fails. */
-    for (uint16_t id = 0x40; id < 0x40 + (MESH_MAX_SLAVES - 3); id++) {
+    /* Exhaust the pool (14 non-root nodes total; A/B/C already hold 3) -> next fails. */
+    for (uint16_t id = 0x40; id < 0x40 + (MESH_MAX_NONROOT_NODES - 3); id++) {
         uint8_t t[MESH_NODE_DEVICE_ID_LEN];
         make_device_id(t, (uint8_t)id);
         CHECK(mesh_alloc_assign(t) != MESH_ADDR_NONE);
     }
-    CHECK(mesh_alloc_count() == MESH_MAX_SLAVES);
+    CHECK(mesh_alloc_count() == MESH_MAX_NONROOT_NODES);
     CHECK(mesh_alloc_assign(unknown) == MESH_ADDR_NONE);
 
     /* Freeing an address recycles the lowest free slot. */
     mesh_alloc_free(3);
-    CHECK(mesh_alloc_count() == MESH_MAX_SLAVES - 1);
+    CHECK(mesh_alloc_count() == MESH_MAX_NONROOT_NODES - 1);
     CHECK(!mesh_alloc_occupies(3));
     CHECK(mesh_alloc_assign(unknown) == 3);
 
     /* Freeing an unassigned address is a no-op (0 is never handed out). */
     mesh_alloc_free(MESH_ADDR_NONE);
-    CHECK(mesh_alloc_count() == MESH_MAX_SLAVES);
+    CHECK(mesh_alloc_count() == MESH_MAX_NONROOT_NODES);
 
     /* Reset clears everything. */
     mesh_alloc_reset();
     CHECK(mesh_alloc_count() == 0);
     CHECK(!mesh_alloc_occupies(2));
 
-    /* mesh_alloc_claim: adopt a specific address after a master restart. */
+    /* mesh_alloc_claim: adopt a specific address after a root restart. */
     CHECK(mesh_alloc_claim(tA, 7));                 /* free address: adopt */
     CHECK(mesh_alloc_lookup(tA) == 7);
     CHECK(mesh_alloc_claim(tA, 7));                 /* idempotent */
@@ -106,7 +106,7 @@ int main(void)
     CHECK(mesh_alloc_lookup(tB) == MESH_ADDR_NONE);
     CHECK(mesh_alloc_claim(tB, 8));
     CHECK(mesh_alloc_lookup(tB) == 8);
-    CHECK(!mesh_alloc_claim(tC, MESH_MASTER_ADDR)); /* out of slave range   */
+    CHECK(!mesh_alloc_claim(tC, MESH_ROOT_ADDR));   /* out of the non-root range */
     CHECK(!mesh_alloc_claim(tC, MESH_ADDR_NONE));
     CHECK(mesh_alloc_count() == 2);
 
@@ -114,7 +114,7 @@ int main(void)
     mesh_alloc_reset();
     {
         uint16_t v = mesh_alloc_version();
-        CHECK(mesh_alloc_assign(tA) == MESH_FIRST_SLAVE_ADDR);
+        CHECK(mesh_alloc_assign(tA) == MESH_FIRST_NONROOT_ADDR);
         CHECK(mesh_alloc_version() == (uint16_t)(v + 1));   /* new bind  */
         (void)mesh_alloc_assign(tA);                        /* idempotent */
         CHECK(mesh_alloc_version() == (uint16_t)(v + 1));

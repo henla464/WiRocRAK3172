@@ -10,25 +10,25 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
 
 ## Model
 
-* **Exactly one master node** (gateway), designated by configuration -- there is no
-  election. The master node is the network's sink: the only node that feeds
+* **Exactly one root node** (gateway), designated by configuration -- there is no
+  election. The root node is the network's sink: the only node that feeds
   **uplinks** to its host. (A node that is the target of a downlink feeds that
-  payload to its host too, and a standby master mirrors the uplinks it overhears.)
-* **4-bit addresses (0-15)** assigned automatically by the master node; the master node
+  payload to its host too, and a standby root mirrors the uplinks it overhears.)
+* **4-bit addresses (0-15)** assigned automatically by the root node; the root node
   itself always owns address `1`, all other nodes use `2`-`15` (14 nodes max).
-* **Convergecast** routing: every node forwards toward the master node, multi-hop
+* **Convergecast** routing: every node forwards toward the root node, multi-hop
   (up to `4` hops).
 * Each node has a **host-provisioned 6-byte node device id** used to claim an
   address; a node with no node device id never starts the mesh.
-* The master node can send a payload **down** to a specific node (needed for
+* The root node can send a payload **down** to a specific node (needed for
   application-layer ACKs).
 
 ```
-            (master node, addr 1)
+            (root node, addr 1)
                  /        \
         (addr 4)      (addr 5)
              |
-        (addr 7)   <-- out of the master node's range: reaches it via addr 4
+        (addr 7)   <-- out of the root node's range: reaches it via addr 4
 ```
 
 ## Enabling
@@ -36,15 +36,15 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
 | Command | Meaning |
 |---------|---------|
 | `ATC+MESH=<0\|1>` | Enable / disable mesh mode (persisted). `ATC+MESH?` reads it. |
-| `ATC+ACTIVEMASTER=<0\|1>` | Designate this node as the active master node / gateway (persisted). `ATC+ACTIVEMASTER?` reads it. |
-| `ATC+STANDBYMASTER=<0\|1>` | Designate this node as a passive standby master (persisted). `ATC+STANDBYMASTER?` reads it. |
+| `ATC+ACTIVEROOT=<0\|1>` | Designate this node as the active root node / gateway (persisted). `ATC+ACTIVEROOT?` reads it. |
+| `ATC+STANDBYROOT=<0\|1>` | Designate this node as a passive standby root (persisted). `ATC+STANDBYROOT?` reads it. |
 | `ATC+MESHNODEDEVICEID=<12 hex>` | Set the 6-byte node device id (persisted). `ATC+MESHNODEDEVICEID?` reads it back. |
 | `ATC+MESHSTATE=?` | Diagnostics (see below). |
 | `ATC+MESHTOPO=?` | Dump the topology map this node knows, one line with rows separated by `|` (see below). |
-| `ATC+P2P=<runcfg>:...,[:<mesh>:<master>:<standby>:<deviceid>]` | Mesh flags and node device id as trailing params of the P2P config command. |
+| `ATC+P2P=<runcfg>:...,[:<mesh>:<root>:<standby>:<deviceid>]` | Mesh flags and node device id as trailing params of the P2P config command. |
 
 A device only joins the network once mesh mode is enabled **and** it has a node
-device id and it is not the master node. A node with **no node device id** neither
+device id and it is not the root node. A node with **no node device id** neither
 beacons nor joins (the mesh does not start). Enabling/disabling takes effect
 immediately (no reboot required).
 
@@ -61,7 +61,7 @@ so the query output can be fed straight back as a set command.
 | argc | params |
 |------|--------|
 | 13 | `<runcfg>` + 12 radio params |
-| 17 | `<runcfg>` + 12 radio params + `<mesh>:<master>:<standby>:<deviceid>` |
+| 17 | `<runcfg>` + 12 radio params + `<mesh>:<root>:<standby>:<deviceid>` |
 
 with fields:
 
@@ -69,40 +69,40 @@ with fields:
   flash-stored config, `1` = use the runtime config.
 * 12 radio params -- unchanged from the legacy `ATC+P2P`.
 * `<mesh>` -- mesh enable flag (`0`/`1`).
-* `<master>` -- active master node / gateway flag (`0`/`1`).
-* `<standby>` -- passive standby master flag (`0`/`1`).
+* `<root>` -- active root node / gateway flag (`0`/`1`).
+* `<standby>` -- passive standby root flag (`0`/`1`).
 * `<deviceid>` -- 6-byte node device id (12 hex chars); the **last** parameter.
 
-`<master>` and `<standby>` are **mutually exclusive** (sending both as 1 is rejected
+`<root>` and `<standby>` are **mutually exclusive** (sending both as 1 is rejected
 with `AT_PARAM_ERROR`). Any other argument count is rejected. (Mesh can also be
-enabled and its roles/id set with the standalone `ATC+MESH` / `ATC+ACTIVEMASTER` /
-`ATC+STANDBYMASTER` / `ATC+MESHNODEDEVICEID` commands, which is how a node changes
+enabled and its roles/id set with the standalone `ATC+MESH` / `ATC+ACTIVEROOT` /
+`ATC+STANDBYROOT` / `ATC+MESHNODEDEVICEID` commands, which is how a node changes
 one field without resending the whole P2P config.)
 
 `ATC+MESHSTATE=?` returns
 
 ```
-MESHSTATE=<enabled>:<is master>:<own addr>:<txq>:<state>:<alloc>:<parent addr>:<hops>:<path cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>
+MESHSTATE=<enabled>:<is root>:<own addr>:<txq>:<state>:<alloc>:<parent addr>:<hops>:<path cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>
 ```
 
 with fields:
 
 * `<enabled>` -- `1` when mesh mode is on.
-* `<is master>` -- `1` on the gateway.
+* `<is root>` -- `1` on the gateway.
 * `<own addr>` -- this node's mesh address (`0` = unassigned).
 * `<txq>` -- mesh **transmit-queue depth**: module-generated frames still queued for
   the radio, `0..8` (`0` = idle; `8` = full, so new frames are dropped).
 * `<state>` -- `0`=unassigned, `1`=joining, `2`=joined.
-* `<alloc>` -- number of addresses the master node has handed out.
+* `<alloc>` -- number of addresses the root node has handed out.
 * `<parent addr>` -- current next hop (`0`=none).
-* `<hops>` / `<path cost>` -- route to the master node.
+* `<hops>` / `<path cost>` -- route to the root node.
 * `<neighbour-count>` -- live neighbour count.
-* `<epoch>` -- master node's **boot number** (a counter the master node increments on
+* `<epoch>` -- root node's **boot number** (a counter the root node increments on
   every boot; only its low 3 bits are advertised, see *Recovery*) as last seen by this node.
 * `<overhead%>` -- measured control-plane airtime as a percentage of the data-frame
   airtime transmitted.
 * `<ackms>` -- derived per-hop ACK timeout for the current datarate.
-* `<standby>` -- `1` when this node is a passive standby master (see *Standby master* below).
+* `<standby>` -- `1` when this node is a passive standby root (see *Standby root* below).
 
 `ATC+MESHTOPO=?` returns the topology map **this node** knows, as a single line
 with one entry per known node, entries separated by `|`:
@@ -117,13 +117,13 @@ with fields:
   row, a descendant's for a row it passed rootward).
 * `<parent addr>` -- that node's parent address (`0` = none).
 * `<btaddr>` -- that node's full 48-bit device id (12 hex chars, MSB first): a node
-  always resolves its own, and the **master node** resolves every address from its
+  always resolves its own, and the **root node** resolves every address from its
   address <-> device-id map, so on any other node only its own row carries a non-zero `btaddr`.
 * trailing list -- the neighbours it hears as `<neighbour addr>=<link cost>` (omitted when none).
 
 A node that knows no rows returns the empty reply `ATC+MESHTOPO=`. Every
 node serves its **own** row (live from its neighbour table) plus a row for each
-**descendant** whose report it has passed rootward, so the master node -- being the
+**descendant** whose report it has passed rootward, so the root node -- being the
 root -- covers the whole network while any other node sees only the part of the
 tree it is on the path for. See *Topology map* below.
 
@@ -132,10 +132,10 @@ tree it is on the path for. See *Topology map* below.
 Addresses travel in the AT interface, so the host is updated in lock-step:
 
 * **`ATC+SEND=<dest>:<hexpayload>`** -- optional leading destination address.
-  `dest=0` means "the master node / default" and is what legacy P2P and every
-  non-master mesh node use. A non-zero `dest` is honoured **only by the master node**
-  as a downlink to that node; on a non-master it is ignored and the payload goes
-  to the master node anyway. The legacy single-parameter form `ATC+SEND=<hexpayload>`
+  `dest=0` means "the root node / default" and is what legacy P2P and every
+  non-root mesh node use. A non-zero `dest` is honoured **only by the root node**
+  as a downlink to that node; on a non-root it is ignored and the payload goes
+  to the root node anyway. The legacy single-parameter form `ATC+SEND=<hexpayload>`
   stays valid (`dest=0`).
   In **both** modes a busy channel (CAD) is reported back as `AT_BUSY_ERROR`; the
   host backs off and resends (see "Channel access").
@@ -152,11 +152,11 @@ Addresses travel in the AT interface, so the host is updated in lock-step:
   * `srcaddr` -- mesh source of the delivered frame (the node that injected it);
     `0` in P2P mode.
   * `btaddr` -- that node's full 48-bit device id (12 hex chars, MSB first).
-    **Only a root node can resolve it for another address** -- the active master
-    holds the authoritative address <-> device-id map, and a **standby master**
-    holds a best-effort shadow of it (see *Standby master*); both resolve via
+    **Only a root node can resolve it for another address** -- the active root
+    holds the authoritative address <-> device-id map, and a **standby root**
+    holds a best-effort shadow of it (see *Standby root*); both resolve via
     `mesh_lookup_device_id`. On any other node (and in P2P mode) it is six zero
-    bytes. The master node uses `srcaddr` to learn which node to ACK.
+    bytes. The root node uses `srcaddr` to learn which node to ACK.
 
 ## Wire format
 
@@ -170,7 +170,7 @@ as the sanity gate). The header is **3 bytes** (24 bits, no waste), MSB-first:
 | 4 | version | protocol version (currently `1`) |
 | 4 | src | source address (0-15) |
 | 4 | dst | destination (0-15; also carries the assigned address / acked origin) |
-| 3 | hops | beacon: hop-count to the master node; data: TTL (max 4) |
+| 3 | hops | beacon: hop-count to the root node; data: TTL (max 4) |
 | 5 | seq | dedup key `(src,seq)`, 32-value window |
 
 ```
@@ -183,7 +183,7 @@ byte2 = hops<<5 | seq
 so each address field sits on a nibble boundary. There is no "ack requested" flag:
 whoever the frame **terminates** at answers it with an explicit `LINK_ACK` when it
 has no next hop whose forward it could overhear the way a relay node does -- the
-master node for an uplink, the target for a downlink. When the master is the other
+root node for an uplink, the target for a downlink. When the root is the other
 end of that hop (a **direct child**, the one case that crossed no relay), no
 `LINK_ACK` is spent: the single hop is confirmed by the application-layer ACK
 instead.
@@ -191,7 +191,7 @@ instead.
 The WiRoc payload follows verbatim and is stripped of the header before delivery to
 the host. Control beacons carry a **1-byte** control payload after the header:
 `epoch[3]` (bits 7-5) packed over `path cost[5]` (bits 4-0). The 3-bit `epoch` is
-the low bits of the master node's **boot number** -- incremented by the master node on each
+the low bits of the root node's **boot number** -- incremented by the root node on each
 boot -- so nodes spot a restart when it changes.
 
 ### Duplicate suppression (dedup)
@@ -229,18 +229,18 @@ header is **not** repeated in the payload (header-field reuse).
 
 | id | type | on-air size (bytes) | delivery | payload | purpose |
 |----|------|-----------------|----------|---------|---------|
-| 0 | `BEACON` | 4 | link-local, not relayed, not deduped | `epoch[3]\|cost[5]` (1 byte); header `hops` = hop-count to the master node | Liveness and routing advertisement. Emitted on an adaptive interval by the master node and by any node that has a parent. Neighbours use it to select a parent and to detect a node going quiet. |
-| 1 | `JOIN_REQ` | 9 | flooded | `devid[6]`; `src` = 0 | An unassigned node asks the master node for an address, retrying with backoff until assigned. Because `src` is 0, it is deduped on its node device id instead of `(src,seq)`. |
-| 2 | `ADDR_ASSIGN` | 9 | flooded | `devid[6]`; **assigned address in header `dst`** | The master node's answer to a `JOIN_REQ` (and its re-assertion after an `ADDR_CLAIM`). The node whose node device id matches adopts and persists the address. A node that sees its own address given to a *different* node device id relinquishes it. |
-| 3 | `ADDR_TABLE` | 5 | flooded (relayed by relay nodes only) | `occupied_bitmap[2]` (16-bit; the master-node bit is always set) | The master node floods its occupied-address bitmap whenever the table **changes** (debounced) and as a slow periodic backstop, so nodes can reconcile. A node that sees its own bit clear for `MESH_TABLE_MISS_LIMIT` intervals relinquishes its address and re-joins. A leaf node does not relay it (see "Flood relay"). |
-| 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the master node. Each relay node dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
-| 5 | `DATA_DOWNLINK` | 3 + N | steered hop-by-hop down the tree (`dst` = target) | WiRoc payload (N bytes) | A WiRoc payload from the master node to one specific node. The target delivers it to its host; any other node re-broadcasts it one hop further **only when one of its children's subtree bitmaps covers the target**, so the frame follows the single branch that leads to the target (`depth(target)` transmissions) instead of flooding the tree. Each hop of that path is retried on its own (`MESH_LINK_RETRIES` times): a relay node clears its pending by overhearing the next hop carry the frame on, and the target -- which has no next hop -- answers with a `LINK_ACK` of its own (see *MAC / link reliability*). |
-| 6 | `LINK_ACK` | 4 | single hop, never relayed (`dst` = the acked origin, used as the match key) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, emitted by whichever node the frame **terminates** at, since that node has no next hop whose forward it could overhear: the master node for a `DATA_UPLINK`, the target for a `DATA_DOWNLINK`. It names the origin of the frame it acks in the header `dst` -- which is what the origin's pending is keyed to, so one matcher serves both directions even though the named origin may be many hops away and never receives the frame itself. It is skipped for a frame that crossed no relay (**a direct child of the master node**, the only frame that arrives at the full TTL): that single hop is confirmed by the application-layer ACK instead. Relay nodes use the implicit ACK. |
-| 7 | `ADDR_CLAIM` | 10 | rootward unicast (flood fallback) | `devid[6]\|parent[1]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted master node can rebuild its RAM-only table; the trailing byte reports its **current parent** (`0`=none), so a claim doubles as a parent report for the topology map. **Event-driven** -- sent on a new boot epoch, on boot, on re-attach, on a parent change, and when the depth >= 2 liveness watchdog sees our parent stop covering us; never on a plain timer. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead. |
-| 8 | `ADDR_ALIVE` | 5 | single hop to the parent (absorbed, never forwarded) | `subtree_bitmap[2]` (16-bit; bit `a` = "address `a` is alive in my subtree") | Periodic liveness **aggregate**, so the master node does not evict a deep idle node (whose beacon is link-local and never reaches it). Each node sets its own bit and ORs in the bitmap reported by each of its children, so **one frame covers a whole subtree**; the parent absorbs it and does not forward it, so the union of the master node's direct children's bitmaps covers every non-master node each round. **Only a relay node sends one** (a leaf is covered by its parent from its beacon); the master node refreshes last-heard for **every** set bit. Sent while the node holds a parent. |
-| 9 | `TOPOLOGY` | 4 + 2K | rootward unicast (`dst` = parent) | `parent[1]\|{addr[1]\|cost[1]}*` (K neighbours) | The reporting node's view of the graph: its current parent and the neighbours it hears, each with its link cost. **Event-driven** (attach / re-parent) plus a slow backstop; **best-effort** (the backstop recovers a loss). Every node on its rootward path absorbs it, so the master node sees the whole network and a relay node sees its own subtree; a relay node also forwards it one hop rootward. Read the local view with `ATC+MESHTOPO?`. |
-| 10 | `MASTER_QUERY` | 9 | broadcast (single hop, not relayed) | `devid[6]`; `src` = 1 | A (re)booting master asks "is another master already here?" -- see **Master conflict** below. |
-| 11 | `MASTER_ANNOUNCE` | 9 | broadcast (single hop, not relayed) | `devid[6]`; `src` = 1 | A master stating its identity so two masters can compare device ids and the junior one stand down. |
+| 0 | `BEACON` | 4 | link-local, not relayed, not deduped | `epoch[3]\|cost[5]` (1 byte); header `hops` = hop-count to the root node | Liveness and routing advertisement. Emitted on an adaptive interval by the root node and by any node that has a parent. Neighbours use it to select a parent and to detect a node going quiet. |
+| 1 | `JOIN_REQ` | 9 | flooded | `devid[6]`; `src` = 0 | An unassigned node asks the root node for an address, retrying with backoff until assigned. Because `src` is 0, it is deduped on its node device id instead of `(src,seq)`. |
+| 2 | `ADDR_ASSIGN` | 9 | flooded | `devid[6]`; **assigned address in header `dst`** | The root node's answer to a `JOIN_REQ` (and its re-assertion after an `ADDR_CLAIM`). The node whose node device id matches adopts and persists the address. A node that sees its own address given to a *different* node device id relinquishes it. |
+| 3 | `ADDR_TABLE` | 5 | flooded (relayed by relay nodes only) | `occupied_bitmap[2]` (16-bit; the root-node bit is always set) | The root node floods its occupied-address bitmap whenever the table **changes** (debounced) and as a slow periodic backstop, so nodes can reconcile. A node that sees its own bit clear for `MESH_TABLE_MISS_LIMIT` intervals relinquishes its address and re-joins. A leaf node does not relay it (see "Flood relay"). |
+| 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the root node. Each relay node dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
+| 5 | `DATA_DOWNLINK` | 3 + N | steered hop-by-hop down the tree (`dst` = target) | WiRoc payload (N bytes) | A WiRoc payload from the root node to one specific node. The target delivers it to its host; any other node re-broadcasts it one hop further **only when one of its children's subtree bitmaps covers the target**, so the frame follows the single branch that leads to the target (`depth(target)` transmissions) instead of flooding the tree. Each hop of that path is retried on its own (`MESH_LINK_RETRIES` times): a relay node clears its pending by overhearing the next hop carry the frame on, and the target -- which has no next hop -- answers with a `LINK_ACK` of its own (see *MAC / link reliability*). |
+| 6 | `LINK_ACK` | 4 | single hop, never relayed (`dst` = the acked origin, used as the match key) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, emitted by whichever node the frame **terminates** at, since that node has no next hop whose forward it could overhear: the root node for a `DATA_UPLINK`, the target for a `DATA_DOWNLINK`. It names the origin of the frame it acks in the header `dst` -- which is what the origin's pending is keyed to, so one matcher serves both directions even though the named origin may be many hops away and never receives the frame itself. It is skipped for a frame that crossed no relay (**a direct child of the root node**, the only frame that arrives at the full TTL): that single hop is confirmed by the application-layer ACK instead. Relay nodes use the implicit ACK. |
+| 7 | `ADDR_CLAIM` | 10 | rootward unicast (flood fallback) | `devid[6]\|parent[1]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted root node can rebuild its RAM-only table; the trailing byte reports its **current parent** (`0`=none), so a claim doubles as a parent report for the topology map. **Event-driven** -- sent on a new boot epoch, on boot, on re-attach, on a parent change, and when the depth >= 2 liveness watchdog sees our parent stop covering us; never on a plain timer. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead. |
+| 8 | `ADDR_ALIVE` | 5 | single hop to the parent (absorbed, never forwarded) | `subtree_bitmap[2]` (16-bit; bit `a` = "address `a` is alive in my subtree") | Periodic liveness **aggregate**, so the root node does not evict a deep idle node (whose beacon is link-local and never reaches it). Each node sets its own bit and ORs in the bitmap reported by each of its children, so **one frame covers a whole subtree**; the parent absorbs it and does not forward it, so the union of the root node's direct children's bitmaps covers every non-root node each round. **Only a relay node sends one** (a leaf is covered by its parent from its beacon); the root node refreshes last-heard for **every** set bit. Sent while the node holds a parent. |
+| 9 | `TOPOLOGY` | 4 + 2K | rootward unicast (`dst` = parent) | `parent[1]\|{addr[1]\|cost[1]}*` (K neighbours) | The reporting node's view of the graph: its current parent and the neighbours it hears, each with its link cost. **Event-driven** (attach / re-parent) plus a slow backstop; **best-effort** (the backstop recovers a loss). Every node on its rootward path absorbs it, so the root node sees the whole network and a relay node sees its own subtree; a relay node also forwards it one hop rootward. Read the local view with `ATC+MESHTOPO?`. |
+| 10 | `ROOT_QUERY` | 9 | broadcast (single hop, not relayed) | `devid[6]`; `src` = 1 | A (re)booting root asks "is another root already here?" -- see **Root conflict** below. |
+| 11 | `ROOT_ANNOUNCE` | 9 | broadcast (single hop, not relayed) | `devid[6]`; `src` = 1 | A root stating its identity so two roots can compare device ids and the junior one stand down. |
 
 All sizes include the fixed 3-byte header. The control types (0, 1, 2, 3, 6, 7, 8, 10, 11) have
 a fixed length; the two data types (4, 5) are `3 + N`, where `N` is the verbatim
@@ -260,16 +260,16 @@ so it is used as the "invalid / out of range" bound when validating a frame.
    `ATC+MESHNODEDEVICEID`); it is *not* a secret, only used to correlate an
    assignment back to the requester. A node with no node device id set never
    enters JOINING.
-2. The master node keeps a RAM-only node-device-id->address table, allocates the
+2. The root node keeps a RAM-only node-device-id->address table, allocates the
    lowest free address in 2-15 and floods `ADDR_ASSIGN{ devid }` (the address is
    the header `dst`).
 3. The matching node adopts and **persists** the address (flash), emits
    `ADDR_CLAIM`, resets its beacon to fast, and becomes **JOINED**.
-4. The master node floods `ADDR_TABLE{ occupied_bitmap[2] }` **whenever the table
+4. The root node floods `ADDR_TABLE{ occupied_bitmap[2] }` **whenever the table
    changes** (debounced), with a slow periodic backstop; a node whose own bit is
    cleared for several intervals relinquishes its address and re-joins.
 
-The master node owns address `1`. Its table is **RAM-only**; nodes are the source of
+The root node owns address `1`. Its table is **RAM-only**; nodes are the source of
 truth for their own address via flash (see *Recovery*).
 
 ## Routing and the link-quality metric
@@ -305,14 +305,14 @@ Parent switching requires a hysteresis margin to avoid flapping, and a stale par
 
 The origin builds `DATA_UPLINK{ src, dst=parent, ttl, payload }` and unicasts it
 to its parent; each relay node dedups `(src,seq)` and forwards to its own parent
-(TTL - 1). The master node queues the payload to its host with `srcaddr` = the origin.
+(TTL - 1). The root node queues the payload to its host with `srcaddr` = the origin.
 An uplink from a **direct child** (the only one that arrives at the full TTL) is
 acknowledged by the application-layer ACK rather than a `LINK_ACK`, so a direct child
 neither receives nor expects the link-layer ACK (see *MAC / link reliability*).
 
 ### Downlink
 
-The master node sends `DATA_DOWNLINK{ src=master, dst=target, ttl }`; the node whose
+The root node sends `DATA_DOWNLINK{ src=root, dst=target, ttl }`; the node whose
 address matches delivers it to its host, and any other node relays it one hop further
 **only when one of its children's subtree bitmaps contains the target** (bounded by TTL
 and dedup). The subtree bitmaps carried by the `ADDR_ALIVE` aggregates therefore double
@@ -326,8 +326,8 @@ clears its pending when it overhears the next hop carry the frame on, and the **
 having no next hop to overhear, sends the `LINK_ACK` that releases its parent. So a lost
 hop costs one retransmission rather than the origin's whole uplink-and-downlink round
 trip -- which is what waiting for the application-layer ACK would cost. A target that is
-a **direct child** of the master node is the exception: that path is a single hop with no
-relay in it, so retrying it end to end costs the same, and neither the master nor the
+a **direct child** of the root node is the exception: that path is a single hop with no
+relay in it, so retrying it end to end costs the same, and neither the root nor the
 target spends a frame on it (see *MAC / link reliability*).
 
 ## Channel access (listen before talk)
@@ -355,7 +355,7 @@ How a busy channel is handled depends on who wants the transmission:
   nodes that just collided from retrying in lockstep; it comes from a per-node
   **xorshift PRNG** -- a *pseudo-random number generator*, a tiny deterministic
   shift-and-XOR routine seeded per node from its boot time.
-* **Host-originated traffic** (`ATC+SEND`, i.e. an uplink or a master-node downlink) is
+* **Host-originated traffic** (`ATC+SEND`, i.e. an uplink or a root-node downlink) is
   **not queued**. The frame is tried **once, immediately**: if the channel is busy
   the AT handler returns `AT_BUSY_ERROR` and the **host owns the backoff and
   resend**, exactly like legacy P2P mode. If the frame does go out, it is still
@@ -377,12 +377,12 @@ gives up and leaves the rest to the application-layer ACK.
 A node the frame **terminates** at has no next hop to overhear and so answers explicitly:
 it emits a `LINK_ACK` (acked origin in the header `dst`, acked seq in the payload) naming
 the origin of the frame it acks, which is what a relay node's pending is keyed to. That is
-the **master node** for a `DATA_UPLINK`, and the **target** for a `DATA_DOWNLINK`; the same
+the **root node** for a `DATA_UPLINK`, and the **target** for a `DATA_DOWNLINK`; the same
 matcher serves both, and because the two origins are different addresses an uplink's ACK
 can never clear a downlink's pending or the reverse.
 
 The exception in both directions is a frame that crossed **no relay at all** -- a
-**direct child of the master node**, the only frame that arrives at the full TTL. That path
+**direct child of the root node**, the only frame that arrives at the full TTL. That path
 is a single hop, so there is no chain to shortcut: retrying it end to end costs exactly
 what a per-hop retry would, and the mesh MAC does **not** retransmit it in either
 direction. Its single hop is confirmed by the **application-layer ACK**, at a latency the
@@ -403,14 +403,14 @@ application-layer (the RAK does not fabricate it in mesh mode).
 re-attaches to the best remaining neighbour, then re-announces its address. If it
 has no neighbour at all it keeps listening until beacons return.
 
-**Master node restart.** The master node's table is RAM-only. To recover it:
+**Root node restart.** The root node's table is RAM-only. To recover it:
 
-* The master node persists a **boot counter** and advertises its low **3 bits** as the
+* The root node persists a **boot counter** and advertises its low **3 bits** as the
   beacon **epoch**, beacons fast for `MESH_RECOVER_MS` after boot, and defers new
   allocations during that window so returning nodes win back their own addresses
   first. The 3-bit epoch is enough because its only job is *fast* reboot detection;
-  a rare miss (the master node rebooting a multiple of 8 times while a node was deaf)
-  is caught instead by the `ADDR_TABLE` bitmap -- the rebooted master forgets the
+  a rare miss (the root node rebooting a multiple of 8 times while a node was deaf)
+  is caught instead by the `ADDR_TABLE` bitmap -- the rebooted root forgets the
   node, its bit stays clear for `MESH_TABLE_MISS_LIMIT` floods, and the node
   relinquishes its address and re-joins.
 * A node (re)binds its flash-stored address with an `ADDR_CLAIM{ devid, parent }`
@@ -423,12 +423,12 @@ has no neighbour at all it keeps listening until beacons return.
   no route yet (just booted / parent lost), or a relay node that has lost its own
   parent, falls back to flooding it.
 * **Liveness is a separate, cheaper message, and it is aggregated.** A deep idle
-  node's beacon is link-local, so it would otherwise go unheard at the master node;
+  node's beacon is link-local, so it would otherwise go unheard at the root node;
   the node instead sends an `ADDR_ALIVE` **subtree aggregate** to its parent every
   `MESH_ALIVE_INTERVAL_MS` (300 s). The 2-byte payload is a bitmap of the
   addresses alive in that node's subtree: the node sets its own bit and ORs in the
   bitmap each child reported. The parent **absorbs** the frame (it is a single
-  hop, never forwarded) and folds it into its own next aggregate; the master node
+  hop, never forwarded) and folds it into its own next aggregate; the root node
   refreshes last-heard for **every** set bit. So one frame covers a whole subtree
   and the liveness plane costs `O(relays)` single-hop frames per round --
   independent of tree depth and node count.
@@ -440,20 +440,20 @@ has no neighbour at all it keeps listening until beacons return.
   liveness from the claim is what lets the claim be event-driven and the liveness
   be aggregated.)
 * **A node at depth >= 2 watches its own coverage, so relay-only liveness cannot
-  strand it.** A deep node (one whose parent is not the master node) **overhears its
+  strand it.** A deep node (one whose parent is not the root node) **overhears its
   parent's `ADDR_ALIVE` aggregate** -- a single-hop unicast to the grandparent, which
   the shared medium lets it see -- and checks whether its own bit is still set. If the
   parent stops aggregating altogether (it rebooted and lost its RAM-only relay role) or
   keeps aggregating but drops the bit, the node re-claims. A claim re-registers it at
-  every hop (`mesh_note_relay`) *and* re-adopts its address at the master node, so the
+  every hop (`mesh_note_relay`) *and* re-adopts its address at the root node, so the
   watchdog is safe even if eviction has already fired. Steady state costs nothing; a
   parent aggregate has to be missing for `MESH_MONITOR_TIMEOUT_MS` (1.5x the aggregate
   interval), and each re-claim is rate-limited to one per interval so a marginal link
-  cannot storm. A depth-1 node is exempt: the master node hears its beacon directly.
-* The master node rebuilds its table from the claims: it adopts the claimed address when
+  cannot storm. A depth-1 node is exempt: the root node hears its beacon directly.
+* The root node rebuilds its table from the claims: it adopts the claimed address when
   free, re-asserts its own assignment when the node device id is already known, and
   hands out a fresh address when the claimed one is already taken.
-* Routing rebuilds on its own: the master node is beaconing again within one interval and
+* Routing rebuilds on its own: the root node is beaconing again within one interval and
   routing state is node-side.
 
 **Eviction / recycling.** A node is refreshed well inside the `MESH_EVICT_MS` (610 s)
@@ -462,11 +462,11 @@ aggregate (every `MESH_ALIVE_INTERVAL_MS`, 300 s) that carries its bit -- so an
 idle-but-alive node is never dropped and even a single missed aggregate is tolerated.
 A relay node drops a child that has been silent for `MESH_ALIVE_CHILD_HOLD_MS` (610 s)
 from its own aggregate, so a dead node's bit stops being reported and its ancestors'
-coverage shrinks toward the master node. Eviction is then **subtree-scoped**: the
-master node records which **direct child** covered each address (`s_cover`), so when a
+coverage shrinks toward the root node. Eviction is then **subtree-scoped**: the
+root node records which **direct child** covered each address (`s_cover`), so when a
 direct child's aggregates have been silent for `MESH_EVICT_MS` it frees that child **and
 its whole covered subtree at once** -- one coherent event per branch -- with a
-per-address timer as the backstop for a leaf sitting directly under the master node.
+per-address timer as the backstop for a leaf sitting directly under the root node.
 A relay's bitmap is trusted only while it keeps being refreshed (`s_child_bm_ms`), so a
 child that has stopped aggregating -- because it *became* a leaf -- is reported as just
 itself instead of a stale subtree.
@@ -474,7 +474,7 @@ itself instead of a stale subtree.
 **Relay-only liveness, and its watchdog.** Because a leaf sends no liveness of its own,
 its place in the tree rests on its event-driven `ADDR_CLAIM` plus the parent's
 beacon-driven refresh of it. A relay that reboots while its children are all *quiet
-leaves* would otherwise make its whole branch invisible to the master node until the
+leaves* would otherwise make its whole branch invisible to the root node until the
 eviction timer (610 s) plus three `ADDR_TABLE` misses pushed the children to re-join.
 The depth >= 2 watchdog (above) closes that window: a node notices within
 `MESH_MONITOR_TIMEOUT_MS` (450 s) -- before eviction -- and re-claims, and the claim also
@@ -488,7 +488,7 @@ device id it relinquishes it and re-joins, so no duplicate address can persist.
 ## Topology map
 
 The node/link map is assembled from two reports, both travelling **rootward**
-toward the master node:
+toward the root node:
 
 * every `ADDR_CLAIM` (sent when a node (re)attaches or re-parents) carries the
   sender's **parent**, so a tree edge is learned the moment a node attaches; and
@@ -503,53 +503,53 @@ immediately).
 
 Both report types are hop-by-hop **unicasts along the tree**, so each one is
 absorbed by every node on the reporter's rootward path -- the reporter's parent,
-grandparent, and so on up to the master node -- and by no one else. It follows
+grandparent, and so on up to the root node -- and by no one else. It follows
 that **each node sees the part of the tree it is on the path for**: its own row
 (live) plus a row for every **descendant** (whose reports pass through it). The
-**master node**, being the root, is on every report's path and so covers the whole
+**root node**, being the root, is on every report's path and so covers the whole
 network. Read the local view with `ATC+MESHTOPO?` on any node.
 
 The map is a **diagnostic**: links are measured one-way and are noisy/asymmetric,
 and the reports are best-effort (a missed report is recovered by the backstop).
 Nothing in the routing path depends on it.
 
-## Standby master
+## Standby root
 
-A **standby master** is a node configured with `ATC+STANDBYMASTER=1` that acts as a
+A **standby root** is a node configured with `ATC+STANDBYROOT=1` that acts as a
 shadow gateway: it **transmits nothing**, mirrors the uplinks it overhears to its
-own host over `ATC+REC` (exactly the payloads an active master would deliver from
-the uplinks it receives), and **auto-promotes** itself to active master if the
-active master stops answering. The standby role and the active-master role are
-mutually exclusive (`ATC+ACTIVEMASTER=1` clears standby and vice-versa).
+own host over `ATC+REC` (exactly the payloads an active root would deliver from
+the uplinks it receives), and **auto-promotes** itself to active root if the
+active root stops answering. The standby role and the active-root role are
+mutually exclusive (`ATC+ACTIVEROOT=1` clears standby and vice-versa).
 
 **Shadow state.** Apart from staying silent, the standby runs the same root-side
-logic as the active master. Because every rootward flow converges on the master,
-a standby placed in earshot of the master overhears the **final hop** of each one
-and absorbs it, shadowing the master's state:
+logic as the active root. Because every rootward flow converges on the root,
+a standby placed in earshot of the root overhears the **final hop** of each one
+and absorbs it, shadowing the root's state:
 
 * `ADDR_ASSIGN` and `ADDR_CLAIM` -- the address <-> device-id bindings, so its
-  `ATC+REC` / `ATC+MESHTOPO` report the origin's `btaddr` like the master's; and
+  `ATC+REC` / `ATC+MESHTOPO` report the origin's `btaddr` like the root's; and
 * `TOPOLOGY` and `ADDR_ALIVE` -- the node/link graph and liveness aggregates.
 
 Silence is enforced at a single gate (the only radio-send call site), so this
 costs **no channel load** and needs no per-path checks. The shadow map is
 best-effort: a standby only learns the bindings it overhears while running, so a
 node that attached before the standby booted shows a zero `btaddr` until it
-re-claims (which it does on the next master restart or epoch change).
+re-claims (which it does on the next root restart or epoch change).
 
-**Placement.** Put the standby within earshot of the active master *and* of the
-master's direct children -- there it hears every uplink as it converges on the
-master, plus the master's own responses. The forwarding, the shadow state, and the
+**Placement.** Put the standby within earshot of the active root *and* of the
+root's direct children -- there it hears every uplink as it converges on the
+root, plus the root's own responses. The forwarding, the shadow state, and the
 failure detection all depend on that: a standby that can hear uplinks but not the
-master's downlinks cannot distinguish "the master is dead" from "I am out of
+root's downlinks cannot distinguish "the root is dead" from "I am out of
 range".
 
-**Liveness probe.** The standby judges the master alive on the **application-layer
-ACK only** -- the downlink the master's host sends back to an uplink's origin
-(`DATA_DOWNLINK` with `src` = master and `dst` = the uplink's source). A `LINK_ACK`
-does **not** count, because a direct child of the master is never sent one (its
+**Liveness probe.** The standby judges the root alive on the **application-layer
+ACK only** -- the downlink the root's host sends back to an uplink's origin
+(`DATA_DOWNLINK` with `src` = root and `dst` = the uplink's source). A `LINK_ACK`
+does **not** count, because a direct child of the root is never sent one (its
 single hop is confirmed by the app ACK instead). Requiring the app ACK also means a
-master whose radio still beacons but whose **host has hung** is caught.
+root whose radio still beacons but whose **host has hung** is caught.
 
 For each uplink it overhears (deduplicated to one per `(src,seq)`):
 
@@ -562,56 +562,56 @@ For each uplink it overhears (deduplicated to one per `(src,seq)`):
 
 The standby promotes itself after `MESH_STANDBY_MISS_LIMIT` consecutive misses
 **spread over at least `MESH_STANDBY_MIN_WINDOW_MS`** (70 s). The window is longer
-than a normal master reboot, so a reboot resets the run and does **not** cause a
+than a normal root reboot, so a reboot resets the run and does **not** cause a
 takeover.
 
 Because this probe is driven by uplinks it has two blind spots: an **idle network** --
 one where no node is sending uplink messages (no punches) -- gives it nothing to probe,
-and a standby that **boots into an already-dead network** never hears the master and so
+and a standby that **boots into an already-dead network** never hears the root and so
 never arms a probe. A separate, traffic-independent
 **backstop** covers both: it promotes after `MESH_STANDBY_BACKSTOP_MS` with *no*
-frame from the master of any kind (beacon, downlink, ACK or table). That window is
-3x the master's slowest beacon interval (`MESH_BEACON_MAX_MS`), and a live master
+frame from the root of any kind (beacon, downlink, ACK or table). That window is
+3x the root's slowest beacon interval (`MESH_BEACON_MAX_MS`), and a live root
 always beacons within that interval, so it can never trip the backstop -- 270 s of
-silence therefore honestly means the master is gone.
+silence therefore honestly means the root is gone.
 
 The standby never beacons or joins, and it is not a member of the tree. Because it transmits
 nothing it adds **no channel load**: the control-plane occupancy and punch
 throughput figures elsewhere in this document are unchanged by its presence.
 
-**Takeover.** Promotion bumps the boot epoch (exactly like a master restart), so
-every node detects the change, re-adopts its address and re-claims -- the new master
+**Takeover.** Promotion bumps the boot epoch (exactly like a root restart), so
+every node detects the change, re-adopts its address and re-claims -- the new root
 rebuilds its RAM-only allocator from those claims, then routes and delivers
-uplinks as any master does. The promotion is persisted, so it survives a power
+uplinks as any root does. The promotion is persisted, so it survives a power
 cycle. The `ATC+MESHSTATE` field `standby` reports the role.
 
-### Master conflict
+### Root conflict
 
-If the old master is powered back on after a takeover it comes up believing it is
-the master too -- two nodes both claiming address 1. This is resolved automatically,
-by a rule every master computes identically: **the lowest node device id wins.**
+If the old root is powered back on after a takeover it comes up believing it is
+the root too -- two nodes both claiming address 1. This is resolved automatically,
+by a rule every root computes identically: **the lowest node device id wins.**
 
-A master does not serve the instant it boots. It first runs a **solo check**:
-it stays silent (no beacon, no joins, no table) and broadcasts a `MASTER_QUERY`
-carrying its device id, listening for `MESH_MASTER_QUERY_WINDOW_MS`. A rival master
+A root does not serve the instant it boots. It first runs a **solo check**:
+it stays silent (no beacon, no joins, no table) and broadcasts a `ROOT_QUERY`
+carrying its device id, listening for `MESH_ROOT_QUERY_WINDOW_MS`. A rival root
 answers:
 
-* a **junior** master (higher device id) hears the query, sees a senior rival, and
+* a **junior** root (higher device id) hears the query, sees a senior rival, and
   **demotes itself to standby** (it clears address 1, becomes the silent shadow
-  root of M7, and can take over again if that master later dies);
-* a **senior** master answers with `MASTER_ANNOUNCE` (its device id), so the
-  booting master compares, finds the rival senior, and demotes.
+  root of M7, and can take over again if that root later dies);
+* a **senior** root answers with `ROOT_ANNOUNCE` (its device id), so the
+  booting root compares, finds the rival senior, and demotes.
 
-If no rival answers within the window, the booting master asserts and serves. The
-same comparison runs continuously: a **serving** master that hears a **beacon**
+If no rival answers within the window, the booting root asserts and serves. The
+same comparison runs continuously: a **serving** root that hears a **beacon**
 sourced from address 1 that it did not send (it never hears its own frames) answers
-with its identity, so two masters that were booted apart and only later came into
+with its identity, so two roots that were booted apart and only later came into
 range resolve the moment they hear each other. Because "lowest device id wins" is a
-total order, exactly one master survives -- there is no tie-break and no flapping.
+total order, exactly one root survives -- there is no tie-break and no flapping.
 
-The check only matters while a rival is actually present: a lone master reboot pays
-at most `MESH_MASTER_QUERY_WINDOW_MS` (1 s) before it serves, and a settled network
-carries no `MASTER_QUERY`/`MASTER_ANNOUNCE` traffic at all.
+The check only matters while a rival is actually present: a lone root reboot pays
+at most `MESH_ROOT_QUERY_WINDOW_MS` (1 s) before it serves, and a settled network
+carries no `ROOT_QUERY`/`ROOT_ANNOUNCE` traffic at all.
 
 ## Tunables
 
@@ -619,7 +619,7 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 
 | Constant | Default | Purpose |
 |----------|---------|---------|
-| `MESH_BEACON_FAST_MS` | 1000 | fast beacon interval (start / after any topology change / master node recovering) |
+| `MESH_BEACON_FAST_MS` | 1000 | fast beacon interval (start / after any topology change / root node recovering) |
 | `MESH_BEACON_MAX_MS` | 90000 | adaptive beacon back-off ceiling (interval doubles while stable) |
 | `MESH_BEACON_LEAF_MULT` | 3 | a leaf node beacons at this multiple of its back-off interval |
 | `MESH_RELAY_HOLD_MS` | 400000 | a node counts as a relay node while a child declared itself to it within this window (>= `MESH_ALIVE_INTERVAL_MS` so liveness aggregates keep it refreshed) |
@@ -628,9 +628,9 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_TABLE_DEBOUNCE_MS` | 500 | window that coalesces table changes into one ADDR_TABLE flood |
 | `MESH_ALIVE_INTERVAL_MS` | 300000 | **relay** liveness **aggregate** period (must stay well under `MESH_EVICT_MS`) |
 | `MESH_ALIVE_CHILD_HOLD_MS` | 610000 | a relay node drops a child from its aggregate after this long without hearing it |
-| `MESH_EVICT_MS` | 610000 | master-node eviction grace |
+| `MESH_EVICT_MS` | 610000 | root-node eviction grace |
 | `MESH_MONITOR_TIMEOUT_MS` | 450000 | depth >= 2 node: no parent aggregate for this long -> re-claim (1.5x `MESH_ALIVE_INTERVAL_MS`; must stay under `MESH_EVICT_MS`) |
-| `MESH_RECOVER_MS` | 10000 | master-node post-boot recovery window |
+| `MESH_RECOVER_MS` | 10000 | root-node post-boot recovery window |
 | `MESH_LINK_RETRIES` | 3 | link retransmits (timeout is derived, see MAC) |
 | `MESH_TX_BACKOFF_MIN_MS` / `MESH_TX_BACKOFF_MAX_MS` | 40 / 1280 | queued-frame backoff after a busy CAD (window bounds, doubles per attempt; the delay waited is drawn from the window's upper half, so 20-40 ms at first) |
 | `MESH_TX_FAST_MS` / `MESH_TX_FAST_JITTER_MS` | 10 / 30 | fast drain delay for a point-to-point frame (base + random jitter) before it is sent, instead of waiting for the 200 ms housekeeping tick |
@@ -638,20 +638,20 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_NEIGHBOR_MAX` | 8 | tracked neighbours per node |
 | `MESH_PARENT_HYSTERESIS` | 1 | cost margin required to switch parent |
 | `MESH_TOPO_INTERVAL_MS` | 300000 | topology-report backstop period (a re-parent also triggers an immediate report) |
-| `MESH_TOPO_HOLD_MS` | 900000 | the master node drops a node's map row after this long without a report |
+| `MESH_TOPO_HOLD_MS` | 900000 | the root node drops a node's map row after this long without a report |
 | `MESH_TOPO_MAX_NEIGH` | 8 | max neighbours carried in one `TOPOLOGY` report (= `MESH_NEIGHBOR_MAX`) |
-| `MESH_STANDBY_PROBE_MS` | 5000 | standby master: how long to wait for the app ACK after an uplink |
-| `MESH_STANDBY_MISS_LIMIT` | 2 | standby master: consecutive unacked uplinks before the master is deemed dead |
-| `MESH_STANDBY_MIN_WINDOW_MS` | 70000 | standby master: the misses must span at least this long (a shorter reboot does not promote) |
-| `MESH_STANDBY_BACKSTOP_MS` | 270000 | standby master: no frame from the master for this long -> promote (3x `MESH_BEACON_MAX_MS`) |
-| `MESH_STANDBY_MIN_SNR` | -6 | standby master: only uplinks heard at least this well (dB) are probed |
-| `MESH_MASTER_QUERY_WINDOW_MS` | 1000 | booting master: listen for a rival master this long before serving |
-| `MESH_MASTER_QUERY_RETRY_MS` | 300 | booting master: re-broadcast the `MASTER_QUERY` this often while listening |
+| `MESH_STANDBY_PROBE_MS` | 5000 | standby root: how long to wait for the app ACK after an uplink |
+| `MESH_STANDBY_MISS_LIMIT` | 2 | standby root: consecutive unacked uplinks before the root is deemed dead |
+| `MESH_STANDBY_MIN_WINDOW_MS` | 70000 | standby root: the misses must span at least this long (a shorter reboot does not promote) |
+| `MESH_STANDBY_BACKSTOP_MS` | 270000 | standby root: no frame from the root for this long -> promote (3x `MESH_BEACON_MAX_MS`) |
+| `MESH_STANDBY_MIN_SNR` | -6 | standby root: only uplinks heard at least this well (dB) are probed |
+| `MESH_ROOT_QUERY_WINDOW_MS` | 1000 | booting root: listen for a rival root this long before serving |
+| `MESH_ROOT_QUERY_RETRY_MS` | 300 | booting root: re-broadcast the `ROOT_QUERY` this often while listening |
 
 **Adaptive beacon.** Each node's beacon interval starts at `MESH_BEACON_FAST_MS`
 and **doubles per stable interval** up to `MESH_BEACON_MAX_MS`, and is **reset to
 fast** on join, re-attach, parent change, epoch change or when a better candidate
-appears. Parent staleness is `3x` the *current* interval. The master node keeps its
+appears. Parent staleness is `3x` the *current* interval. The root node keeps its
 `MESH_RECOVER_MS` fast window after boot, then backs off too. Trade-off (accepted):
 failure detection slows down once backed off.
 
@@ -664,12 +664,12 @@ leaf nodes). A node is a **relay node** while a child declared itself to it **ad
 to it** within `MESH_RELAY_HOLD_MS` -- via a rootward unicast (uplink / claim), a
 liveness aggregate, or that child's own beacon (the only signal that another node has
 selected it as its parent); relay nodes and the
-master node beacon at the full `MESH_BEACON_MAX_MS` rate. On the leaf-node -> relay-node
+root node beacon at the full `MESH_BEACON_MAX_MS` rate. On the leaf-node -> relay-node
 transition the beacon resets to fast so the new child can track us promptly.
 Trade-off (accepted): discovering a leaf node as a parent takes up to one leaf-node
 interval, so re-parenting onto a former leaf node is slower (its parent-side liveness
 is unaffected -- the leaf node's own `ADDR_ALIVE` aggregate keeps it alive at the relay
-node within one interval, and at the master node -- via that relay node -- regardless).
+node within one interval, and at the root node -- via that relay node -- regardless).
 
 **Flood relay.** A flood is re-broadcast once per receiving node (deduped on
 `(src,seq)`), so one flood costs one transmission per relay node. Floods whose
@@ -720,12 +720,12 @@ terms (the 3-byte header and the per-hop ACK) never amortise, while only the
 **fixed-rate** control terms do.
 
 The overhead budget is `[header + per-hop ACK + beacons + liveness + table] / data
-airtime`. The design cuts it several ways: **4-bit addresses (14 non-master nodes max)** roughly
+airtime`. The design cuts it several ways: **4-bit addresses (14 non-root nodes max)** roughly
 halve the beacon term, the **adaptive beacon** back-off plus **leaf suppression**
-(only relay nodes and the master node beacon at the full rate) cut the steady-state beacon
+(only relay nodes and the root node beacon at the full rate) cut the steady-state beacon
 term by the interval ratio, **frame slimming** (1-byte beacons, 2-byte ADDR_TABLE,
 header-field reuse) shrinks every control frame, the **rootward `ADDR_CLAIM`** reaches
-the master node hop-by-hop (flooding only when a node is route-less) instead of the
+the root node hop-by-hop (flooding only when a node is route-less) instead of the
 `O(N)` of a flood, and the **aggregated `ADDR_ALIVE`** collapses per-node liveness into
 one single-hop subtree bitmap per **relay** node (a leaf sends nothing), so the liveness
 plane is `O(F)` transmissions per round independent of tree depth. The host can
@@ -744,28 +744,28 @@ aggregates and the `ADDR_TABLE` flood**, and exclude `LINK_ACK` (which only exis
 alongside an uplink) and application data. `ADDR_CLAIM`s and `TOPOLOGY` reports are
 event-driven (plus a slow backstop) and contribute negligibly in steady state, so they
 are not counted. Everything is derived from the airtimes above and the
-live tunables: relay nodes and the master node beacon every `MESH_BEACON_MAX_MS` (90 s),
+live tunables: relay nodes and the root node beacon every `MESH_BEACON_MAX_MS` (90 s),
 a leaf node every `3x` that (270 s); every **relay** node sends a single-hop `ADDR_ALIVE`
 aggregate (5 bytes) once per `MESH_ALIVE_INTERVAL_MS` (300 s) -- **one frame per relay node,
-independent of depth** -- while a leaf node is covered by its parent; the master node
+independent of depth** -- while a leaf node is covered by its parent; the root node
 floods `ADDR_TABLE` on the
 `MESH_TABLE_INTERVAL_MS` backstop (300 s), relayed by non-leaf nodes only. `<nodes>` is
-`N` (non-master nodes); the tree is rooted at the master node with depth `<= 4`.
+`N` (non-root nodes); the tree is rooted at the root node with depth `<= 4`.
 
 With `B4` = airtime of a 4-byte beacon, `A5` = airtime of a 5-byte `ADDR_ALIVE`,
 `T5` = airtime of a 5-byte `ADDR_TABLE`, and `F` / `L` the non-leaf / leaf counts:
 
 ```
 beacon%   = F*B4/900  + L*B4/2700
-liveness% = (F-1)*A5/3000        (one single-hop aggregate per non-master relay;
-                                  the master node does not send one)
-table%    = F*T5/3000            (master flood + one relay per non-leaf node)
+liveness% = (F-1)*A5/3000        (one single-hop aggregate per non-root relay;
+                                  the root node does not send one)
+table%    = F*T5/3000            (root flood + one relay per non-leaf node)
 ```
 
 `SD` below is the sum of node depths (the uplink hop-cost); liveness does not scale
 with it.
 
-| topology | F = non-leaf nodes (incl. master node) | L = leaf nodes | SD = sum of node depths |
+| topology | F = non-leaf nodes (incl. root node) | L = leaf nodes | SD = sum of node depths |
 |---|---|---|---|
 | deep tree (max uplink hops -- fewest relay nodes) | 4 | N-3 | 4N-6 |
 | average 1.5 hops (2-level: floor(N/2) at depth 1, the rest at depth 2) | 1+floor(N/2) | ceil(N/2) | ~1.5N |
@@ -773,7 +773,7 @@ with it.
 
 **Control-plane occupancy, % of wall-clock time (LINK_ACK and data excluded)**
 
-| topology | nodes (non-master) | SF5 | SF6 | SF7 | SF8 |
+| topology | nodes (non-root) | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
 | **deep tree**              | 4  | 0.3% | 0.5% | 0.9% | 1.8% |
 |                           | 9  | 0.3% | 0.6% | 1.1% | 2.2% |
@@ -805,7 +805,7 @@ average-2-hop 14-node tree at SF8, 4.9%).
 ### Punch throughput
 
 A WiRoc *punch* round trip costs: one **uplink** `DATA` (15-byte payload -> 18-byte
-frame) over `d_avg` hops; one **`LINK_ACK`** (4 bytes) from the master node (relay nodes
+frame) over `d_avg` hops; one **`LINK_ACK`** (4 bytes) from the root node (relay nodes
 use the implicit ACK, which costs no frame); one **downlink** ACK `DATA` (7-byte payload
 -> 10-byte frame) **steered back down the tree**, so it also costs `d_avg` hops rather than one
 transmission per relay node; and one further **`LINK_ACK`** from that downlink's target
@@ -814,7 +814,7 @@ to overhear. (Here `airN` is the airtime of an N-byte frame, so
 `air4` is a 4-byte `LINK_ACK`, `air10` a 10-byte downlink and `air18` an 18-byte
 uplink.) One exchange is therefore `d_avg*(air18 + air10) + 2*air4`
 of airtime when the origin is not a direct child, and `d_avg*(air18 + air10)` (both ACKs
-absent) when it is: a punch from a **direct child** of the master node crosses no relay,
+absent) when it is: a punch from a **direct child** of the root node crosses no relay,
 so both of its single hops are left to the application-layer ACK. The network-wide rate
 (one exchange at a time, error-free channel, no
 retransmits) is `60 / exchange` punches per minute. Retries, busy backoff and per-hop
@@ -825,13 +825,13 @@ the store-and-forward wait between hops is quantified under *Realistic throughpu
 terms are included for every origin, so a punch from a direct child is slightly faster
 than shown).
 
-`nodes` is the number of **non-master nodes** (the master node, address 1, is not
-counted); `d_avg` is the **mean hop count** from a node to the master node (the
+`nodes` is the number of **non-root nodes** (the root node, address 1, is not
+counted); `d_avg` is the **mean hop count** from a node to the root node (the
 uplink's hop cost, and -- since the ACK is steered back down the same tree -- the
 downlink's too); and the SF5-SF8 columns are **punches per minute** at that spreading
 factor.
 
-| topology | nodes (non-master) | `d_avg` (mean hops to master) | SF5 | SF6 | SF7 | SF8 |
+| topology | nodes (non-root) | `d_avg` (mean hops to root) | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|---|
 | **deep tree**              | 4  | 2.5  | 162 | 91 | 51 | 28 |
 |                           | 9  | 3.3  | 129 | 73 | 41 | 23 |
@@ -850,7 +850,7 @@ Because the ACK is steered, the **exchange cost depends only on the hop count
 
 Both legs are **unicasts of `d_avg` hops**, so the exchange cost tracks the hop count
 and nothing else. A balanced tree puts most nodes one or two hops
-from the master node, so both the uplink and the steered ACK are short. The three N=14
+from the root node, so both the uplink and the steered ACK are short. The three N=14
 shapes (`r` = relay node, `l` = leaf node):
 
 deep tree (max uplink hops):
@@ -892,13 +892,13 @@ average 2 hops:
 relay nodes = 10 (M + 4 + 5)   d_avg = 2.1
 ```
 
-| tree | uplink unicast `d_avg x 369 ms` | `LINK_ACK` x2 (master + target) | steered ACK unicast `d_avg x 289 ms` | exchange | punches/min |
+| tree | uplink unicast `d_avg x 369 ms` | `LINK_ACK` x2 (root + target) | steered ACK unicast `d_avg x 289 ms` | exchange | punches/min |
 |---|---|---|---|---|---|
 | deep tree | 1328 ms | 2 x 246 = 492 ms | **3.6 x 289 = 1040 ms** | 2860 ms | 21 |
 | average 1.5 hops | 554 ms | 2 x 246 = 492 ms | **1.5 x 289 = 434 ms** | 1480 ms | **41** |
 | average 2 hops | 775 ms | 2 x 246 = 492 ms | **2.1 x 289 = 607 ms** | 1874 ms | 32 |
 
-(`LINK_ACK` is a 4-byte frame -- 246 ms at SF8 -- sent by the master node for the uplink
+(`LINK_ACK` is a 4-byte frame -- 246 ms at SF8 -- sent by the root node for the uplink
 and by the downlink's target for the last hop of the return leg; both are absent for a
 punch whose origin is a direct child.)
 
@@ -925,8 +925,8 @@ forwarding it is dead air. That wait is set by whichever drains the queue first:
   competing flood relays.
 
 The punch exchange is point-to-point, so its relayed hops -- and both
-`LINK_ACK`s (the master's and the downlink target's) -- ride the fast path (the
-origin's uplink and the master's downlink
+`LINK_ACK`s (the root's and the downlink target's) -- ride the fast path (the
+origin's uplink and the root's downlink
 first hop are host-originated and sent immediately). **Every relayed hop waits on
 average 25 ms** (`10 + 30/2`), uniformly 10-40 ms, instead of half a tick. The
 exchange has about `d_avg` hops on the uplink and `d_avg` on the steered-ACK leg,
@@ -941,7 +941,7 @@ Because the fixed per-hop term is small (25 ms), it is **not SF-scaling-dominate
 it is a modest, roughly constant penalty that the long SF8 frames already dwarf.
 The result is a **practical upper bound**:
 
-| topology | nodes (non-master) | SF5 | SF6 | SF7 | SF8 |
+| topology | nodes (non-root) | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
 | **deep tree**              | 4  | 121 | 77 | 46 | 27 |
 |                           | 9  | 95 | 61 | 37 | 21 |
@@ -967,11 +967,11 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
 
 | File | Role |
 |------|------|
-| `mesh.h` / `mesh.cpp` | mesh engine: config, join, routing, MAC, recovery, topology map, standby master |
+| `mesh.h` / `mesh.cpp` | mesh engine: config, join, routing, MAC, recovery, topology map, standby root |
 | `mesh_wire.h` / `mesh_wire.cpp` | pure 3-byte header codec (host-tested) |
-| `mesh_alloc.h` / `mesh_alloc.cpp` | pure master-node address allocator (host-tested) |
+| `mesh_alloc.h` / `mesh_alloc.cpp` | pure root-node address allocator (host-tested) |
 | `mesh_route.h` / `mesh_route.cpp` | pure link metric + parent selection (host-tested) |
-| `custom_at.cpp` | AT integration (`MESH`/`ACTIVEMASTER`/`STANDBYMASTER`/`MESHSTATE`/`MESHTOPO`, `SEND`/`REC`) |
+| `custom_at.cpp` | AT integration (`MESH`/`ACTIVEROOT`/`STANDBYROOT`/`MESHSTATE`/`MESHTOPO`, `SEND`/`REC`) |
 | `MessageQueue.h` | `SourceAddr` carried from RX to `ATC+REC` |
 | `test/` | host `g++` unit tests for the pure modules |
 
@@ -983,42 +983,42 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
 * **Build check** against the real target flags: compile the sketch sources with
   `-fsyntax-only` using the generated `compile_commands.json`.
 * **Lab, 2 devices**: set a node device id on each (`ATC+MESHNODEDEVICEID=<12 hex>`), enable mesh,
-  designate one as the master node -> the other node joins and is assigned an address; its
-  `ATC+SEND` arrives at the master node's `ATC+REC` with `srcaddr` = its own address; an
+  designate one as the root node -> the other node joins and is assigned an address; its
+  `ATC+SEND` arrives at the root node's `ATC+REC` with `srcaddr` = its own address; an
   app-level ACK sent back with `ATC+SEND=<addr>:...` reaches it.
 * **Narrowband**: run two devices at `ATC+P2P=0:<freq>:<sf>:7:<cr>:...` (31.25 kHz) for SF5
   and SF8; verify join, uplink, downlink, and that `ATC+MESHSTATE?` reports the derived
   `ackms` and the measured `overhead%`.
-* **Lab, multi-hop**: three nodes in a line with the far one out of the master node's
-  range -> it reaches the master node through the middle relay node; perturb SNR and confirm
+* **Lab, multi-hop**: three nodes in a line with the far one out of the root node's
+  range -> it reaches the root node through the middle relay node; perturb SNR and confirm
   the cost-based parent choice and hysteresis.
-* **Topology map**: confirm `ATC+MESHTOPO?` on the master node lists every attached
+* **Topology map**: confirm `ATC+MESHTOPO?` on the root node lists every attached
   node with its parent and heard neighbours; force a node to re-parent (move it or
   perturb SNR) and confirm its row's parent updates within one report (immediately,
   via the re-claim), and that a powered-off node's row disappears after
-  `MESH_TOPO_HOLD_MS`. On a non-master node `ATC+MESHTOPO?` shows its own row plus
-  its descendants' rows and nothing outside its subtree; on the master node it shows
+  `MESH_TOPO_HOLD_MS`. On a non-root node `ATC+MESHTOPO?` shows its own row plus
+  its descendants' rows and nothing outside its subtree; on the root node it shows
   every node.
 * **Failure / recovery**: power off a relay node -> its children re-attach; reboot the
-  master node -> nodes re-claim on the new epoch and are back within one or two beacon
-  intervals. Reboot a non-master node -> it keeps / re-joins its address.
-* **Standby master**: set `ATC+STANDBYMASTER=1` on a node placed near the master node
+  root node -> nodes re-claim on the new epoch and are back within one or two beacon
+  intervals. Reboot a non-root node -> it keeps / re-joins its address.
+* **Standby root**: set `ATC+STANDBYROOT=1` on a node placed near the root node
   and confirm (a) it forwards the uplink traffic to its own `ATC+REC`, (b) it emits
   nothing (sniff; no beacon/join), (c) `ATC+MESHSTATE?` reports `standby=1` while
-  `ACTIVEMASTER`/address are 0, and (d) it does **not** promote while the master node
-  answers. Power off the master node: confirm it keeps forwarding for
+  `ACTIVEROOT`/address are 0, and (d) it does **not** promote while the root node
+  answers. Power off the root node: confirm it keeps forwarding for
   `MESH_STANDBY_MIN_WINDOW_MS` and then promotes (epoch bump), and the other nodes
-  re-claim and re-attach to it. Power-cycle the master node (a reboot shorter than the
-  window): confirm **no** promotion. Also confirm a reboot of the master node's **host**
+  re-claim and re-attach to it. Power-cycle the root node (a reboot shorter than the
+  window): confirm **no** promotion. Also confirm a reboot of the root node's **host**
   (radio still up) eventually promotes -- the app-ACK probe, not the beacon, is what
   detects it.
-* **Master conflict**: after a standby has promoted, power the old master back on.
-  Confirm it does **not** immediately beacon (listen for `MESH_MASTER_QUERY_WINDOW_MS`),
+* **Root conflict**: after a standby has promoted, power the old root back on.
+  Confirm it does **not** immediately beacon (listen for `MESH_ROOT_QUERY_WINDOW_MS`),
   that exactly one of the two keeps address 1 (the one with the lower device id, per
   `ATC+MESHNODEDEVICEID?`), and that the other reports `standby=1`. Confirm nodes do
-  not churn (no repeated re-claims) once the conflict resolves, and that a lone master
+  not churn (no repeated re-claims) once the conflict resolves, and that a lone root
   reboot is back to serving within ~1 s.
-* **Flood pruning / change-triggered table**: add a node and confirm the master node
+* **Flood pruning / change-triggered table**: add a node and confirm the root node
   emits an `ADDR_TABLE` within ~`MESH_TABLE_DEBOUNCE_MS` (sniff, or watch the new
   node's fast adoption) rather than waiting for the backstop; confirm a fresh
   multi-hop node keeps reconciling (no rising table-miss / no spurious re-join),
@@ -1036,29 +1036,29 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
 
 ## Limitations
 
-* The active master node is a single point of failure unless a **standby master** is
+* The active root node is a single point of failure unless a **standby root** is
   deployed. The standby makes the recovery automatic but is itself constrained: it
-  must be placed where it hears both the uplinks and the master's downlinks, and its
+  must be placed where it hears both the uplinks and the root's downlinks, and its
   probe is blind to traffic that is legitimately never acknowledged at the
-  application layer (such traffic is read as a missed ACK). An old master that
-  reappears after a takeover is resolved automatically by the **master conflict**
+  application layer (such traffic is read as a missed ACK). An old root that
+  reappears after a takeover is resolved automatically by the **root conflict**
   rule (lowest device id wins, see above), but note the choice is by device id, not
   by "who was there first": the node with the lower device id keeps address 1, which
   may be the *promoted* node rather than the returning one, so the active gateway can
-  change. Recovery from a genuinely deaf or dead side (a master that cannot hear the
+  change. Recovery from a genuinely deaf or dead side (a root that cannot hear the
   other, or a hung host) is still manual.
-* A **direct child** of the master node gets no `LINK_ACK` in either direction, so neither
+* A **direct child** of the root node gets no `LINK_ACK` in either direction, so neither
   its uplink nor a downlink to it is retransmitted at the mesh layer -- both rely entirely
   on the application-layer ACK (and retry). This is safe only because WiRoc's protocol
   acknowledges its messages; a direct child whose traffic is *not* acknowledged at the
   application layer has no link-layer retry (a deeper node still does, via the implicit
   ACK).
-* The 4-bit space caps the network at 14 non-master nodes; addresses are recycled on eviction.
+* The 4-bit space caps the network at 14 non-root nodes; addresses are recycled on eviction.
 * `hops` is 3 bits (max 7 hops, we cap at 4) and `seq` is 5 bits (32-value dedup
   window, matching `MESH_DEDUP_SIZE`).
 * The beacon `cost` is 5 bits, so the path cost must stay `<= 31`: with `hops <= 4`
   and a max link cost of 6 this holds with headroom (keep the link-cost map <= 7).
-* The beacon epoch is 3 bits, so a master-node reboot that is a multiple of 8 while a
+* The beacon epoch is 3 bits, so a root-node reboot that is a multiple of 8 while a
   node was deaf is caught by the `ADDR_TABLE` bitmap miss (the node sees its bit clear
   for `MESH_TABLE_MISS_LIMIT` floods and re-joins), not by a periodic claim.
 * Downlink is steered along the tree by the `ADDR_ALIVE` subtree bitmaps rather than a
@@ -1067,9 +1067,9 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
   reported it -- e.g. a relay node that just rebooted and has not heard a silent leaf
   child re-claim -- is unreachable by downlink until the next aggregate or re-join; the
   application-layer ACK / retry is the backstop.
-* The topology map is **diagnostic only** and, on a non-master node, **partial**: a
+* The topology map is **diagnostic only** and, on a non-root node, **partial**: a
   node learns its own row plus its descendants' rows (the reports it forwards
-  rootward), while the master node -- being on every report's path -- sees the whole
+  rootward), while the root node -- being on every report's path -- sees the whole
   graph. It is built from best-effort reports, its links are measured one-way (each
   node reports what *it* hears, so the graph is directed and may be asymmetric), and
   only a node's own row is live -- every other row is as fresh as that node's last

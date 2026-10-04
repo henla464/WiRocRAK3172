@@ -61,15 +61,15 @@ int main()
         f.dst = 3;
         assert(!mesh_wire_ack_key(&f, pl, 1, 3, &ack_src, &ack_seq));
 
-        /* A downlink is acked the same way, and its origin is the master (1),
-         * never a slave -- so the two directions cannot clear each other. */
+        /* A downlink is acked the same way, and its origin is the root (1),
+         * never a non-root node -- so the two directions cannot clear each other. */
         f = mesh_header_t{ MESH_TYPE_DATA_DOWNLINK, MESH_WIRE_VERSION, 1, 9, 3, 4 };
         assert(mesh_wire_ack_key(&f, pl, 1, 7, &ack_src, &ack_seq) &&
                ack_src == 1 && ack_seq == 4);
 
         /* A LINK_ACK acks the origin named in its header dst, read from its
          * payload byte -- and counts even when we are the one addressed (an
-         * uplink origin hears the master's ACK for its own frame directly). */
+         * uplink origin hears the root's ACK for its own frame directly). */
         f = mesh_header_t{ MESH_TYPE_LINK_ACK, MESH_WIRE_VERSION, 1, 2, 0, 0 };
         pl[0] = 19;
         assert(mesh_wire_ack_key(&f, pl, 1, 2, &ack_src, &ack_seq) &&

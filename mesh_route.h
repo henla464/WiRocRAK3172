@@ -25,17 +25,17 @@ typedef struct {
     uint8_t  addr;          /* neighbour address (0 == free slot)             */
     int16_t  snr_x10;       /* smoothed SNR in 0.1 dB units                   */
     uint8_t  cost;          /* neighbour's advertised path cost               */
-    uint8_t  hops;          /* neighbour's advertised hop-count to the master */
+    uint8_t  hops;          /* neighbour's advertised hop-count to the root */
     uint8_t  link_cost;     /* cost of our link to this neighbour             */
     uint32_t last_ms;       /* time of the last beacon from this neighbour    */
 } mesh_route_neighbor_t;
 
-/* Our route to the master. */
+/* Our route to the root. */
 typedef struct {
     uint8_t parent_addr;    /* next hop (0 = none)                            */
     uint8_t parent_cost;    /* parent's advertised cost                       */
-    uint8_t self_cost;      /* our cost to the master                         */
-    uint8_t self_hops;      /* our hop-count to the master                    */
+    uint8_t self_cost;      /* our cost to the root                         */
+    uint8_t self_hops;      /* our hop-count to the root                    */
 } mesh_route_t;
 
 /* Map a smoothed SNR (0.1 dB units) to a small integer link cost, given the

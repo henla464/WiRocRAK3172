@@ -1,5 +1,5 @@
 /*
- * mesh_alloc.cpp - master-side slave address allocator (see mesh_alloc.h).
+ * mesh_alloc.cpp - root-side non-root node address allocator (see mesh_alloc.h).
  */
 
 #include <string.h>
@@ -10,14 +10,14 @@ typedef struct {
     uint8_t addr;                       /* MESH_ADDR_NONE == free slot */
 } mesh_alloc_entry_t;
 
-static mesh_alloc_entry_t s_entries[MESH_MAX_SLAVES];
+static mesh_alloc_entry_t s_entries[MESH_MAX_NONROOT_NODES];
 
 /* Bumped on every real change of the occupied set (see mesh_alloc_version()). */
 static uint16_t s_version;
 
 static int mesh_alloc_find(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN])
 {
-    for (uint8_t i = 0; i < MESH_MAX_SLAVES; i++) {
+    for (uint8_t i = 0; i < MESH_MAX_NONROOT_NODES; i++) {
         if (s_entries[i].addr != MESH_ADDR_NONE &&
             memcmp(s_entries[i].device_id, device_id, MESH_NODE_DEVICE_ID_LEN) == 0) {
             return (int)i;
@@ -28,7 +28,7 @@ static int mesh_alloc_find(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN])
 
 static bool mesh_alloc_addr_used(uint8_t addr)
 {
-    for (uint8_t i = 0; i < MESH_MAX_SLAVES; i++) {
+    for (uint8_t i = 0; i < MESH_MAX_NONROOT_NODES; i++) {
         if (s_entries[i].addr == addr) {
             return true;
         }
@@ -50,7 +50,7 @@ uint16_t mesh_alloc_version(void)
 uint8_t mesh_alloc_count(void)
 {
     uint8_t n = 0;
-    for (uint8_t i = 0; i < MESH_MAX_SLAVES; i++) {
+    for (uint8_t i = 0; i < MESH_MAX_NONROOT_NODES; i++) {
         if (s_entries[i].addr != MESH_ADDR_NONE) {
             n++;
         }
@@ -69,7 +69,7 @@ bool mesh_alloc_device_id(uint8_t addr, uint8_t out[MESH_NODE_DEVICE_ID_LEN])
     if (addr == MESH_ADDR_NONE) {
         return false;                   /* 0 is a free slot / unknown, never bound */
     }
-    for (uint8_t i = 0; i < MESH_MAX_SLAVES; i++) {
+    for (uint8_t i = 0; i < MESH_MAX_NONROOT_NODES; i++) {
         if (s_entries[i].addr == addr) {
             memcpy(out, s_entries[i].device_id, MESH_NODE_DEVICE_ID_LEN);
             return true;
@@ -93,12 +93,12 @@ uint8_t mesh_alloc_assign(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN])
     if (i >= 0) {
         return s_entries[i].addr;
     }
-    /* Lowest free address in the slave range. */
-    for (uint8_t addr = MESH_FIRST_SLAVE_ADDR; addr <= MESH_ADDR_MAX; addr++) {
+    /* Lowest free address in the non-root node range. */
+    for (uint8_t addr = MESH_FIRST_NONROOT_ADDR; addr <= MESH_ADDR_MAX; addr++) {
         if (mesh_alloc_addr_used(addr)) {
             continue;
         }
-        for (uint8_t k = 0; k < MESH_MAX_SLAVES; k++) {
+        for (uint8_t k = 0; k < MESH_MAX_NONROOT_NODES; k++) {
             if (s_entries[k].addr == MESH_ADDR_NONE) {
                 memcpy(s_entries[k].device_id, device_id, MESH_NODE_DEVICE_ID_LEN);
                 s_entries[k].addr = addr;
@@ -115,7 +115,7 @@ bool mesh_alloc_claim(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN], uint8_t 
 {
     int i;
 
-    if (addr < MESH_FIRST_SLAVE_ADDR || addr > MESH_ADDR_MAX) {
+    if (addr < MESH_FIRST_NONROOT_ADDR || addr > MESH_ADDR_MAX) {
         return false;
     }
     i = mesh_alloc_find(device_id);
@@ -125,7 +125,7 @@ bool mesh_alloc_claim(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN], uint8_t 
     if (mesh_alloc_addr_used(addr)) {
         return false;                           /* held by another device id     */
     }
-    for (uint8_t k = 0; k < MESH_MAX_SLAVES; k++) {
+    for (uint8_t k = 0; k < MESH_MAX_NONROOT_NODES; k++) {
         if (s_entries[k].addr == MESH_ADDR_NONE) {
             memcpy(s_entries[k].device_id, device_id, MESH_NODE_DEVICE_ID_LEN);
             s_entries[k].addr = addr;
@@ -141,7 +141,7 @@ void mesh_alloc_free(uint8_t addr)
     if (addr == MESH_ADDR_NONE) {
         return;                         /* 0 addresses a free slot, not an entry */
     }
-    for (uint8_t i = 0; i < MESH_MAX_SLAVES; i++) {
+    for (uint8_t i = 0; i < MESH_MAX_NONROOT_NODES; i++) {
         if (s_entries[i].addr == addr) {
             memset(&s_entries[i], 0, sizeof(s_entries[i]));
             s_version++;
@@ -153,8 +153,8 @@ void mesh_alloc_free(uint8_t addr)
 void mesh_alloc_bitmap(uint8_t out[2])
 {
     memset(out, 0, 2);
-    out[MESH_MASTER_ADDR >> 3] |= (uint8_t)(1u << (MESH_MASTER_ADDR & 7));
-    for (uint8_t i = 0; i < MESH_MAX_SLAVES; i++) {
+    out[MESH_ROOT_ADDR >> 3] |= (uint8_t)(1u << (MESH_ROOT_ADDR & 7));
+    for (uint8_t i = 0; i < MESH_MAX_NONROOT_NODES; i++) {
         uint8_t addr = s_entries[i].addr;
         if (addr != MESH_ADDR_NONE) {
             out[addr >> 3] |= (uint8_t)(1u << (addr & 7));

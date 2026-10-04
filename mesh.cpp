@@ -21,8 +21,8 @@
 #include "MessageQueue.h"
 
 #define MESH_FLAG_ENABLED       0x01
-#define MESH_FLAG_MASTER        0x02
-#define MESH_FLAG_STANDBY       0x04    /* passive observer (M7); not the master  */
+#define MESH_FLAG_ROOT        0x02
+#define MESH_FLAG_STANDBY       0x04    /* passive observer (M7); not the root  */
 
 /* ======================================================================= */
 /*  Persistent configuration                                              */
@@ -34,8 +34,8 @@ struct __attribute__((packed)) mesh_flash_config_t {
     uint8_t  version;
     uint8_t  flags;      /* MESH_FLAG_* */
     uint8_t  address;    /* own 4-bit address, MESH_ADDR_NONE when unassigned */
-    uint16_t boot_count; /* master boot counter: bumped each boot, used as the
-                          * beacon epoch so nodes detect a master restart */
+    uint16_t boot_count; /* root boot counter: bumped each boot, used as the
+                          * beacon epoch so nodes detect a root restart */
     uint8_t  device_id[MESH_NODE_DEVICE_ID_LEN]; /* host-provisioned device id */
 };
 
@@ -45,7 +45,7 @@ static void mesh_config_defaults(void)
 {
     s_cfg.magic      = MESH_FLASH_MAGIC;
     s_cfg.version    = MESH_FLASH_VERSION;
-    s_cfg.flags      = 0;               /* meshing disabled, not master */
+    s_cfg.flags      = 0;               /* meshing disabled, not root */
     s_cfg.address    = MESH_ADDR_NONE;
     s_cfg.boot_count = 0;
     memset(s_cfg.device_id, 0, MESH_NODE_DEVICE_ID_LEN);
@@ -121,7 +121,7 @@ static uint8_t  s_table_miss;                   /* consecutive table misses   */
 /* ======================================================================= */
 
 static mesh_route_neighbor_t s_neigh[MESH_NEIGHBOR_MAX];
-static mesh_route_t s_route;                    /* our route to the master    */
+static mesh_route_t s_route;                    /* our route to the root    */
 static uint32_t s_beacon_next_ms;               /* next beacon transmission   */
 static uint32_t s_beacon_interval_ms;           /* adaptive beacon interval   */
 static uint32_t s_relay_last_ms;                /* last forward for a child    */
@@ -165,14 +165,14 @@ typedef struct {
 static mesh_pending_t s_pending[MESH_PEND_N];
 
 /* --- M5: recovery / robustness ----------------------------------------- */
-static uint16_t s_boot_epoch;       /* master: this boot's epoch              */
-static uint16_t s_master_epoch;     /* node: last epoch heard (0 = unknown)   */
-static bool     s_epoch_valid;      /* node: s_master_epoch is meaningful      */
+static uint16_t s_boot_epoch;       /* root: this boot's epoch              */
+static uint16_t s_root_epoch;     /* node: last epoch heard (0 = unknown)   */
+static bool     s_epoch_valid;      /* node: s_root_epoch is meaningful      */
 static bool     s_claim_due;        /* node: an ADDR_CLAIM is pending (event)  */
 static uint32_t s_alive_next_ms;    /* node: next periodic liveness aggregate  */
 static bool     s_had_parent;       /* node: had a parent on the previous tick*/
-static uint32_t s_boot_ms;          /* master: uptime reference for RECOVER   */
-static uint32_t s_heard_ms[MESH_ADDR_MAX + 1]; /* master: last frame per addr  */
+static uint32_t s_boot_ms;          /* root: uptime reference for RECOVER   */
+static uint32_t s_heard_ms[MESH_ADDR_MAX + 1]; /* root: last frame per addr  */
 /* Step-2/3 liveness aggregation: per-child subtree bitmap (bit a = "address a
  * is alive in that child's subtree"), when that bitmap was last received, and
  * the last time we heard the child at all.  A child is current while
@@ -184,15 +184,15 @@ static uint32_t s_heard_ms[MESH_ADDR_MAX + 1]; /* master: last frame per addr  *
 static uint16_t s_child_bm[MESH_ADDR_MAX + 1];       /* last subtree bitmap      */
 static uint32_t s_child_bm_ms[MESH_ADDR_MAX + 1];    /* when that bitmap arrived */
 static uint32_t s_child_heard_ms[MESH_ADDR_MAX + 1]; /* last heard as our child  */
-/* Master only (Step 3): the direct child whose liveness aggregate last covered
+/* Root only (Step 3): the direct child whose liveness aggregate last covered
  * each address (0 = none).  A dead direct child takes its whole covered set with
  * it -- subtree-scoped eviction. */
 static uint8_t  s_cover[MESH_ADDR_MAX + 1];
 
-/* M6 topology map (master only): each node reports its parent and the
- * neighbours it hears, rootward along the tree, so the master can stitch the
+/* M6 topology map (root only): each node reports its parent and the
+ * neighbours it hears, rootward along the tree, so the root can stitch the
  * whole graph together.  A node with no report yet (age 0) is absent from the
- * map; a row older than MESH_TOPO_HOLD_MS is dropped.  The master's own row
+ * map; a row older than MESH_TOPO_HOLD_MS is dropped.  The root's own row
  * (addr 1) comes from its live neighbour table, not from a report. */
 #define MESH_TOPO_NO_LINK   0xFF                    /* s_topo_cost: no link */
 static uint8_t  s_topo_parent[MESH_ADDR_MAX + 1];   /* reported parent (0=none) */
@@ -205,16 +205,16 @@ static uint8_t  s_topo_cost[MESH_ADDR_MAX + 1][MESH_ADDR_MAX + 1]; /* link cost 
 static bool     s_topo_due;
 static uint32_t s_topo_next_ms;
 
-/* --- M7: standby master (silent shadow root) --------------------------- */
+/* --- M7: standby root (silent shadow root) --------------------------- */
 /* A standby transmits nothing (single silence gate in mesh_tx_radio_send).  It
- * otherwise mirrors the master: it shadows the address <-> device-id map and
+ * otherwise mirrors the root: it shadows the address <-> device-id map and
  * topology from the rootward control frames it overhears, mirrors uplinks to its
- * host, and -- if the active master stops answering -- promotes itself (see the
- * M7 section).  s_master_alive_ms is refreshed by every frame from the master and
+ * host, and -- if the active root stops answering -- promotes itself (see the
+ * M7 section).  s_root_alive_ms is refreshed by every frame from the root and
  * drives the backstop; the probe tracks one overheard uplink at a time, expecting
  * the application ACK (a downlink back to the origin) within PROBE_MS. */
-static bool     s_master_seen;      /* a master frame has been heard (gates probe)*/
-static uint32_t s_master_alive_ms;  /* last frame heard from the master         */
+static bool     s_root_seen;      /* a root frame has been heard (gates probe)*/
+static uint32_t s_root_alive_ms;  /* last frame heard from the root         */
 static bool     s_probe_active;     /* an uplink probe is in flight             */
 static uint8_t  s_probe_src;        /* the probed uplink's origin               */
 static uint32_t s_probe_deadline;   /* when an unconfirmed probe becomes a miss  */
@@ -229,14 +229,14 @@ static uint32_t s_mon_parent_ms;    /* when we adopted that parent             *
 static uint32_t s_parent_alive_ms;  /* last parent aggregate overheard (0=none)*/
 static uint32_t s_mon_claim_ms;     /* last monitor-triggered re-claim (0=none)*/
 
-/* --- M8: master conflict (lowest device id wins) ----------------------- */
-/* A (re)booted master does not serve until it has proven it is alone (or the
- * senior of the two): it starts "contending", broadcasting MASTER_QUERY and
- * listening for a rival before it beacons/answers joins.  s_master_serving is
+/* --- M8: root conflict (lowest device id wins) ----------------------- */
+/* A (re)booted root does not serve until it has proven it is alone (or the
+ * senior of the two): it starts "contending", broadcasting ROOT_QUERY and
+ * listening for a rival before it beacons/answers joins.  s_root_serving is
  * false while contending; s_contend_until_ms == 0 means "not yet armed". */
-static bool     s_master_serving;       /* master passed the solo check          */
+static bool     s_root_serving;       /* root passed the solo check          */
 static uint32_t s_contend_until_ms;     /* probation deadline (0 = not armed)     */
-static uint32_t s_contend_next_ms;      /* next MASTER_QUERY retry                */
+static uint32_t s_contend_next_ms;      /* next ROOT_QUERY retry                */
 
 /* Defined in the M3 section below; used by the timer. */
 static void mesh_emit_beacon(void);
@@ -259,11 +259,11 @@ static void mesh_standby_tick(uint32_t now);
 static void mesh_standby_takeover(void);
 
 /* Defined in the M8 section below; used by the timer / RX. */
-static void mesh_master_contend_tick(uint32_t now);
-static void mesh_rx_master_query(const mesh_header_t *h, const uint8_t *payload, uint8_t plen);
-static void mesh_rx_master_announce(const mesh_header_t *h, const uint8_t *payload, uint8_t plen);
-static void mesh_master_demote_to_standby(void);
-static void mesh_master_announce_send(void);
+static void mesh_root_contend_tick(uint32_t now);
+static void mesh_rx_root_query(const mesh_header_t *h, const uint8_t *payload, uint8_t plen);
+static void mesh_rx_root_announce(const mesh_header_t *h, const uint8_t *payload, uint8_t plen);
+static void mesh_root_demote_to_standby(void);
+static void mesh_root_announce_send(void);
 
 /* Fast forward path: a point-to-point frame is drained by a one-shot timer
  * rather than waiting for the next housekeeping tick (see mesh_tx_schedule). */
@@ -283,10 +283,10 @@ static void mesh_update_state(void)
     if (!mesh_is_enabled() || !mesh_has_node_device_id() ||
         (s_cfg.flags & MESH_FLAG_STANDBY)) {
         /* Without a host-provisioned node device id the mesh does not run: no
-         * beacons and no join attempt.  It is how the master identifies us.
-         * A standby master (M7) is an observer, not a member of the tree. */
+         * beacons and no join attempt.  It is how the root identifies us.
+         * A standby root (M7) is an observer, not a member of the tree. */
         s_state = MESH_STATE_UNASSIGNED;
-    } else if (mesh_is_master() || mesh_get_address() != MESH_ADDR_NONE) {
+    } else if (mesh_is_root() || mesh_get_address() != MESH_ADDR_NONE) {
         s_state = MESH_STATE_JOINED;
     } else {
         s_state = MESH_STATE_JOINING;
@@ -329,7 +329,7 @@ static void mesh_state_clear(void)
 
     /* M5 recovery state.  s_boot_epoch is *not* reset here: it is owned by
      * mesh_apply_role() and must survive an enable/disable cycle. */
-    s_master_epoch   = 0;
+    s_root_epoch   = 0;
     s_epoch_valid    = false;
     s_claim_due      = false;
     s_alive_next_ms  = 0;
@@ -347,10 +347,10 @@ static void mesh_state_clear(void)
     s_topo_due        = false;
     s_topo_next_ms    = 0;
 
-    /* M7 standby state.  s_master_alive_ms starts at the boot reference so the
+    /* M7 standby state.  s_root_alive_ms starts at the boot reference so the
      * backstop also fires for a standby that boots into a dead network. */
-    s_master_seen     = false;
-    s_master_alive_ms = millis();
+    s_root_seen     = false;
+    s_root_alive_ms = millis();
     s_probe_active    = false;
     s_probe_src       = MESH_ADDR_NONE;
     s_probe_deadline  = 0;
@@ -362,9 +362,9 @@ static void mesh_state_clear(void)
     s_parent_alive_ms = 0;
     s_mon_claim_ms    = 0;
 
-    /* M8 master conflict.  A master (re)enters its solo check on every fresh
-     * start; a non-master never runs it (guarded by mesh_is_master()). */
-    s_master_serving  = false;
+    /* M8 root conflict.  A root (re)enters its solo check on every fresh
+     * start; a non-root never runs it (guarded by mesh_is_root()). */
+    s_root_serving  = false;
     s_contend_until_ms = 0;
     s_contend_next_ms  = 0;
 
@@ -515,25 +515,25 @@ static void mesh_timer_cb(void *)
 
     now = millis();
 
-    /* Standby master (M7): a silent shadow root.  Run its liveness detector,
-     * then fall through the common flow -- a standby is not the master, so it
-     * skips the master-only housekeeping below; anything it would transmit is
+    /* Standby root (M7): a silent shadow root.  Run its liveness detector,
+     * then fall through the common flow -- a standby is not the root, so it
+     * skips the root-only housekeeping below; anything it would transmit is
      * dropped by the silence gate. */
     if (mesh_is_standby()) {
         mesh_standby_tick(now);
-    } else if (mesh_is_master() && !s_master_serving) {
-        /* A master that has not yet passed its solo check (M8) serves nothing:
+    } else if (mesh_is_root() && !s_root_serving) {
+        /* A root that has not yet passed its solo check (M8) serves nothing:
          * it only probes for a rival, then asserts or stands down. */
-        mesh_master_contend_tick(now);
+        mesh_root_contend_tick(now);
         return;
     }
 
-    /* Beacons: the master and every routable node advertise periodically so
+    /* Beacons: the root and every routable node advertise periodically so
      * neighbours can pick parents and detect a node going down.  The interval
      * backs off toward MESH_BEACON_MAX_MS while stable, and is reset fast on
      * any topology change (join, re-attach, epoch change). */
     if ((int32_t)(now - s_beacon_next_ms) >= 0) {
-        bool recovering = mesh_is_master() &&
+        bool recovering = mesh_is_root() &&
                           (uint32_t)(now - s_boot_ms) < MESH_RECOVER_MS;
         uint32_t interval;
 
@@ -543,7 +543,7 @@ static void mesh_timer_cb(void *)
             interval = s_beacon_interval_ms;
             /* A leaf (no children) is on nobody's path: it only needs to
              * advertise itself as a potential parent occasionally. */
-            if (!mesh_is_master() && !mesh_is_relay()) {
+            if (!mesh_is_root() && !mesh_is_relay()) {
                 interval *= MESH_BEACON_LEAF_MULT;
             }
         }
@@ -562,7 +562,7 @@ static void mesh_timer_cb(void *)
     mesh_monitor_tick(now);
     mesh_pending_tick(now);
 
-    if (mesh_is_master()) {
+    if (mesh_is_root()) {
         /* Subtree-scoped eviction: a known direct child whose liveness aggregate
          * has been silent for MESH_EVICT_MS takes its whole covered subtree with
          * it, so a dead branch expires as one coherent event rather than as N
@@ -570,12 +570,12 @@ static void mesh_timer_cb(void *)
          * child's aggregates and by its beacons (mesh_rx_alive / mesh_rx_beacon),
          * so a child that merely stopped being a relay -- and went quiet on the
          * aggregate timer -- is not mistaken for a dead one. */
-        for (uint8_t c = MESH_FIRST_SLAVE_ADDR; c <= MESH_ADDR_MAX; c++) {
+        for (uint8_t c = MESH_FIRST_NONROOT_ADDR; c <= MESH_ADDR_MAX; c++) {
             if (s_child_heard_ms[c] == 0 ||
                 (uint32_t)(now - s_child_heard_ms[c]) <= MESH_EVICT_MS) {
                 continue;
             }
-            for (uint8_t a = MESH_FIRST_SLAVE_ADDR; a <= MESH_ADDR_MAX; a++) {
+            for (uint8_t a = MESH_FIRST_NONROOT_ADDR; a <= MESH_ADDR_MAX; a++) {
                 if (s_cover[a] == c) {
                     mesh_alloc_free(a);
                     s_cover[a]    = MESH_ADDR_NONE;
@@ -587,8 +587,8 @@ static void mesh_timer_cb(void *)
             s_child_bm_ms[c]    = 0;
         }
         /* Backstop: any still-allocated address that has itself been silent (a
-         * leaf directly under the master node has no covering direct child). */
-        for (uint8_t a = MESH_FIRST_SLAVE_ADDR; a <= MESH_ADDR_MAX; a++) {
+         * leaf directly under the root node has no covering direct child). */
+        for (uint8_t a = MESH_FIRST_NONROOT_ADDR; a <= MESH_ADDR_MAX; a++) {
             if (mesh_alloc_occupies(a) &&
                 (uint32_t)(now - s_heard_ms[a]) > MESH_EVICT_MS) {
                 mesh_alloc_free(a);
@@ -618,7 +618,7 @@ static void mesh_timer_cb(void *)
         }
     } else {
         if (s_state == MESH_STATE_JOINING) {
-            /* Ask the master for an address, backing off between attempts. */
+            /* Ask the root for an address, backing off between attempts. */
             if ((int32_t)(now - s_join_next_ms) >= 0) {
                 mesh_send_broadcast(MESH_TYPE_JOIN_REQ, MESH_DEFAULT_TTL,
                                     s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN);
@@ -633,21 +633,21 @@ static void mesh_timer_cb(void *)
         } else if (s_state == MESH_STATE_JOINED &&
                    mesh_get_address() != MESH_ADDR_NONE) {
             /* Event-driven claim: (re)bind our address to our device id so a
-             * restarted master can rebuild its RAM-only table.  Set by an epoch
+             * restarted root can rebuild its RAM-only table.  Set by an epoch
              * change, a boot, or a re-attach -- never on a timer. */
             if (s_claim_due) {
                 mesh_send_claim();
                 s_claim_due = false;
             }
             /* Periodic liveness: a subtree aggregate a deep idle node would
-             * otherwise never get to the master (its beacon is link-local).
+             * otherwise never get to the root (its beacon is link-local).
              * Rate is set by MESH_ALIVE_INTERVAL_MS, which the eviction window
              * (MESH_EVICT_MS) must stay comfortably above. */
             if ((int32_t)(now - s_alive_next_ms) >= 0) {
                 mesh_send_alive();
             }
             /* Topology report: event-driven (attach / parent change) and a
-             * slow backstop, so the master's node/link map stays current. */
+             * slow backstop, so the root's node/link map stays current. */
             if (s_topo_due || (int32_t)(now - s_topo_next_ms) >= 0) {
                 mesh_send_topology();
                 s_topo_due = false;
@@ -766,13 +766,13 @@ static void mesh_note_relay(uint8_t child)
     bool was = mesh_is_relay();
 
     s_relay_last_ms = millis();
-    if (child >= MESH_FIRST_SLAVE_ADDR && child <= MESH_ADDR_MAX) {
+    if (child >= MESH_FIRST_NONROOT_ADDR && child <= MESH_ADDR_MAX) {
         if (s_child_heard_ms[child] == 0) {
             s_child_bm[child]    = (uint16_t)(1u << child); /* at least itself */
             s_child_bm_ms[child] = 0;                       /* no subtree yet  */
             if (was) {
                 /* A new child under an existing relay: publish the updated
-                 * subtree promptly, so the master (liveness) and our parent
+                 * subtree promptly, so the root (liveness) and our parent
                  * (downlink steering) can reach it without waiting a whole
                  * aggregate interval. */
                 s_alive_next_ms = 0;
@@ -786,15 +786,15 @@ static void mesh_note_relay(uint8_t child)
     }
 }
 
-/* The master always owns MESH_MASTER_ADDR; a demoted master must rejoin. */
+/* The root always owns MESH_ROOT_ADDR; a demoted root must rejoin. */
 static void mesh_apply_role(void)
 {
-    if (mesh_is_master()) {
-        if (mesh_get_address() != MESH_MASTER_ADDR) {
-            mesh_set_address(MESH_MASTER_ADDR);
+    if (mesh_is_root()) {
+        if (mesh_get_address() != MESH_ROOT_ADDR) {
+            mesh_set_address(MESH_ROOT_ADDR);
             mesh_config_save();
         }
-        /* Give this master run a fresh epoch so nodes detect the restart and
+        /* Give this root run a fresh epoch so nodes detect the restart and
          * re-announce their flash-stored addresses. */
         if (s_boot_epoch == 0) {
             s_cfg.boot_count = (uint16_t)(s_cfg.boot_count + 1);
@@ -804,7 +804,7 @@ static void mesh_apply_role(void)
             s_boot_epoch = s_cfg.boot_count;
             mesh_config_save();
         }
-    } else if (mesh_get_address() == MESH_MASTER_ADDR) {
+    } else if (mesh_get_address() == MESH_ROOT_ADDR) {
         mesh_set_address(MESH_ADDR_NONE);
         mesh_config_save();
     }
@@ -851,25 +851,25 @@ void mesh_set_enabled(bool enabled)
     }
 }
 
-bool mesh_is_master(void)
+bool mesh_is_root(void)
 {
-    return (s_cfg.flags & MESH_FLAG_MASTER) != 0;
+    return (s_cfg.flags & MESH_FLAG_ROOT) != 0;
 }
 
-void mesh_set_master(bool master)
+void mesh_set_root(bool root)
 {
-    bool was = mesh_is_master();
+    bool was = mesh_is_root();
 
-    if (master) {
-        s_cfg.flags |= MESH_FLAG_MASTER;
+    if (root) {
+        s_cfg.flags |= MESH_FLAG_ROOT;
         s_cfg.flags &= (uint8_t)~MESH_FLAG_STANDBY; /* roles are exclusive */
     } else {
-        s_cfg.flags &= (uint8_t)~MESH_FLAG_MASTER;
+        s_cfg.flags &= (uint8_t)~MESH_FLAG_ROOT;
     }
-    if (master != was) {
-        /* A role change restarts the solo check: a fresh master must re-prove
+    if (root != was) {
+        /* A role change restarts the solo check: a fresh root must re-prove
          * it is alone before it serves. */
-        s_master_serving   = false;
+        s_root_serving   = false;
         s_contend_until_ms = 0;
     }
     mesh_apply_role();
@@ -885,10 +885,10 @@ void mesh_set_standby(bool standby)
 {
     if (standby) {
         s_cfg.flags |= MESH_FLAG_STANDBY;
-        s_cfg.flags &= (uint8_t)~MESH_FLAG_MASTER;  /* roles are exclusive */
+        s_cfg.flags &= (uint8_t)~MESH_FLAG_ROOT;  /* roles are exclusive */
         /* An observer holds no address and is not a tree member. */
         s_cfg.address = MESH_ADDR_NONE;
-        s_master_serving = false;       /* no longer a serving master         */
+        s_root_serving = false;       /* no longer a serving root         */
         mesh_state_clear();
     } else {
         s_cfg.flags &= (uint8_t)~MESH_FLAG_STANDBY;
@@ -906,24 +906,24 @@ void mesh_set_address(uint8_t address)
     s_cfg.address = (uint8_t)(address & MESH_ADDR_MASK);
 }
 
-/* The active master and a passive standby both maintain the master-owned tables
+/* The active root and a passive standby both maintain the root-owned tables
  * (address <-> device-id map, topology, liveness): a standby is a "shadow root"
- * that mirrors the master's state without transmitting (mesh_tx_radio_send drops
+ * that mirrors the root's state without transmitting (mesh_tx_radio_send drops
  * every frame it would send). */
-static bool mesh_is_root(void)
+static bool mesh_at_root(void)
 {
-    return mesh_is_master() || mesh_is_standby();
+    return mesh_is_root() || mesh_is_standby();
 }
 
 /* True when a frame's header `dst` addresses this node.  A standby additionally
- * treats the master's well-known address as its own, so it absorbs the rootward
- * traffic that reaches the master on its final hop (claims, liveness aggregates,
+ * treats the root's well-known address as its own, so it absorbs the rootward
+ * traffic that reaches the root on its final hop (claims, liveness aggregates,
  * topology reports) even though it holds no address of its own. */
 static bool mesh_addressed_to_me(uint8_t dst)
 {
     return dst != MESH_ADDR_NONE &&
            (dst == mesh_get_address() ||
-            (mesh_is_standby() && dst == MESH_MASTER_ADDR));
+            (mesh_is_standby() && dst == MESH_ROOT_ADDR));
 }
 
 bool mesh_has_node_device_id(void)
@@ -965,9 +965,9 @@ bool mesh_lookup_device_id(uint8_t addr, uint8_t out[MESH_NODE_DEVICE_ID_LEN])
         mesh_get_node_device_id(out);
         return true;
     }
-    /* The active master holds the full map; a standby holds a best-effort shadow
+    /* The active root holds the full map; a standby holds a best-effort shadow
      * of it (learned from overheard ADDR_ASSIGN / ADDR_CLAIM frames). */
-    if (!mesh_is_root()) {
+    if (!mesh_at_root()) {
         return false;
     }
     return mesh_alloc_device_id(addr, out);
@@ -1017,7 +1017,7 @@ mesh_state_t mesh_get_state(void)
     return s_state;
 }
 
-uint8_t mesh_master_alloc_count(void)
+uint8_t mesh_root_alloc_count(void)
 {
     return mesh_alloc_count();
 }
@@ -1147,14 +1147,14 @@ static void mesh_send_addr_assign(const uint8_t device_id[MESH_NODE_DEVICE_ID_LE
                     MESH_DEFAULT_TTL, device_id, MESH_NODE_DEVICE_ID_LEN);
 }
 
-/* A joining node asks for an address (payload = devid, flooded).  The master
+/* A joining node asks for an address (payload = devid, flooded).  The root
  * allocates and floods ADDR_ASSIGN; every node relays the request onward. */
 static void mesh_rx_join_req(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     if (plen < MESH_NODE_DEVICE_ID_LEN) {
         return;
     }
-    if (mesh_is_master()) {
+    if (mesh_is_root()) {
         /* After a restart the table is empty; give nodes a moment to re-claim
          * their flash addresses before handing addresses to fresh joiners. */
         if ((uint32_t)(millis() - s_boot_ms) >= MESH_RECOVER_MS) {
@@ -1167,7 +1167,7 @@ static void mesh_rx_join_req(const mesh_header_t *h, const uint8_t *payload, uin
     mesh_relay_flood(h, payload, plen);
 }
 
-/* Node: adopt an address the master assigned to our node device id (flooded). */
+/* Node: adopt an address the root assigned to our node device id (flooded). */
 static void mesh_rx_addr_assign(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     uint8_t addr;
@@ -1177,17 +1177,17 @@ static void mesh_rx_addr_assign(const mesh_header_t *h, const uint8_t *payload, 
     }
     addr = (uint8_t)(h->dst & MESH_ADDR_MASK);
     if (mesh_is_standby()) {
-        /* Shadow root: learn the master's address <-> device-id binding from the
+        /* Shadow root: learn the root's address <-> device-id binding from the
          * assignment it overhears (payload = device id, header dst = address).
          * Record only -- never transmit, so the flood is not relayed. */
-        if (addr >= MESH_FIRST_SLAVE_ADDR && addr <= MESH_ADDR_MAX) {
+        if (addr >= MESH_FIRST_NONROOT_ADDR && addr <= MESH_ADDR_MAX) {
             mesh_alloc_claim(payload, addr);
         }
         return;
     }
-    if (!mesh_is_master()) {
+    if (!mesh_is_root()) {
         if (memcmp(payload, s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN) == 0) {
-            if (addr >= MESH_FIRST_SLAVE_ADDR) {
+            if (addr >= MESH_FIRST_NONROOT_ADDR) {
                 if (mesh_get_address() != addr) {
                     mesh_set_address(addr);
                     mesh_config_save();
@@ -1195,7 +1195,7 @@ static void mesh_rx_addr_assign(const mesh_header_t *h, const uint8_t *payload, 
                 mesh_update_state();
                 mesh_beacon_fast();     /* announce the new attachment quickly */
             }
-        } else if (addr >= MESH_FIRST_SLAVE_ADDR && addr == mesh_get_address()) {
+        } else if (addr >= MESH_FIRST_NONROOT_ADDR && addr == mesh_get_address()) {
             /* Our address was handed to a different node: relinquish it and
              * re-join so no duplicate address can persist (safety net). */
             mesh_set_address(MESH_ADDR_NONE);
@@ -1207,7 +1207,7 @@ static void mesh_rx_addr_assign(const mesh_header_t *h, const uint8_t *payload, 
     mesh_relay_flood(h, payload, plen);
 }
 
-/* Node: reconcile our address with the master's occupied bitmap (flooded). */
+/* Node: reconcile our address with the root's occupied bitmap (flooded). */
 static void mesh_rx_addr_table(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     uint8_t addr = mesh_get_address();
@@ -1215,11 +1215,11 @@ static void mesh_rx_addr_table(const mesh_header_t *h, const uint8_t *payload, u
     if (plen < 2) {
         return;
     }
-    if (!mesh_is_master() && addr != MESH_ADDR_NONE) {
+    if (!mesh_is_root() && addr != MESH_ADDR_NONE) {
         if (payload[addr >> 3] & (uint8_t)(1u << (addr & 7))) {
-            s_table_miss = 0;           /* master still knows us */
+            s_table_miss = 0;           /* root still knows us */
         } else if (++s_table_miss >= MESH_TABLE_MISS_LIMIT) {
-            /* Our address vanished from the master's table.  A single lost
+            /* Our address vanished from the root's table.  A single lost
              * flood is normal, so only relinquish after several misses
              * (M5 will refine this with an explicit grace policy). */
             s_table_miss = 0;
@@ -1291,7 +1291,7 @@ uint8_t mesh_get_neighbor_count(void)
 /* --- M6: topology map accessors ----------------------------------------- *
  * Every node keeps a partial map: its own row (fed live from the neighbour
  * table) plus a row for each node whose report has passed through it, i.e. its
- * descendants -- the part of the tree it is on the path for.  The master node
+ * descendants -- the part of the tree it is on the path for.  The root node
  * is on the path for every report (and also absorbs the flooded fallback and
  * the tree edge carried by claims), so it sees the whole graph. */
 
@@ -1311,7 +1311,7 @@ uint8_t mesh_topo_row_count(void)
     uint32_t now = millis();
     uint8_t  n = 0;
 
-    for (uint8_t a = MESH_MASTER_ADDR; a <= MESH_ADDR_MAX; a++) {
+    for (uint8_t a = MESH_ROOT_ADDR; a <= MESH_ADDR_MAX; a++) {
         if (mesh_topo_row_valid(a, now)) {
             n++;
         }
@@ -1328,7 +1328,7 @@ bool mesh_topo_row(uint8_t index, mesh_topo_row_t *out)
         return false;
     }
     now = millis();
-    for (uint8_t a = MESH_MASTER_ADDR; a <= MESH_ADDR_MAX; a++) {
+    for (uint8_t a = MESH_ROOT_ADDR; a <= MESH_ADDR_MAX; a++) {
         if (!mesh_topo_row_valid(a, now)) {
             continue;
         }
@@ -1339,7 +1339,7 @@ bool mesh_topo_row(uint8_t index, mesh_topo_row_t *out)
         out->addr = a;
         if (a == mesh_get_address()) {
             /* Our own row: live parent and links from the neighbour table. */
-            out->parent = (a == MESH_MASTER_ADDR) ? MESH_ADDR_NONE
+            out->parent = (a == MESH_ROOT_ADDR) ? MESH_ADDR_NONE
                                                   : mesh_get_parent();
             for (uint8_t i = 0; i < MESH_NEIGHBOR_MAX; i++) {
                 if (s_neigh[i].addr == MESH_ADDR_NONE || s_neigh[i].addr == a) {
@@ -1351,7 +1351,7 @@ bool mesh_topo_row(uint8_t index, mesh_topo_row_t *out)
             }
         } else {
             out->parent = s_topo_parent[a];
-            for (uint8_t b = MESH_FIRST_SLAVE_ADDR;
+            for (uint8_t b = MESH_FIRST_NONROOT_ADDR;
                  b <= MESH_ADDR_MAX && out->count <= MESH_TOPO_MAX_NEIGH; b++) {
                 if (!(s_topo_link[a] & (uint16_t)(1u << b))) {
                     continue;
@@ -1400,41 +1400,41 @@ static void mesh_check_parent_staleness(uint32_t now)
     }
 }
 
-/* Emit this node's beacon: only routable nodes (master, or a node with a
+/* Emit this node's beacon: only routable nodes (root, or a node with a
  * parent) advertise, so advertised costs are always meaningful.  The 1-byte
- * payload packs the master epoch (3 bits) over the path cost (5 bits). */
+ * payload packs the root epoch (3 bits) over the path cost (5 bits). */
 static void mesh_emit_beacon(void)
 {
     uint8_t payload[MESH_BEACON_LEN];
 
-    if (mesh_is_master()) {
+    if (mesh_is_root()) {
         payload[0] = (uint8_t)((s_boot_epoch & 0x07) << 5);     /* cost 0 */
         mesh_send_broadcast(MESH_TYPE_BEACON, 0, payload, MESH_BEACON_LEN);
         return;
     }
     if (s_route.parent_addr != MESH_ADDR_NONE) {
-        payload[0] = (uint8_t)(((s_master_epoch & 0x07) << 5) |
+        payload[0] = (uint8_t)(((s_root_epoch & 0x07) << 5) |
                                (s_route.self_cost & 0x1F));
         mesh_send_broadcast(MESH_TYPE_BEACON, s_route.self_hops, payload,
                             MESH_BEACON_LEN);
     }
 }
 
-/* Track the master's boot epoch.  A change (or the first one seen while we
- * already hold an address) means the master restarted, so schedule a claim. */
+/* Track the root's boot epoch.  A change (or the first one seen while we
+ * already hold an address) means the root restarted, so schedule a claim. */
 static void mesh_note_epoch(uint16_t epoch)
 {
     bool announce = false;
 
-    if (mesh_is_master()) {
+    if (mesh_is_root()) {
         return;
     }
     if (!s_epoch_valid) {
         s_epoch_valid  = true;
-        s_master_epoch = epoch;
+        s_root_epoch = epoch;
         announce = (mesh_get_address() != MESH_ADDR_NONE);
-    } else if (epoch != s_master_epoch) {
-        s_master_epoch = epoch;
+    } else if (epoch != s_root_epoch) {
+        s_root_epoch = epoch;
         announce = true;
     }
     if (announce && mesh_get_address() != MESH_ADDR_NONE) {
@@ -1454,7 +1454,7 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
     if (h->src == mesh_get_address() || plen < MESH_BEACON_LEN) {
         return;
     }
-    epoch = (uint8_t)((payload[0] >> 5) & 0x07);    /* 3-bit master epoch */
+    epoch = (uint8_t)((payload[0] >> 5) & 0x07);    /* 3-bit root epoch */
     n = mesh_neighbor_obtain(h->src);
     if (n == NULL) {
         return;
@@ -1475,7 +1475,7 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
      * routing through us, so refresh its liveness/relay timestamps.  Set
      * s_relay_last_ms directly (not via mesh_note_relay) so a periodic child
      * beacon never resets our own beacon back-off. */
-    if (h->src >= MESH_FIRST_SLAVE_ADDR && s_child_heard_ms[h->src] != 0) {
+    if (h->src >= MESH_FIRST_NONROOT_ADDR && s_child_heard_ms[h->src] != 0) {
         s_child_heard_ms[h->src] = now;
         s_relay_last_ms          = now;
     }
@@ -1489,9 +1489,9 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
     }
 
     /* Any (re)attachment -- a fresh one or a switch to a better parent --
-     * re-announces our address so the master re-binds us and learns our new
+     * re-announces our address so the root re-binds us and learns our new
      * parent, and queues a topology report so the map follows the move. */
-    if (!mesh_is_master() && s_route.parent_addr != MESH_ADDR_NONE &&
+    if (!mesh_is_root() && s_route.parent_addr != MESH_ADDR_NONE &&
         mesh_get_address() != MESH_ADDR_NONE) {
         if (!s_had_parent || s_route.parent_addr != old_parent) {
             s_claim_due = true;
@@ -1547,9 +1547,9 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
     if (len > MESH_MAX_FRAME - MESH_HEADER_SIZE) {
         return false;
     }
-    if (mesh_is_master()) {
-        /* The master's own message is delivered straight to its host. */
-        mesh_deliver_to_host(payload, len, MESH_MASTER_ADDR);
+    if (mesh_is_root()) {
+        /* The root's own message is delivered straight to its host. */
+        mesh_deliver_to_host(payload, len, MESH_ROOT_ADDR);
         return true;
     }
     if (s_state != MESH_STATE_JOINED || s_route.parent_addr == MESH_ADDR_NONE) {
@@ -1569,11 +1569,11 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
     }
     /* Arm the pending entry so a lost hop is still retried by the mesh MAC
      * (implicit link ACK), independent of the host.  A direct child of the
-     * master is the exception: its parent is the root, which does not forward,
-     * so there is no forward to overhear and the master sends it no LINK_ACK.
+     * root is the exception: its parent is the root, which does not forward,
+     * so there is no forward to overhear and the root sends it no LINK_ACK.
      * Its single hop is instead confirmed by the application-layer ACK, so it
      * arms nothing here and the mesh MAC does not retransmit. */
-    if (s_route.parent_addr != MESH_MASTER_ADDR) {
+    if (s_route.parent_addr != MESH_ROOT_ADDR) {
         mesh_set_pending(MESH_PEND_UP, frame, flen, mesh_get_address(), seq);
     }
     return true;
@@ -1595,7 +1595,7 @@ static void mesh_deliver_to_host(const uint8_t *payload, uint8_t len, uint8_t sr
     MessageQueue_enQueue(&incomingMessageQueue, &msg);
 }
 
-/* Explicit link ACK: the master has no next hop to forward to, so it acks the
+/* Explicit link ACK: the root has no next hop to forward to, so it acks the
  * uplink it just delivered by (origin,seq); relays clear on the same key.
  * The acked origin rides in the header `dst`, so the payload is just the seq. */
 static void mesh_send_link_ack(uint8_t acked_src, uint8_t acked_seq)
@@ -1617,11 +1617,11 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
 
     if (mesh_is_standby()) {
         /* Passive observer (M7): mirror the uplink to our own host exactly as
-         * the master delivers the uplinks it receives, then probe for the
-         * master's application ACK.  Only one probe is in flight at a time, so
+         * the root delivers the uplinks it receives, then probe for the
+         * root's application ACK.  Only one probe is in flight at a time, so
          * a node's two quick uplinks are not counted as two independent trials. */
         mesh_deliver_to_host(payload, plen, h->src);
-        if (!s_probe_active && s_master_seen &&
+        if (!s_probe_active && s_root_seen &&
             s_rx_snr >= MESH_STANDBY_MIN_SNR) {
             s_probe_active   = true;
             s_probe_src      = h->src;
@@ -1629,13 +1629,13 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
         }
         return;                         /* never forward / ack: an observer is silent */
     }
-    if (mesh_is_master()) {
+    if (mesh_is_root()) {
         mesh_deliver_to_host(payload, plen, h->src);
         /* A relay node clears its pending on the next hop's forward (implicit
-         * ACK); the master has no next hop to overhear, so it answers with an
-         * explicit LINK_ACK.  The exception is a direct child of the master: its
+         * ACK); the root has no next hop to overhear, so it answers with an
+         * explicit LINK_ACK.  The exception is a direct child of the root: its
          * single hop is confirmed by the application-layer ACK (see
-         * mesh_send_uplink), so the master does not spend a LINK_ACK frame on it.
+         * mesh_send_uplink), so the root does not spend a LINK_ACK frame on it.
          * A direct child's uplink is the only one that arrives at the full TTL
          * (a relay is only ever in the path of deeper uplinks, which it
          * decrements), so h->hops identifies it exactly. */
@@ -1676,7 +1676,7 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
  * reported as just itself, because it may have become a leaf (subtree gone). */
 static uint16_t mesh_child_bitmap(uint8_t a, uint32_t now)
 {
-    if (a < MESH_FIRST_SLAVE_ADDR || a > MESH_ADDR_MAX ||
+    if (a < MESH_FIRST_NONROOT_ADDR || a > MESH_ADDR_MAX ||
         a == mesh_get_address() || s_child_heard_ms[a] == 0 ||
         (uint32_t)(now - s_child_heard_ms[a]) > MESH_ALIVE_CHILD_HOLD_MS) {
         return 0;
@@ -1694,11 +1694,11 @@ static uint8_t mesh_child_for(uint8_t dst)
 {
     uint32_t now = millis();
 
-    if (dst < MESH_FIRST_SLAVE_ADDR || dst > MESH_ADDR_MAX ||
+    if (dst < MESH_FIRST_NONROOT_ADDR || dst > MESH_ADDR_MAX ||
         dst == mesh_get_address()) {
         return MESH_ADDR_NONE;
     }
-    for (uint8_t c = MESH_FIRST_SLAVE_ADDR; c <= MESH_ADDR_MAX; c++) {
+    for (uint8_t c = MESH_FIRST_NONROOT_ADDR; c <= MESH_ADDR_MAX; c++) {
         if (mesh_child_bitmap(c, now) & (uint16_t)(1u << dst)) {
             return c;
         }
@@ -1706,7 +1706,7 @@ static uint8_t mesh_child_for(uint8_t dst)
     return MESH_ADDR_NONE;
 }
 
-/* Master: send a payload down to a specific node.  Steered hop by hop via the
+/* Root: send a payload down to a specific node.  Steered hop by hop via the
  * subtree bitmaps, so the frame is on air once per hop instead of once per
  * relay node. */
 bool mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len)
@@ -1715,7 +1715,7 @@ bool mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len)
     uint8_t flen;
     uint8_t seq;
 
-    if (!mesh_is_master() || dst < MESH_FIRST_SLAVE_ADDR) {
+    if (!mesh_is_root() || dst < MESH_FIRST_NONROOT_ADDR) {
         return false;
     }
     if (len > MESH_MAX_FRAME - MESH_HEADER_SIZE) {
@@ -1760,10 +1760,10 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
     uint8_t flen;
 
     if (mesh_is_standby()) {
-        /* The application ACK we are waiting for is a downlink from the master
-         * back to the origin of the probed uplink: a live, responsive master.
+        /* The application ACK we are waiting for is a downlink from the root
+         * back to the origin of the probed uplink: a live, responsive root.
          * Confirm the probe and reset the consecutive-miss run. */
-        if (s_probe_active && h->src == MESH_MASTER_ADDR && h->dst == s_probe_src) {
+        if (s_probe_active && h->src == MESH_ROOT_ADDR && h->dst == s_probe_src) {
             s_probe_active = false;
             s_probe_miss   = 0;
         }
@@ -1773,16 +1773,16 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
         mesh_deliver_to_host(payload, plen, h->src);
         /* The path ends here, so there is no next hop whose forward our parent
          * could overhear; we ack the final hop ourselves, the mirror of the
-         * master acking an uplink it terminated.  A direct child of the master
+         * root acking an uplink it terminated.  A direct child of the root
          * sees the full TTL (no relay touched the frame) and is skipped: that
-         * hop is the master's own and it did not arm it (mesh_send_downlink). */
+         * hop is the root's own and it did not arm it (mesh_send_downlink). */
         if (h->hops < MESH_DEFAULT_TTL) {
             mesh_send_link_ack(h->src, h->seq);
         }
         return;
     }
-    if (mesh_is_master()) {
-        return;                         /* the master originates downlinks */
+    if (mesh_is_root()) {
+        return;                         /* the root originates downlinks */
     }
     if (mesh_child_for(h->dst) != MESH_ADDR_NONE &&
         mesh_relay_frame(h, payload, plen, frame, &flen)) {
@@ -1799,12 +1799,12 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
 /*  M5: recovery / robustness                                             */
 /* ======================================================================= */
 
-/* Record one node's reported parent (the tree edge).  Shared by the master (a
+/* Record one node's reported parent (the tree edge).  Shared by the root (a
  * claim it absorbs) and by any relay on a claim's rootward path, so every node
- * learns its descendants' tree edges, not just the master. */
+ * learns its descendants' tree edges, not just the root. */
 static void mesh_topo_note_parent(uint8_t addr, uint8_t parent)
 {
-    if (addr < MESH_FIRST_SLAVE_ADDR || addr > MESH_ADDR_MAX) {
+    if (addr < MESH_FIRST_NONROOT_ADDR || addr > MESH_ADDR_MAX) {
         return;
     }
     parent = (uint8_t)(parent & MESH_ADDR_MASK);
@@ -1815,16 +1815,16 @@ static void mesh_topo_note_parent(uint8_t addr, uint8_t parent)
     s_topo_age_ms[addr] = millis();
 }
 
-/* Master: apply a node's claim to the RAM-only table.  Adopt the claimed
+/* Root: apply a node's claim to the RAM-only table.  Adopt the claimed
  * address when it is free, re-assert our existing assignment when the node device
  * id is already known, and fall back to a fresh allocation when the claimed address
  * is already taken.  Shared by the unicast and flooded claim paths. */
-static void mesh_master_apply_claim(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
+static void mesh_root_apply_claim(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     uint8_t want = (uint8_t)(h->src & MESH_ADDR_MASK);  /* node's own address */
     uint8_t have;
 
-    if (want < MESH_FIRST_SLAVE_ADDR || want > MESH_ADDR_MAX) {
+    if (want < MESH_FIRST_NONROOT_ADDR || want > MESH_ADDR_MAX) {
         return;
     }
     /* A claim also reports the node's parent (the topology map's tree edge). */
@@ -1846,11 +1846,11 @@ static void mesh_master_apply_claim(const mesh_header_t *h, const uint8_t *paylo
     }
 }
 
-/* Node: re-announce our flash-stored address so a restarted master can rebuild
+/* Node: re-announce our flash-stored address so a restarted root can rebuild
  * its RAM-only table.  Our address is already in the header `src`; the payload
  * is just our node device id.
  *
- * This is a rootward message: it only has to reach the master, so we send it
+ * This is a rootward message: it only has to reach the root, so we send it
  * hop-by-hop toward our parent (same discipline as DATA_UPLINK) rather than
  * flooding -- the network-wide cost is O(hops) per claim instead of O(N).  When
  * we have no route yet (just booted, or just lost our parent) we fall back to a
@@ -1866,16 +1866,16 @@ static void mesh_send_claim(void)
     uint8_t flen;
     uint8_t seq;
 
-    if (mesh_is_master() || mesh_get_address() == MESH_ADDR_NONE) {
+    if (mesh_is_root() || mesh_get_address() == MESH_ADDR_NONE) {
         return;
     }
-    /* Payload is our device id plus our current parent, so the master learns
+    /* Payload is our device id plus our current parent, so the root learns
      * both the address binding and the tree edge (its topology map) in one
      * message.  Parent 0 when we have no route yet. */
     memcpy(claim, s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN);
     claim[MESH_NODE_DEVICE_ID_LEN] = s_route.parent_addr;
     if (s_state != MESH_STATE_JOINED || s_route.parent_addr == MESH_ADDR_NONE) {
-        /* No route: flood so the master can still find us. */
+        /* No route: flood so the root can still find us. */
         mesh_send_broadcast(MESH_TYPE_ADDR_CLAIM, MESH_DEFAULT_TTL,
                             claim, sizeof(claim));
     } else {
@@ -1892,8 +1892,8 @@ static void mesh_send_claim(void)
     s_alive_next_ms = millis() + MESH_ALIVE_INTERVAL_MS;
 }
 
-/* Node: topology report.  Rootward (to the master) it carries our current
- * parent and every neighbour we hear, with its link cost, so the master can
+/* Node: topology report.  Rootward (to the root) it carries our current
+ * parent and every neighbour we hear, with its link cost, so the root can
  * assemble the whole node/link graph.  The header `src` is our address, so the
  * payload is `parent(1) | {addr(1), cost(1)}*` (no count: the length implies
  * it).  Event-driven (attach, parent change) plus a slow backstop; sent only
@@ -1909,7 +1909,7 @@ static void mesh_send_topology(void)
 
     s_topo_next_ms = millis() + MESH_TOPO_INTERVAL_MS;
 
-    if (mesh_is_master() || mesh_get_address() == MESH_ADDR_NONE) {
+    if (mesh_is_root() || mesh_get_address() == MESH_ADDR_NONE) {
         return;
     }
     if (s_state != MESH_STATE_JOINED || s_route.parent_addr == MESH_ADDR_NONE) {
@@ -1935,8 +1935,8 @@ static void mesh_send_topology(void)
  * carrying a 2-byte subtree bitmap (bit a = "address a is alive in our
  * subtree").  We set our own bit and OR in the bitmap reported by every current
  * child, so one frame covers the whole subtree -- the parent absorbs it (never
- * forwards it), and the union of the master's direct children therefore covers
- * every non-master node each round.
+ * forwards it), and the union of the root's direct children therefore covers
+ * every non-root node each round.
  *
  * Only a **relay** (a node with children) sends one: a leaf sends nothing, so
  * the steady-state cost is (relays) single-hop frames per round, not N.  A leaf
@@ -1963,7 +1963,7 @@ static void mesh_send_alive(void)
 
     s_alive_next_ms = now + MESH_ALIVE_INTERVAL_MS;
 
-    if (mesh_is_master() || mesh_get_address() == MESH_ADDR_NONE) {
+    if (mesh_is_root() || mesh_get_address() == MESH_ADDR_NONE) {
         return;
     }
     if (s_state != MESH_STATE_JOINED || s_route.parent_addr == MESH_ADDR_NONE) {
@@ -1973,7 +1973,7 @@ static void mesh_send_alive(void)
         return;                         /* leaf: our parent covers us */
     }
     bm = (uint16_t)(1u << mesh_get_address());
-    for (uint8_t a = MESH_FIRST_SLAVE_ADDR; a <= MESH_ADDR_MAX; a++) {
+    for (uint8_t a = MESH_FIRST_NONROOT_ADDR; a <= MESH_ADDR_MAX; a++) {
         bm |= mesh_child_bitmap(a, now); /* self, plus each current child's subtree */
     }
     payload[0] = (uint8_t)(bm & 0xFF);
@@ -2001,7 +2001,7 @@ static void mesh_forward_rootward(const mesh_header_t *h,
     }
     if (s_route.parent_addr == MESH_ADDR_NONE) {
         /* We cannot forward rootward right now: fall back to a flood (origin's
-         * src preserved, dst cleared) so the message can still reach the master
+         * src preserved, dst cleared) so the message can still reach the root
          * via another path. */
         flen = mesh_build_frame(frame, h->type, h->src,
                                 MESH_ADDR_NONE, (uint8_t)(h->hops - 1), h->seq,
@@ -2015,7 +2015,7 @@ static void mesh_forward_rootward(const mesh_header_t *h,
     mesh_send_frame(frame, flen);       /* best effort; no pending retry */
 }
 
-/* Handle an incoming ADDR_CLAIM.  The master applies it to its table; a standby
+/* Handle an incoming ADDR_CLAIM.  The root applies it to its table; a standby
  * records the binding (shadow root); an intermediate node forwards a rootward
  * unicast one hop toward its parent (or converts it to a flood if it has lost its
  * own parent); the flooded fallback is relayed by everyone. */
@@ -2028,9 +2028,9 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
     if (mesh_is_standby()) {
         /* Shadow root: learn the address <-> device-id binding (device id in the
          * payload, the node's own address in header `src`) and the tree edge,
-         * without allocating or responding -- that is the active master's job. */
+         * without allocating or responding -- that is the active root's job. */
         uint8_t addr = (uint8_t)(h->src & MESH_ADDR_MASK);
-        if (addr >= MESH_FIRST_SLAVE_ADDR && addr <= MESH_ADDR_MAX) {
+        if (addr >= MESH_FIRST_NONROOT_ADDR && addr <= MESH_ADDR_MAX) {
             mesh_alloc_claim(payload, addr);
             if (plen >= MESH_NODE_DEVICE_ID_LEN + 1) {
                 mesh_topo_note_parent(addr, payload[MESH_NODE_DEVICE_ID_LEN]);
@@ -2040,10 +2040,10 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
     }
 
     /* Flooded fallback (sent by a node that has no route yet): everyone relays
-     * and the master rebuilds. */
+     * and the root rebuilds. */
     if (h->dst == MESH_ADDR_NONE) {
-        if (mesh_is_master()) {
-            mesh_master_apply_claim(h, payload, plen);
+        if (mesh_is_root()) {
+            mesh_root_apply_claim(h, payload, plen);
         }
         mesh_relay_flood(h, payload, plen);
         return;
@@ -2053,8 +2053,8 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
     if (!mesh_addressed_to_me(h->dst)) {
         return;                         /* not addressed to us */
     }
-    if (mesh_is_master()) {
-        mesh_master_apply_claim(h, payload, plen);
+    if (mesh_is_root()) {
+        mesh_root_apply_claim(h, payload, plen);
         return;
     }
     /* We are on the claim's rootward path: record its tree edge, then forward. */
@@ -2066,13 +2066,13 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
 
 /* Absorb one node's topology report -- its parent plus the neighbours it hears
  * and their link costs.  A report replaces that node's whole row.  Called by
- * any node on the reporter's rootward path: the master node (which sees every
+ * any node on the reporter's rootward path: the root node (which sees every
  * report) and each relay ancestor (which sees its own descendants). */
 static void mesh_apply_topology(uint8_t src, const uint8_t *payload, uint8_t plen)
 {
     uint8_t n;
 
-    if (src < MESH_FIRST_SLAVE_ADDR || src > MESH_ADDR_MAX || plen < 1) {
+    if (src < MESH_FIRST_NONROOT_ADDR || src > MESH_ADDR_MAX || plen < 1) {
         return;
     }
     mesh_topo_note_parent(src, payload[0]);
@@ -2086,7 +2086,7 @@ static void mesh_apply_topology(uint8_t src, const uint8_t *payload, uint8_t ple
     for (uint8_t i = 0; i < n; i++) {
         uint8_t a = (uint8_t)(payload[1 + i * 2] & MESH_ADDR_MASK);
         uint8_t c = payload[2 + i * 2];
-        if (a < MESH_FIRST_SLAVE_ADDR || a > MESH_ADDR_MAX || a == src) {
+        if (a < MESH_FIRST_NONROOT_ADDR || a > MESH_ADDR_MAX || a == src) {
             continue;
         }
         s_topo_link[src]   |= (uint16_t)(1u << a);
@@ -2094,15 +2094,15 @@ static void mesh_apply_topology(uint8_t src, const uint8_t *payload, uint8_t ple
     }
     /* A parent is by definition a neighbour: make sure the tree edge shows up
      * even if the neighbour list was truncated. */
-    if (s_topo_parent[src] >= MESH_FIRST_SLAVE_ADDR &&
+    if (s_topo_parent[src] >= MESH_FIRST_NONROOT_ADDR &&
         s_topo_parent[src] <= MESH_ADDR_MAX) {
         s_topo_link[src] |= (uint16_t)(1u << s_topo_parent[src]);
     }
 }
 
 /* Handle an incoming topology report.  Every node the report passes through on
- * its rootward path absorbs it -- so the master node learns the whole graph and
- * a relay learns its own subtree -- and a non-master forwards it one hop toward
+ * its rootward path absorbs it -- so the root node learns the whole graph and
+ * a relay learns its own subtree -- and a non-root forwards it one hop toward
  * its parent.  The flooded fallback (a relay that lost its own parent) is
  * absorbed only by a root (everyone else would pollute its map with nodes
  * that are not its descendants) and relayed by everyone. */
@@ -2112,7 +2112,7 @@ static void mesh_rx_topology(const mesh_header_t *h, const uint8_t *payload, uin
         return;
     }
     if (h->dst == MESH_ADDR_NONE) {
-        if (mesh_is_root()) {
+        if (mesh_at_root()) {
             mesh_apply_topology(h->src, payload, plen);
         }
         mesh_relay_flood(h, payload, plen);
@@ -2123,14 +2123,14 @@ static void mesh_rx_topology(const mesh_header_t *h, const uint8_t *payload, uin
     }
     /* We are a hop on the reporter's rootward path: absorb its row. */
     mesh_apply_topology(h->src, payload, plen);
-    if (mesh_is_root()) {
+    if (mesh_at_root()) {
         return;                         /* the root does not forward; a standby is silent */
     }
     mesh_forward_rootward(h, payload, plen);
 }
 
 /* --- Node liveness monitor (Step 4) -------------------------------------- *
- * A node at depth >= 2 cannot observe the master directly, and under
+ * A node at depth >= 2 cannot observe the root directly, and under
  * relay-only liveness a *leaf* sends no aggregate of its own, so its only
  * upstream proof of life is its parent's aggregate carrying its bit.  The
  * monitor watches that aggregate -- a single-hop unicast to the grandparent,
@@ -2139,7 +2139,7 @@ static void mesh_rx_topology(const mesh_header_t *h, const uint8_t *payload, uin
  * lost its RAM-only child table, so it is no longer a relay), or it keeps
  * aggregating but has dropped our bit.  A claim re-registers us at every hop
  * (mesh_forward_rootward -> mesh_note_relay) and re-adopts our address at the
- * master, so it is safe even if the eviction timer has already fired.  Steady
+ * root, so it is safe even if the eviction timer has already fired.  Steady
  * state costs nothing; only a node that has actually lost coverage emits. */
 
 /* Fire a re-claim, rate-limited to one per liveness interval so a broken or
@@ -2162,9 +2162,9 @@ static void mesh_monitor_tick(uint32_t now)
     uint8_t  parent = s_route.parent_addr;
     uint32_t last;
 
-    if (mesh_is_master() || s_state != MESH_STATE_JOINED ||
-        parent < MESH_FIRST_SLAVE_ADDR || parent > MESH_ADDR_MAX) {
-        s_mon_parent = MESH_ADDR_NONE;  /* parent is the master / none: exempt */
+    if (mesh_is_root() || s_state != MESH_STATE_JOINED ||
+        parent < MESH_FIRST_NONROOT_ADDR || parent > MESH_ADDR_MAX) {
+        s_mon_parent = MESH_ADDR_NONE;  /* parent is the root / none: exempt */
         return;
     }
     if (parent != s_mon_parent) {
@@ -2189,7 +2189,7 @@ static void mesh_monitor_alive(const mesh_header_t *h,
     uint32_t now = millis();
 
     if (plen < 2 || me == MESH_ADDR_NONE ||
-        s_route.parent_addr < MESH_FIRST_SLAVE_ADDR ||
+        s_route.parent_addr < MESH_FIRST_NONROOT_ADDR ||
         s_route.parent_addr > MESH_ADDR_MAX ||
         h->src != s_route.parent_addr) {
         return;
@@ -2212,7 +2212,7 @@ static void mesh_monitor_alive(const mesh_header_t *h,
 
 /* Handle an incoming ADDR_ALIVE: a single-hop subtree-liveness aggregate
  * addressed to us (its parent).  We never forward it.
- *   - root (the master, or a standby shadowing it): book liveness for every
+ *   - root (the root, or a standby shadowing it): book liveness for every
  *     address the child reported alive (so the eviction loop sees the whole
  *     subtree refreshed, not just the header src), record the sender as a known
  *     direct child, and remember which direct child covers each address (s_cover)
@@ -2227,7 +2227,7 @@ static void mesh_rx_alive(const mesh_header_t *h, const uint8_t *payload, uint8_
         /* Not addressed to us.  If it is our parent's own aggregate (a unicast
          * to our grandparent) we overhear it to monitor whether we are still
          * covered upstream (see mesh_monitor_alive). */
-        if (!mesh_is_root() && h->src == s_route.parent_addr) {
+        if (!mesh_at_root() && h->src == s_route.parent_addr) {
             mesh_monitor_alive(h, payload, plen);
         }
         return;                         /* single-hop aggregate: only the parent acts */
@@ -2238,13 +2238,13 @@ static void mesh_rx_alive(const mesh_header_t *h, const uint8_t *payload, uint8_
     bm = (uint16_t)(payload[0] | ((uint16_t)payload[1] << 8));
     c  = h->src;
 
-    if (mesh_is_root()) {
+    if (mesh_at_root()) {
         uint32_t now = millis();
-        if (c < MESH_FIRST_SLAVE_ADDR || c > MESH_ADDR_MAX) {
+        if (c < MESH_FIRST_NONROOT_ADDR || c > MESH_ADDR_MAX) {
             return;
         }
         s_child_heard_ms[c] = now;      /* c is a known direct child */
-        for (uint8_t a = MESH_FIRST_SLAVE_ADDR; a <= MESH_ADDR_MAX; a++) {
+        for (uint8_t a = MESH_FIRST_NONROOT_ADDR; a <= MESH_ADDR_MAX; a++) {
             if (bm & (uint16_t)(1u << a)) {
                 s_heard_ms[a] = now;
                 s_cover[a]    = c;      /* a is covered by branch c */
@@ -2252,7 +2252,7 @@ static void mesh_rx_alive(const mesh_header_t *h, const uint8_t *payload, uint8_
         }
         return;
     }
-    if (c >= MESH_FIRST_SLAVE_ADDR && c <= MESH_ADDR_MAX) {
+    if (c >= MESH_FIRST_NONROOT_ADDR && c <= MESH_ADDR_MAX) {
         mesh_note_relay(c);             /* refresh child + our relay status */
         s_child_bm[c]    = bm;          /* adopt the richer subtree bitmap  */
         s_child_bm_ms[c] = millis();
@@ -2260,18 +2260,18 @@ static void mesh_rx_alive(const mesh_header_t *h, const uint8_t *payload, uint8_
 }
 
 /* ======================================================================= */
-/*  M7: standby master (passive observer)                                 */
+/*  M7: standby root (passive observer)                                 */
 /* ======================================================================= */
 
 /* Per-tick liveness check for the standby.  Two independent ways to declare the
- * active master dead:
+ * active root dead:
  *   - the application-ACK probe: an uplink we probed got no downlink back to its
  *     origin within MESH_STANDBY_PROBE_MS -> a miss.  MESH_STANDBY_MISS_LIMIT
  *     misses in a row, spread over at least MESH_STANDBY_MIN_WINDOW_MS (so a
  *     reboot shorter than that window does not promote), is "dead".
- *   - the backstop: no frame from the master for MESH_STANDBY_BACKSTOP_MS (covers
+ *   - the backstop: no frame from the root for MESH_STANDBY_BACKSTOP_MS (covers
  *     an idle network and a standby that boots into a dead one -- the clock runs
- *     from boot until the first master frame, because s_master_alive_ms starts
+ *     from boot until the first root frame, because s_root_alive_ms starts
  *     there). */
 static void mesh_standby_tick(uint32_t now)
 {
@@ -2287,36 +2287,36 @@ static void mesh_standby_tick(uint32_t now)
             return;
         }
     }
-    if ((uint32_t)(now - s_master_alive_ms) >= MESH_STANDBY_BACKSTOP_MS) {
+    if ((uint32_t)(now - s_root_alive_ms) >= MESH_STANDBY_BACKSTOP_MS) {
         mesh_standby_takeover();
     }
 }
 
-/* Promote the standby to master.  Clearing the standby role stops the observer
- * paths; mesh_set_master(true) gives us address 1 and -- via mesh_apply_role --
+/* Promote the standby to root.  Clearing the standby role stops the observer
+ * paths; mesh_set_root(true) gives us address 1 and -- via mesh_apply_role --
  * a fresh boot epoch, so every node sees the restart, re-adopts its address and
- * re-claims (the master's table is RAM-only).  mesh_state_clear() drops the
+ * re-claims (the root's table is RAM-only).  mesh_state_clear() drops the
  * observer state and schedules the first beacon / ADDR_TABLE immediately, and
  * the save persists the promotion across a power-cycle. */
 static void mesh_standby_takeover(void)
 {
     s_cfg.flags &= (uint8_t)~MESH_FLAG_STANDBY;
-    /* Force a fresh epoch even if this device was an active master earlier in the
+    /* Force a fresh epoch even if this device was an active root earlier in the
      * power cycle (mesh_apply_role only bumps while s_boot_epoch is still 0), so
      * the nodes always see a change and re-claim. */
     s_boot_epoch = 0;
-    mesh_set_master(true);
+    mesh_set_root(true);
     mesh_state_clear();
     mesh_update_state();
     mesh_config_save();
 }
 
 /* ======================================================================= */
-/*  M8: master conflict (lowest device id wins)                            */
+/*  M8: root conflict (lowest device id wins)                            */
 /* ======================================================================= */
 
 /* Total order on two device ids: -1 if a < b, +1 if a > b, 0 if equal.  Both
- * masters compute it identically, so exactly one steps down and the result is
+ * roots compute it identically, so exactly one steps down and the result is
  * stable -- no tie-break, no oscillation. */
 static int mesh_devid_cmp(const uint8_t *a, const uint8_t *b)
 {
@@ -2324,89 +2324,89 @@ static int mesh_devid_cmp(const uint8_t *a, const uint8_t *b)
     return (c < 0) ? -1 : (c > 0) ? 1 : 0;
 }
 
-/* Advertise our identity so a rival master can compare device ids. */
-static void mesh_master_announce_send(void)
+/* Advertise our identity so a rival root can compare device ids. */
+static void mesh_root_announce_send(void)
 {
     uint8_t own[MESH_NODE_DEVICE_ID_LEN];
 
     mesh_get_node_device_id(own);
-    mesh_send_broadcast(MESH_TYPE_MASTER_ANNOUNCE, 1, own, sizeof(own));
+    mesh_send_broadcast(MESH_TYPE_ROOT_ANNOUNCE, 1, own, sizeof(own));
 }
 
-/* A master with a lower device id exists: stand down and observe it.  We become
- * a standby (M7) -- silent, shadowing, and able to take over again if that master
- * later dies -- and arm its heartbeat (we have just heard a master). */
-static void mesh_master_demote_to_standby(void)
+/* A root with a lower device id exists: stand down and observe it.  We become
+ * a standby (M7) -- silent, shadowing, and able to take over again if that root
+ * later dies -- and arm its heartbeat (we have just heard a root). */
+static void mesh_root_demote_to_standby(void)
 {
-    mesh_set_standby(true);             /* clears master + address, resets state */
-    s_master_seen     = true;
-    s_master_alive_ms = millis();
+    mesh_set_standby(true);             /* clears root + address, resets state */
+    s_root_seen     = true;
+    s_root_alive_ms = millis();
     mesh_config_save();                 /* persist the role across a reboot      */
 }
 
-/* A rival asked "who is master?".  Lowest device id wins: if we are junior we
+/* A rival asked "who is root?".  Lowest device id wins: if we are junior we
  * stand down; if we are senior we stop contending and answer. */
-static void mesh_rx_master_query(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
+static void mesh_rx_root_query(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     uint8_t own[MESH_NODE_DEVICE_ID_LEN];
 
-    if (!mesh_is_master() || h->src != MESH_MASTER_ADDR ||
+    if (!mesh_is_root() || h->src != MESH_ROOT_ADDR ||
         plen < MESH_NODE_DEVICE_ID_LEN) {
-        return;                         /* a query is for masters only */
+        return;                         /* a query is for roots only */
     }
     mesh_get_node_device_id(own);
     if (mesh_devid_cmp(payload, own) < 0) {
-        mesh_master_demote_to_standby();
+        mesh_root_demote_to_standby();
         return;
     }
-    s_master_serving   = true;          /* we are senior: assert and reply */
+    s_root_serving   = true;          /* we are senior: assert and reply */
     s_contend_until_ms = 0;
-    mesh_master_announce_send();
+    mesh_root_announce_send();
 }
 
 /* A rival stated its identity.  If it is senior, stand down; else it is the one
  * that yields (it will hear our announce / query in turn). */
-static void mesh_rx_master_announce(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
+static void mesh_rx_root_announce(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     uint8_t own[MESH_NODE_DEVICE_ID_LEN];
 
-    if (!mesh_is_master() || h->src != MESH_MASTER_ADDR ||
+    if (!mesh_is_root() || h->src != MESH_ROOT_ADDR ||
         plen < MESH_NODE_DEVICE_ID_LEN) {
         return;
     }
     mesh_get_node_device_id(own);
     if (mesh_devid_cmp(payload, own) < 0) {
-        mesh_master_demote_to_standby();
+        mesh_root_demote_to_standby();
     }
 }
 
-/* Tick for a master that has not yet proven it is alone: broadcast the query so
+/* Tick for a root that has not yet proven it is alone: broadcast the query so
  * a rival answers, then assert if nothing senior turns up within the window. */
-static void mesh_master_contend_tick(uint32_t now)
+static void mesh_root_contend_tick(uint32_t now)
 {
     uint8_t own[MESH_NODE_DEVICE_ID_LEN];
 
     if (s_contend_until_ms == 0) {      /* arm on the first tick */
-        s_contend_until_ms = now + MESH_MASTER_QUERY_WINDOW_MS;
-        /* Jitter the first query so two masters booting together do not answer
+        s_contend_until_ms = now + MESH_ROOT_QUERY_WINDOW_MS;
+        /* Jitter the first query so two roots booting together do not answer
          * each other in lockstep. */
-        s_contend_next_ms  = now + (mesh_rand() % MESH_MASTER_QUERY_RETRY_MS);
+        s_contend_next_ms  = now + (mesh_rand() % MESH_ROOT_QUERY_RETRY_MS);
         return;
     }
     if ((int32_t)(now - s_contend_next_ms) >= 0) {
         mesh_get_node_device_id(own);
-        mesh_send_broadcast(MESH_TYPE_MASTER_QUERY, 1, own, sizeof(own));
-        s_contend_next_ms = now + MESH_MASTER_QUERY_RETRY_MS;
+        mesh_send_broadcast(MESH_TYPE_ROOT_QUERY, 1, own, sizeof(own));
+        s_contend_next_ms = now + MESH_ROOT_QUERY_RETRY_MS;
     }
     if ((int32_t)(now - s_contend_until_ms) >= 0) {
-        s_master_serving   = true;      /* nobody senior answered: we are master */
+        s_root_serving   = true;      /* nobody senior answered: we are root */
         s_contend_until_ms = 0;
     }
 }
 
 uint16_t mesh_get_epoch(void)
 {
-    return mesh_is_master() ? s_boot_epoch : s_master_epoch;
+    return mesh_is_root() ? s_boot_epoch : s_root_epoch;
 }
 
 uint8_t mesh_get_parent(void)
@@ -2443,17 +2443,17 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     s_rx_rssi = rssi;
     s_rx_snr  = snr;
 
-    /* Master liveness bookkeeping: refresh the last-heard time for a node as
+    /* Root liveness bookkeeping: refresh the last-heard time for a node as
      * long as it sends anything (beacon, uplink, claim or liveness aggregate);
      * mesh_rx_alive additionally refreshes every bit of a child's aggregate. */
-    if (mesh_is_master() && h.src >= MESH_FIRST_SLAVE_ADDR && h.src <= MESH_ADDR_MAX) {
+    if (mesh_is_root() && h.src >= MESH_FIRST_NONROOT_ADDR && h.src <= MESH_ADDR_MAX) {
         s_heard_ms[h.src] = millis();
     }
-    /* Standby master (M7): any frame from the master (beacon, downlink, ACK,
+    /* Standby root (M7): any frame from the root (beacon, downlink, ACK,
      * table) refreshes the backstop heartbeat. */
-    if (mesh_is_standby() && h.src == MESH_MASTER_ADDR) {
-        s_master_alive_ms = millis();
-        s_master_seen     = true;
+    if (mesh_is_standby() && h.src == MESH_ROOT_ADDR) {
+        s_root_alive_ms = millis();
+        s_root_seen     = true;
     }
 
     payload = buf + MESH_HEADER_SIZE;
@@ -2488,29 +2488,29 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
         }
     }
 
-    /* A master that has not yet passed its solo check (M8) serves nothing: it
-     * handles only the conflict handshake, so a booting master cannot hand out
+    /* A root that has not yet passed its solo check (M8) serves nothing: it
+     * handles only the conflict handshake, so a booting root cannot hand out
      * addresses or relay while it is still undecided. */
-    if (mesh_is_master() && !s_master_serving &&
-        h.type != MESH_TYPE_MASTER_QUERY &&
-        h.type != MESH_TYPE_MASTER_ANNOUNCE) {
+    if (mesh_is_root() && !s_root_serving &&
+        h.type != MESH_TYPE_ROOT_QUERY &&
+        h.type != MESH_TYPE_ROOT_ANNOUNCE) {
         return;
     }
 
     /* A frame sourced from address 1 that we did not send (a node never hears
-     * its own frames) proves a rival master exists.  A serving master answers a
+     * its own frames) proves a rival root exists.  A serving root answers a
      * rival's beacon with its identity (M8) so the two can compare and the
-     * junior one stand down; a contending master waits for the handshake above. */
-    if (mesh_is_master() && s_master_serving && h.src == MESH_MASTER_ADDR &&
+     * junior one stand down; a contending root waits for the handshake above. */
+    if (mesh_is_root() && s_root_serving && h.src == MESH_ROOT_ADDR &&
         h.type == MESH_TYPE_BEACON) {
-        mesh_master_announce_send();
+        mesh_root_announce_send();
     }
 
-    /* A standby master (M7) is a silent shadow root, not a routing node: it
+    /* A standby root (M7) is a silent shadow root, not a routing node: it
      * skips the join / neighbour / routing control types entirely and only
      * observes -- it delivers data and absorbs the rootward control frames that
-     * reach the master (ADDR_ASSIGN / ADDR_CLAIM / ALIVE / TOPOLOGY, handled via
-     * mesh_addressed_to_me / mesh_is_root inside the handlers). */
+     * reach the root (ADDR_ASSIGN / ADDR_CLAIM / ALIVE / TOPOLOGY, handled via
+     * mesh_addressed_to_me / mesh_at_root inside the handlers). */
     if (mesh_is_standby() &&
         (h.type == MESH_TYPE_BEACON ||
          h.type == MESH_TYPE_JOIN_REQ ||
@@ -2529,8 +2529,8 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     case MESH_TYPE_ADDR_CLAIM:    mesh_rx_addr_claim(&h, payload, plen);   break;
     case MESH_TYPE_ADDR_ALIVE:    mesh_rx_alive(&h, payload, plen);        break;
     case MESH_TYPE_TOPOLOGY:      mesh_rx_topology(&h, payload, plen);     break;
-    case MESH_TYPE_MASTER_QUERY:  mesh_rx_master_query(&h, payload, plen);    break;
-    case MESH_TYPE_MASTER_ANNOUNCE: mesh_rx_master_announce(&h, payload, plen);break;
+    case MESH_TYPE_ROOT_QUERY:  mesh_rx_root_query(&h, payload, plen);    break;
+    case MESH_TYPE_ROOT_ANNOUNCE: mesh_rx_root_announce(&h, payload, plen);break;
     default:                                                               break;
     }
 }

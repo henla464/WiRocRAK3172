@@ -24,8 +24,8 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int config_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int receive_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int mesh_handler(SERIAL_PORT port, char *cmd, stParam *param);
-int activemaster_handler(SERIAL_PORT port, char *cmd, stParam *param);
-int standbymaster_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int activeroot_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int standbyroot_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param);
@@ -49,7 +49,7 @@ bool init_config_at(void)
 {
 
 	return api.system.atMode.add((char *)"P2P",
-								 (char *)"Configure in P2P mode. Usage: ATC+P2P=<runtime config 0|1>:<frequency>:<spreading factor>:<bandwidth>:<coding rate>:<preamble length>:<tx power>:<low data rate optimize>:<crc on>:<rx gain>:<drf1268dscompatmode>:<sendack>:<payload length>[:<mesh>:<master>:<standby>:<deviceid>]",
+								 (char *)"Configure in P2P mode. Usage: ATC+P2P=<runtime config 0|1>:<frequency>:<spreading factor>:<bandwidth>:<coding rate>:<preamble length>:<tx power>:<low data rate optimize>:<crc on>:<rx gain>:<drf1268dscompatmode>:<sendack>:<payload length>[:<mesh>:<root>:<standby>:<deviceid>]",
 								 (char *)"P2P", config_handler,
 								 RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
 }
@@ -82,13 +82,13 @@ bool init_mesh_at(void)
 								(char *)"Enable/disable LoRa mesh mode. Usage: ATC+MESH=<0|1>",
 								(char *)"MESH", mesh_handler,
 								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
-	ok &= api.system.atMode.add((char *)"ACTIVEMASTER",
-								(char *)"Set this node as the mesh master/gateway. Usage: ATC+ACTIVEMASTER=<0|1>",
-								(char *)"ACTIVEMASTER", activemaster_handler,
+	ok &= api.system.atMode.add((char *)"ACTIVEROOT",
+								(char *)"Set this node as the mesh root/gateway. Usage: ATC+ACTIVEROOT=<0|1>",
+								(char *)"ACTIVEROOT", activeroot_handler,
 								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
-	ok &= api.system.atMode.add((char *)"STANDBYMASTER",
-								(char *)"Set this node as a passive standby master (listens, forwards uplinks to the host and takes over if the active master dies). Usage: ATC+STANDBYMASTER=<0|1>",
-								(char *)"STANDBYMASTER", standbymaster_handler,
+	ok &= api.system.atMode.add((char *)"STANDBYROOT",
+								(char *)"Set this node as a passive standby root (listens, forwards uplinks to the host and takes over if the active root dies). Usage: ATC+STANDBYROOT=<0|1>",
+								(char *)"STANDBYROOT", standbyroot_handler,
 								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
 	ok &= api.system.atMode.add((char *)"MESHSTATE",
 								(char *)"Get mesh state. Usage: ATC+MESHSTATE=?",
@@ -190,24 +190,24 @@ int mesh_handler(SERIAL_PORT port, char *cmd, stParam *param)
 }
 
 /**
- * @brief Set this node as the mesh master/gateway.
- *        Usage: ATC+ACTIVEMASTER=<0|1> / ATC+ACTIVEMASTER=?
+ * @brief Set this node as the mesh root/gateway.
+ *        Usage: ATC+ACTIVEROOT=<0|1> / ATC+ACTIVEROOT=?
  */
-int activemaster_handler(SERIAL_PORT port, char *cmd, stParam *param)
+int activeroot_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if (param->argc == 1 && !strcmp(param->argv[0], "?"))
 	{
-		atcmd_printf("%s=%d", cmd, mesh_is_master() ? 1 : 0);
+		atcmd_printf("%s=%d", cmd, mesh_is_root() ? 1 : 0);
 		return AT_NO_STATUS;
 	}
 	else if (param->argc == 1)
 	{
-		uint32_t master;
-		if (0 != at_check_digital_uint32_t(param->argv[0], &master))
+		uint32_t root;
+		if (0 != at_check_digital_uint32_t(param->argv[0], &root))
 			return AT_PARAM_ERROR;
-		if (master > 1)
+		if (root > 1)
 			return AT_PARAM_ERROR;
-		mesh_set_master(master != 0);
+		mesh_set_root(root != 0);
 		mesh_config_save();
 		return AT_OK;
 	}
@@ -215,12 +215,12 @@ int activemaster_handler(SERIAL_PORT port, char *cmd, stParam *param)
 }
 
 /**
- * @brief Set this node as a passive standby master.  It transmits nothing: it
+ * @brief Set this node as a passive standby root.  It transmits nothing: it
  *        mirrors the uplinks it overhears to its host (ATC+REC) and promotes
- *        itself to active master if the active master stops answering.
- *        Usage: ATC+STANDBYMASTER=<0|1> / ATC+STANDBYMASTER=?
+ *        itself to active root if the active root stops answering.
+ *        Usage: ATC+STANDBYROOT=<0|1> / ATC+STANDBYROOT=?
  */
-int standbymaster_handler(SERIAL_PORT port, char *cmd, stParam *param)
+int standbyroot_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if (param->argc == 1 && !strcmp(param->argv[0], "?"))
 	{
@@ -280,25 +280,25 @@ int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param)
 /**
  * @brief Get mesh state. Usage: ATC+MESHSTATE=?
  *        Returns
- *        '<enabled>:<is master>:<own addr>:<txq>:<state>:<alloc>:<parent addr>:<hops>:<path cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>'
+ *        '<enabled>:<is root>:<own addr>:<txq>:<state>:<alloc>:<parent addr>:<hops>:<path cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>'
  *        with fields:
  *          - <enabled>          1 when mesh mode is on
- *          - <is master>        1 on the gateway
+ *          - <is root>        1 on the gateway
  *          - <own addr>         this node's mesh address (0 = unassigned)
  *          - <txq>              mesh transmit-queue depth -- module-generated frames
  *                               still queued for the radio, 0..8 (0 = idle; 8 = full,
  *                               so new frames are dropped)
  *          - <state>            0=unassigned 1=joining 2=joined
- *          - <alloc>            number of addresses the master has allocated
+ *          - <alloc>            number of addresses the root has allocated
  *          - <parent addr>      current parent address (0 = none)
- *          - <hops>/<path cost> route to the master
+ *          - <hops>/<path cost> route to the root
  *          - <neighbour-count>  live neighbour count
- *          - <epoch>            master's boot number (incremented on every boot; only
+ *          - <epoch>            root's boot number (incremented on every boot; only
  *                               its low 3 bits ride the beacon) as last seen by this node
  *          - <overhead%>        measured control-plane airtime as a percentage of the
  *                               data-frame airtime transmitted
  *          - <ackms>            derived per-hop ACK timeout (datarate dependent)
- *          - <standby>          1 when this node is a passive standby master (M7)
+ *          - <standby>          1 when this node is a passive standby root (M7)
  */
 int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
@@ -306,11 +306,11 @@ int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param)
 	{
 		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d", cmd,
 					 mesh_is_enabled() ? 1 : 0,
-					 mesh_is_master() ? 1 : 0,
+					 mesh_is_root() ? 1 : 0,
 					 mesh_get_address(),
 					 mesh_tx_queue_count(),
 					 (int)mesh_get_state(),
-					 mesh_master_alloc_count(),
+					 mesh_root_alloc_count(),
 					 mesh_get_parent(),
 					 mesh_get_hops(),
 					 mesh_get_path_cost(),
@@ -331,7 +331,7 @@ int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param)
  *
  *        Every node serves what it knows: its own row (live from the neighbour
  *        table) plus a row for each descendant whose report it has passed
- *        rootward.  The master node, being the root, covers the whole network;
+ *        rootward.  The root node, being the root, covers the whole network;
  *        any other node sees only the part of the tree it is on the path for.
  *        Each row is
  *        '<node addr>:<parent addr>:<btaddr>:<neighbour addr>=<link cost>,...'
@@ -341,7 +341,7 @@ int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param)
  *          - <parent addr>  that node's parent address (0 = none)
  *          - <btaddr>       that node's full 6-byte device id as 12 hex chars
  *                           (resolved for its own row by any node and for every row
- *                           by the master; six zero bytes when unknown)
+ *                           by the root; six zero bytes when unknown)
  *          - trailing list  the neighbours it hears, with their link costs
  *                           (omitted when none)
  *        Successive rows are joined with '|' on one output line; a node that
@@ -430,7 +430,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
             atcmd_printf("%d:", runtimeConfigP2P.sendack);
 			atcmd_printf("%u:", runtimeConfigP2P.payload_len);
 			atcmd_printf("%d:", mesh_is_enabled() ? 1 : 0);
-			atcmd_printf("%d:", mesh_is_master() ? 1 : 0);
+			atcmd_printf("%d:", mesh_is_root() ? 1 : 0);
 			atcmd_printf("%d", mesh_is_standby() ? 1 : 0);
         }
         else
@@ -448,7 +448,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
             atcmd_printf("%d:", service_lora_p2p_get_sendack());
 			atcmd_printf("%u:", service_lora_p2p_get_payloadlen());
 			atcmd_printf("%d:", mesh_is_enabled() ? 1 : 0);
-			atcmd_printf("%d:", mesh_is_master() ? 1 : 0);
+			atcmd_printf("%d:", mesh_is_root() ? 1 : 0);
 			atcmd_printf("%d", mesh_is_standby() ? 1 : 0);
         }
         {
@@ -476,10 +476,10 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		uint8_t o_payload_len;
         uint8_t udrv_code;
         // argv[0] is the mandatory runtime-config selector (0 = stored config).
-        // Optional trailing <mesh>:<master>:<standby>:<deviceid> parameters
+        // Optional trailing <mesh>:<root>:<standby>:<deviceid> parameters
         // (argc == 17).  The device id is the last parameter.
         bool haveMeshParams = (param->argc >= 17);
-        uint32_t mesh_enabled = 0, is_master = 0, is_standby = 0;
+        uint32_t mesh_enabled = 0, is_root = 0, is_standby = 0;
         uint8_t mesh_device_id[MESH_NODE_DEVICE_ID_LEN] = {0};
 
         // Preserve current p2p parameters
@@ -528,14 +528,14 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         {
             if (0 != at_check_digital_uint32_t(param->argv[13], &mesh_enabled))
                 return AT_PARAM_ERROR;
-            if (0 != at_check_digital_uint32_t(param->argv[14], &is_master))
+            if (0 != at_check_digital_uint32_t(param->argv[14], &is_root))
                 return AT_PARAM_ERROR;
             if (0 != at_check_digital_uint32_t(param->argv[15], &is_standby))
                 return AT_PARAM_ERROR;
-            if (mesh_enabled > 1 || is_master > 1 || is_standby > 1)
+            if (mesh_enabled > 1 || is_root > 1 || is_standby > 1)
                 return AT_PARAM_ERROR;
             // The two roles are mutually exclusive.
-            if (is_master && is_standby)
+            if (is_root && is_standby)
                 return AT_PARAM_ERROR;
             // The node device id is mandatory whenever the mesh tail is present;
             // it is the last parameter.
@@ -620,7 +620,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         if (haveMeshParams)
         {
             mesh_set_enabled(mesh_enabled != 0);
-            mesh_set_master(is_master != 0);
+            mesh_set_root(is_root != 0);
             mesh_set_standby(is_standby != 0);
             mesh_set_node_device_id(mesh_device_id);
             mesh_config_save();
@@ -661,10 +661,10 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		uint8_t o_payload_len;
         uint8_t udrv_code;
         // argv[0] is the mandatory runtime-config selector (1 = runtime config).
-        // Optional trailing <mesh>:<master>:<standby>:<deviceid> parameters
+        // Optional trailing <mesh>:<root>:<standby>:<deviceid> parameters
         // (argc == 17).  The device id is the last parameter.
         bool haveMeshParams = (param->argc >= 17);
-        uint32_t mesh_enabled = 0, is_master = 0, is_standby = 0;
+        uint32_t mesh_enabled = 0, is_root = 0, is_standby = 0;
         uint8_t mesh_device_id[MESH_NODE_DEVICE_ID_LEN] = {0};
         bool o_useRuntimeConfig = get_useRuntimeConfigP2P();
         runtimeConfigP2P_t runtimeConfigP2P;
@@ -737,14 +737,14 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         {
             if (0 != at_check_digital_uint32_t(param->argv[13], &mesh_enabled))
                 return AT_PARAM_ERROR;
-            if (0 != at_check_digital_uint32_t(param->argv[14], &is_master))
+            if (0 != at_check_digital_uint32_t(param->argv[14], &is_root))
                 return AT_PARAM_ERROR;
             if (0 != at_check_digital_uint32_t(param->argv[15], &is_standby))
                 return AT_PARAM_ERROR;
-            if (mesh_enabled > 1 || is_master > 1 || is_standby > 1)
+            if (mesh_enabled > 1 || is_root > 1 || is_standby > 1)
                 return AT_PARAM_ERROR;
             // The two roles are mutually exclusive.
-            if (is_master && is_standby)
+            if (is_root && is_standby)
                 return AT_PARAM_ERROR;
             // The node device id is mandatory whenever the mesh tail is present;
             // it is the last parameter.
@@ -819,7 +819,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         if (haveMeshParams)
         {
             mesh_set_enabled(mesh_enabled != 0);
-            mesh_set_master(is_master != 0);
+            mesh_set_root(is_root != 0);
             mesh_set_standby(is_standby != 0);
             mesh_set_node_device_id(mesh_device_id);
             mesh_config_save();
@@ -923,7 +923,7 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
 
     /* Optional leading destination address: ATC+SEND=<dest>:<hexpayload>.
      * Without a ':' the whole parameter is the payload and dest defaults to 0
-     * (legacy P2P form, and every non-master mesh node sends toward the master). */
+     * (legacy P2P form, and every non-root mesh node sends toward the root). */
     hexParam = param->argv[0];
     colon = strchr(param->argv[0], ':');
     if (colon != NULL)
@@ -952,14 +952,14 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
 
     if (mesh_is_enabled())
     {
-        if (mesh_is_master() && destAddr >= MESH_FIRST_SLAVE_ADDR)
+        if (mesh_is_root() && destAddr >= MESH_FIRST_NONROOT_ADDR)
         {
-            // Master sending to a specific node: flooded downlink.
+            // Root sending to a specific node: flooded downlink.
             sentOK = mesh_send_downlink(destAddr, lora_data, (uint8_t)(datalen / 2));
         }
         else
         {
-            // Toward the master (non-master), or to the master's own host.
+            // Toward the root (non-root), or to the root's own host.
             sentOK = mesh_send_uplink(lora_data, (uint8_t)(datalen / 2));
         }
         if (!sentOK)
@@ -1237,7 +1237,7 @@ int receive_handler(SERIAL_PORT port, char *cmd, stParam *param)
             LoraMeessage_t msg;
             if (MessageQueue_deQueue(&incomingMessageQueue, &msg))
             {
-                /* Origin's full BT address; zeros unless this node (the master,
+                /* Origin's full BT address; zeros unless this node (the root,
                  * or a standby shadowing it) can resolve the source address. */
                 uint8_t srcBt[MESH_NODE_DEVICE_ID_LEN] = {0};
                 mesh_lookup_device_id(msg.SourceAddr, srcBt);

@@ -65,9 +65,9 @@ int main(void)
     CHECK(mesh_route_link_cost(-75, 8) == 3);
     CHECK(mesh_route_link_cost(-76, 8) == 6);
 
-    /* --- prefer a good 2-hop path over a weak direct link to the master --- */
+    /* --- prefer a good 2-hop path over a weak direct link to the root --- */
     std::memset(n, 0, sizeof(n));
-    put(n, 0, MESH_MASTER_ADDR, -100, 0, 0);   /* master, weak link: 6+0 = 6  */
+    put(n, 0, MESH_ROOT_ADDR, -100, 0, 0);   /* root, weak link: 6+0 = 6  */
     put(n, 1, 5, 80, 1, 1);                     /* relay, good, cost 1: 1+1=2  */
     std::memset(&cur, 0, sizeof(cur));
     cur.parent_addr = MESH_ADDR_NONE;

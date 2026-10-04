@@ -12,7 +12,7 @@
  *     4   version  protocol version
  *     4   src      source 4-bit address
  *     4   dst      destination 4-bit address
- *     3   hops     beacon: hop-count to master; data: TTL
+ *     3   hops     beacon: hop-count to root; data: TTL
  *     5   seq      dedup key (src,seq)
  *
  *   byte0 = type<<4 | version
@@ -41,8 +41,8 @@ typedef enum {
     MESH_TYPE_ADDR_CLAIM,       /* rootward: { devid, parent }, bind addr<->devid */
     MESH_TYPE_ADDR_ALIVE,       /* single hop: { subtree_bitmap }, liveness      */
     MESH_TYPE_TOPOLOGY,         /* rootward: { parent, {addr,cost}* }, map      */
-    MESH_TYPE_MASTER_QUERY,     /* broadcast: { devid }, "who is master?", see M8 */
-    MESH_TYPE_MASTER_ANNOUNCE,  /* broadcast: { devid }, a master states its id  */
+    MESH_TYPE_ROOT_QUERY,     /* broadcast: { devid }, "who is root?", see M8 */
+    MESH_TYPE_ROOT_ANNOUNCE,  /* broadcast: { devid }, a root states its id  */
     MESH_TYPE_COUNT
 } mesh_type_t;
 

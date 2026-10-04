@@ -3,8 +3,8 @@
  *
  *  LoRa mesh mode for WiRocRAK3172.
  *
- *  Convergecast tree rooted at a single master (gateway). 4-bit addresses are
- *  assigned by the master; all nodes route their messages toward the master.
+ *  Convergecast tree rooted at a single root (gateway). 4-bit addresses are
+ *  assigned by the root; all nodes route their messages toward the root.
  *
  *  The flash-persisted configuration holds mesh enabled / role / own address
  *  and the host-provisioned 6-byte device id; the accessors here are used
@@ -23,10 +23,10 @@
 #define MESH_ADDR_MASK          0x0F
 #define MESH_ADDR_MAX           0x0F
 
-#define MESH_ADDR_NONE          0x00    /* unassigned / "default: send to master" */
-#define MESH_MASTER_ADDR        0x01    /* well-known root (gateway) address       */
-#define MESH_FIRST_SLAVE_ADDR   0x02    /* first auto-assigned slave address       */
-#define MESH_MAX_SLAVES         (MESH_ADDR_MAX - MESH_FIRST_SLAVE_ADDR + 1) /* 14 */
+#define MESH_ADDR_NONE          0x00    /* unassigned / "default: send to root" */
+#define MESH_ROOT_ADDR          0x01    /* well-known root (gateway) address    */
+#define MESH_FIRST_NONROOT_ADDR 0x02    /* first auto-assigned non-root address */
+#define MESH_MAX_NONROOT_NODES  (MESH_ADDR_MAX - MESH_FIRST_NONROOT_ADDR + 1) /* 14 */
 
 /* Broadcast is expressed as a message type, not as an address. */
 
@@ -40,7 +40,7 @@
 typedef enum {
     MESH_STATE_UNASSIGNED = 0,  /* mesh disabled                                   */
     MESH_STATE_JOINING,         /* enabled, no address yet: broadcasting JOIN_REQ  */
-    MESH_STATE_JOINED           /* has an address (or is the master)               */
+    MESH_STATE_JOINED           /* has an address (or is the root)               */
 } mesh_state_t;
 
 /* --- Persistent (flash) configuration ----------------------------------- */
@@ -50,18 +50,18 @@ typedef enum {
 #define MESH_FLASH_VERSION      0x03
 
 /* --- Lifecycle ---------------------------------------------------------- */
-/* Load persisted config (or defaults: disabled, not master, unassigned). */
+/* Load persisted config (or defaults: disabled, not root, unassigned). */
 bool mesh_init(void);
 
 /* --- Configuration accessors -------------------------------------------- */
 bool    mesh_is_enabled(void);
 void    mesh_set_enabled(bool enabled);
 
-bool    mesh_is_master(void);
-void    mesh_set_master(bool master);
+bool    mesh_is_root(void);
+void    mesh_set_root(bool root);
 
-/* A standby master is a passive observer (see "M7 standby master" below).  It is
- * mutually exclusive with the master role: setting one clears the other. */
+/* A standby root is a passive observer (see "M7 standby root" below).  It is
+ * mutually exclusive with the root role: setting one clears the other. */
 bool    mesh_is_standby(void);
 void    mesh_set_standby(bool standby);
 
@@ -76,8 +76,8 @@ void    mesh_get_node_device_id(uint8_t out[MESH_NODE_DEVICE_ID_LEN]);
 
 /* Full 6-byte device id for a mesh address, for ATC+REC / ATC+MESHTOPO to report
  * a node's origin.  Every node resolves its **own** address from its own device
- * id; the **master node** additionally resolves every other address from its
- * address <-> device-id map, and a **standby master** resolves the best-effort
+ * id; the **root node** additionally resolves every other address from its
+ * address <-> device-id map, and a **standby root** resolves the best-effort
  * shadow of that map it learns from overheard ADDR_ASSIGN / ADDR_CLAIM frames.
  * Returns false (leaving `out` untouched) for an address it cannot resolve, so
  * the caller emits six zero bytes. */
@@ -95,7 +95,7 @@ bool    mesh_config_save(void);
 /* --- M2 join / address assignment --------------------------------------- */
 #define MESH_JOIN_INTERVAL_MS   3000    /* initial JOIN_REQ period            */
 #define MESH_JOIN_INTERVAL_MAX_MS 15000 /* JOIN_REQ backoff ceiling           */
-#define MESH_TABLE_INTERVAL_MS  300000  /* master ADDR_TABLE backstop period   */
+#define MESH_TABLE_INTERVAL_MS  300000  /* root ADDR_TABLE backstop period   */
 #define MESH_TABLE_DEBOUNCE_MS  500     /* coalesce table changes into a flood */
 #define MESH_TABLE_MISS_LIMIT   3       /* misses before a node re-joins      */
 
@@ -116,13 +116,13 @@ bool    mesh_config_save(void);
 /* Join state of this node (UNASSIGNED / JOINING / JOINED). */
 mesh_state_t mesh_get_state(void);
 
-/* Number of addresses currently allocated by the master (diagnostics). */
-uint8_t mesh_master_alloc_count(void);
+/* Number of addresses currently allocated by the root (diagnostics). */
+uint8_t mesh_root_alloc_count(void);
 
 /* Routing diagnostics. */
 uint8_t mesh_get_parent(void);          /* current parent address (0 = none)  */
-uint8_t mesh_get_hops(void);            /* hop-count to the master            */
-uint8_t mesh_get_path_cost(void);       /* cost to the master                 */
+uint8_t mesh_get_hops(void);            /* hop-count to the root            */
+uint8_t mesh_get_path_cost(void);       /* cost to the root                 */
 uint8_t mesh_get_neighbor_count(void);  /* live neighbours                    */
 
 /* Running control-plane overhead since enable, in percent of the data-frame
@@ -130,8 +130,8 @@ uint8_t mesh_get_neighbor_count(void);  /* live neighbours                    */
  * Diagnostic for the narrowband (31.25 kHz) 10% budget. */
 uint16_t mesh_get_overhead_pct(void);
 
-/* Enqueue a WiRoc payload toward the master (non-master) or to the local host
- * (master). Returns false when there is no route / the frame is too large. */
+/* Enqueue a WiRoc payload toward the root (non-root) or to the local host
+ * (root). Returns false when there is no route / the frame is too large. */
 bool    mesh_send_uplink(const uint8_t *payload, uint8_t len);
 
 /* --- M4 MAC / downlink -------------------------------------------------- */
@@ -157,7 +157,7 @@ bool    mesh_send_uplink(const uint8_t *payload, uint8_t len);
 #define MESH_TX_FAST_MS          10     /* base delay before an immediate drain */
 #define MESH_TX_FAST_JITTER_MS   30     /* random extra, decorrelates forwarders */
 
-/* Master only: flood a payload down to a specific node (0 on failure). */
+/* Root only: flood a payload down to a specific node (0 on failure). */
 bool    mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len);
 
 /* Derived per-hop ACK timeout (ms) for the current datarate: ~2x the airtime
@@ -169,8 +169,8 @@ uint32_t mesh_get_link_ack_timeout_ms(void);
 #define MESH_BEACON_FAST_MS      1000   /* beacon period while (re)attaching  */
 #define MESH_ALIVE_INTERVAL_MS   300000 /* relay liveness aggregate period    */
 #define MESH_ALIVE_CHILD_HOLD_MS 610000 /* drop a silent child from our agg   */
-#define MESH_EVICT_MS            610000 /* master frees a silent node's addr  */
-#define MESH_RECOVER_MS          10000  /* master defers new allocs after boot*/
+#define MESH_EVICT_MS            610000 /* root frees a silent node's addr  */
+#define MESH_RECOVER_MS          10000  /* root defers new allocs after boot*/
 /* Node liveness monitor (a node at depth >= 2): re-claim if our parent's
  * liveness aggregate has not carried us for this long.  1.5x the aggregate
  * interval absorbs normal jitter while still beating the 610 s eviction
@@ -197,54 +197,54 @@ typedef struct {
 /* Topology map: number of rows available and the row at `index` (0-based).
  * Returns false when `index` is out of range.  Every node serves what it knows:
  * its own row (live from the neighbour table) plus a row for each descendant
- * whose report it has passed rootward -- the master node, being the root, sees
+ * whose report it has passed rootward -- the root node, being the root, sees
  * every report and so covers the whole network; any other node sees only the
  * part of the tree it is on the path for.  Rows age out after MESH_TOPO_HOLD_MS. */
 uint8_t mesh_topo_row_count(void);
 bool    mesh_topo_row(uint8_t index, mesh_topo_row_t *out);
 
-/* --- M7 standby master -------------------------------------------------- */
-/* A standby master is a "shadow root" placed within earshot of the active
- * master and of the master's direct children.  It transmits nothing -- every
+/* --- M7 standby root -------------------------------------------------- */
+/* A standby root is a "shadow root" placed within earshot of the active
+ * root and of the root's direct children.  It transmits nothing -- every
  * transmit path funnels through a single silence gate -- but otherwise mirrors
- * the master: it absorbs the rootward control frames that reach the master on
+ * the root: it absorbs the rootward control frames that reach the root on
  * their final hop (ADDR_ASSIGN / ADDR_CLAIM / ADDR_ALIVE / TOPOLOGY) to shadow
- * the master's address <-> device-id map and topology, and it mirrors the uplink
- * payloads it overhears to its host (ATC+REC) exactly as the master delivers the
- * uplinks it receives.  If the master stops answering it promotes itself to
- * master (address 1, fresh boot epoch), after which the nodes re-claim and
+ * the root's address <-> device-id map and topology, and it mirrors the uplink
+ * payloads it overhears to its host (ATC+REC) exactly as the root delivers the
+ * uplinks it receives.  If the root stops answering it promotes itself to
+ * root (address 1, fresh boot epoch), after which the nodes re-claim and
  * rebuild the tree.
  *
  * Liveness is probed on the application-layer ACK only.  After overhearing an
  * uplink the standby expects a DATA_DOWNLINK addressed back to that uplink's
  * origin within MESH_STANDBY_PROBE_MS; a LINK_ACK does not count (a direct child
- * of the master gets none), so this also catches a master whose host has hung
+ * of the root gets none), so this also catches a root whose host has hung
  * while its radio still beacons.  Only uplinks heard at >= MESH_STANDBY_MIN_SNR
  * are probed, one probe is in flight at a time (so a node's two quick uplinks are
  * not two independent trials), and the misses must span MESH_STANDBY_MIN_WINDOW_MS
  * (longer than a normal reboot) before the takeover fires.  Any frame from the
- * master refreshes the backstop; MESH_STANDBY_BACKSTOP_MS of silence also
+ * root refreshes the backstop; MESH_STANDBY_BACKSTOP_MS of silence also
  * promotes (this covers an idle network and a standby booting into a dead one). */
 #define MESH_STANDBY_PROBE_MS        5000    /* wait for the app ACK after an uplink */
 #define MESH_STANDBY_MISS_LIMIT      2       /* consecutive unacked uplinks -> dead  */
 #define MESH_STANDBY_MIN_WINDOW_MS   70000   /* misses must span at least this long  */
-#define MESH_STANDBY_BACKSTOP_MS     270000  /* no master frame -> dead (3x beacon)  */
+#define MESH_STANDBY_BACKSTOP_MS     270000  /* no root frame -> dead (3x beacon)  */
 #define MESH_STANDBY_MIN_SNR         (-6)    /* only probe uplinks heard at least this
                                               * well (dB) */
 
-/* --- M8 master conflict (lowest device id wins) ------------------------- */
-/* A master that (re)boots does not serve immediately: it broadcasts a
- * MASTER_QUERY carrying its device id and listens for MESH_MASTER_QUERY_WINDOW_MS
- * for a rival master.  A rival answers with MASTER_ANNOUNCE (its id), or stands
+/* --- M8 root conflict (lowest device id wins) ------------------------- */
+/* A root that (re)boots does not serve immediately: it broadcasts a
+ * ROOT_QUERY carrying its device id and listens for MESH_ROOT_QUERY_WINDOW_MS
+ * for a rival root.  A rival answers with ROOT_ANNOUNCE (its id), or stands
  * down if it is junior (higher id).  "Lowest device id wins" is a total order
- * every node computes identically, so exactly one master survives and no
- * tie-break is needed -- this turns the old "two masters coexist until a manual
+ * every node computes identically, so exactly one root survives and no
+ * tie-break is needed -- this turns the old "two roots coexist until a manual
  * fix" split-brain into an automatic, bounded resolution. */
-#define MESH_MASTER_QUERY_WINDOW_MS  1000   /* booting master listens this long  */
-#define MESH_MASTER_QUERY_RETRY_MS   300    /* ... re-broadcasting the query every */
+#define MESH_ROOT_QUERY_WINDOW_MS  1000   /* booting root listens this long  */
+#define MESH_ROOT_QUERY_RETRY_MS   300    /* ... re-broadcasting the query every */
                                             /*     this long while contending     */
 
-/* Master boot epoch last heard (0 while unknown). */
+/* Root boot epoch last heard (0 while unknown). */
 uint16_t mesh_get_epoch(void);
 
 /* Parse an incoming mesh frame (already gated on mesh_is_enabled() by caller).
