@@ -77,8 +77,10 @@ void    mesh_get_node_device_id(uint8_t out[MESH_NODE_DEVICE_ID_LEN]);
 /* Full 6-byte device id for a mesh address, for ATC+REC / ATC+MESHTOPO to report
  * a node's origin.  Every node resolves its **own** address from its own device
  * id; the **master node** additionally resolves every other address from its
- * address <-> device-id map.  Returns false (leaving `out` untouched) for an
- * address it cannot resolve, so the caller emits six zero bytes. */
+ * address <-> device-id map, and a **standby master** resolves the best-effort
+ * shadow of that map it learns from overheard ADDR_ASSIGN / ADDR_CLAIM frames.
+ * Returns false (leaving `out` untouched) for an address it cannot resolve, so
+ * the caller emits six zero bytes. */
 bool    mesh_lookup_device_id(uint8_t addr, uint8_t out[MESH_NODE_DEVICE_ID_LEN]);
 
 /* Persist the current configuration to flash. */
@@ -159,7 +161,7 @@ bool    mesh_send_uplink(const uint8_t *payload, uint8_t len);
 bool    mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len);
 
 /* Derived per-hop ACK timeout (ms) for the current datarate: ~2x the airtime
- * of a maximum-length data frame. Reported by ATC+MESHMAP. */
+ * of a maximum-length data frame. Reported by ATC+MESHSTATE. */
 uint32_t mesh_get_link_ack_timeout_ms(void);
 
 /* --- M5 recovery / robustness ------------------------------------------- */
@@ -202,12 +204,16 @@ uint8_t mesh_topo_row_count(void);
 bool    mesh_topo_row(uint8_t index, mesh_topo_row_t *out);
 
 /* --- M7 standby master -------------------------------------------------- */
-/* A standby master is a passive observer placed within earshot of the active
- * master and of the master's direct children.  It transmits nothing: it mirrors
- * the uplink payloads it overhears to its host (ATC+REC) exactly as the master
- * delivers the uplinks it receives, and -- if the master stops answering -- it
- * promotes itself to master (address 1, fresh boot epoch), after which the nodes
- * re-claim and rebuild the tree.
+/* A standby master is a "shadow root" placed within earshot of the active
+ * master and of the master's direct children.  It transmits nothing -- every
+ * transmit path funnels through a single silence gate -- but otherwise mirrors
+ * the master: it absorbs the rootward control frames that reach the master on
+ * their final hop (ADDR_ASSIGN / ADDR_CLAIM / ADDR_ALIVE / TOPOLOGY) to shadow
+ * the master's address <-> device-id map and topology, and it mirrors the uplink
+ * payloads it overhears to its host (ATC+REC) exactly as the master delivers the
+ * uplinks it receives.  If the master stops answering it promotes itself to
+ * master (address 1, fresh boot epoch), after which the nodes re-claim and
+ * rebuild the tree.
  *
  * Liveness is probed on the application-layer ACK only.  After overhearing an
  * uplink the standby expects a DATA_DOWNLINK addressed back to that uplink's

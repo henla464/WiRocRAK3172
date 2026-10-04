@@ -37,7 +37,7 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
 | `ATC+ACTIVEMASTER=<0\|1>` | Designate this node as the active master node / gateway (persisted). `ATC+ACTIVEMASTER?` reads it. |
 | `ATC+STANDBYMASTER=<0\|1>` | Designate this node as a passive standby master (persisted). `ATC+STANDBYMASTER?` reads it. |
 | `ATC+MESHNODEDEVICEID=<12 hex>` | Set the 6-byte node device id (persisted). `ATC+MESHNODEDEVICEID?` reads it back. |
-| `ATC+MESHMAP=?` | Diagnostics (see below). |
+| `ATC+MESHSTATE=?` | Diagnostics (see below). |
 | `ATC+MESHTOPO=?` | Dump the topology map this node knows, one line with rows separated by `|` (see below). |
 | `ATC+P2P=<runcfg>:...,[:<mesh>:<master>:<standby>:<deviceid>]` | Mesh flags and node device id as trailing params of the P2P config command. |
 
@@ -52,40 +52,55 @@ per node. It rides only the `JOIN_REQ` / `ADDR_ASSIGN` / `ADDR_CLAIM` control
 frames, never the data frames.
 
 **`ATC+P2P` layout.** The runtime-config selector is the **first parameter and
-is mandatory** (`0` = use the flash-stored config, `1` = use the runtime config);
-the 12 radio parameters follow, then the optional mesh tail. `ATC+P2P=?` returns
-the same layout -- its first field is the active selector -- so the query output
-can be fed straight back as a set command.
+is mandatory**; the 12 radio parameters follow, then the optional mesh tail.
+`ATC+P2P=?` returns the same layout -- its first field is the active selector --
+so the query output can be fed straight back as a set command.
 
 | argc | params |
 |------|--------|
 | 13 | `<runcfg>` + 12 radio params |
 | 17 | `<runcfg>` + 12 radio params + `<mesh>:<master>:<standby>:<deviceid>` |
 
-`<runcfg>` is a single digit at `argv[0]`; the 12 radio parameters are unchanged
-from the legacy `ATC+P2P`. In the mesh tail the **device id is the last
-parameter**; `<master>` and `<standby>` are 0/1 flags and are **mutually
-exclusive** (sending both as 1 is rejected with `AT_PARAM_ERROR`). Any other
-argument count is rejected. (Mesh can also be enabled and its roles/id
-set with the standalone `ATC+MESH` / `ATC+ACTIVEMASTER` / `ATC+STANDBYMASTER` /
-`ATC+MESHNODEDEVICEID` commands, which is how a node changes one field without
-resending the whole P2P config.)
+with fields:
 
-`ATC+MESHMAP=?` returns
-`MESHMAP=<enabled>:<is master>:<own addr>:<txq>:<state>:<alloc>:<parent addr>:<hops>:<path cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>`
-where `enabled` is `1` when mesh mode is on, `is master` is `1` on the gateway;
-`own addr` is this node's mesh address (`0` = unassigned); `txq` is the mesh
-**transmit-queue depth** -- module-generated frames still queued for the radio,
-`0..8` (`0` = idle; `8` = full, so new frames are dropped); `state` is `0`=unassigned,
-`1`=joining, `2`=joined; `alloc` is the number of
-addresses the master node has handed out; `parent addr` is the current next hop (`0`=none);
-`hops`/`path cost` are the route to the master node; `neighbour-count` is the live neighbour
-count; `epoch` is the master node's **boot number** -- a counter the master node increments
-on every boot -- as last seen by this node (only its low 3 bits are advertised;
-see *Recovery*); `overhead%` is the measured control-plane airtime as a
-percentage of the data-frame airtime transmitted; `ackms` is the derived
-per-hop ACK timeout for the current datarate; and `standby` is `1` when this node
-is a passive standby master (see *Standby master* below).
+* `<runcfg>` -- runtime-config selector, a single digit at `argv[0]`: `0` = use the
+  flash-stored config, `1` = use the runtime config.
+* 12 radio params -- unchanged from the legacy `ATC+P2P`.
+* `<mesh>` -- mesh enable flag (`0`/`1`).
+* `<master>` -- active master node / gateway flag (`0`/`1`).
+* `<standby>` -- passive standby master flag (`0`/`1`).
+* `<deviceid>` -- 6-byte node device id (12 hex chars); the **last** parameter.
+
+`<master>` and `<standby>` are **mutually exclusive** (sending both as 1 is rejected
+with `AT_PARAM_ERROR`). Any other argument count is rejected. (Mesh can also be
+enabled and its roles/id set with the standalone `ATC+MESH` / `ATC+ACTIVEMASTER` /
+`ATC+STANDBYMASTER` / `ATC+MESHNODEDEVICEID` commands, which is how a node changes
+one field without resending the whole P2P config.)
+
+`ATC+MESHSTATE=?` returns
+
+```
+MESHSTATE=<enabled>:<is master>:<own addr>:<txq>:<state>:<alloc>:<parent addr>:<hops>:<path cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>
+```
+
+with fields:
+
+* `<enabled>` -- `1` when mesh mode is on.
+* `<is master>` -- `1` on the gateway.
+* `<own addr>` -- this node's mesh address (`0` = unassigned).
+* `<txq>` -- mesh **transmit-queue depth**: module-generated frames still queued for
+  the radio, `0..8` (`0` = idle; `8` = full, so new frames are dropped).
+* `<state>` -- `0`=unassigned, `1`=joining, `2`=joined.
+* `<alloc>` -- number of addresses the master node has handed out.
+* `<parent addr>` -- current next hop (`0`=none).
+* `<hops>` / `<path cost>` -- route to the master node.
+* `<neighbour-count>` -- live neighbour count.
+* `<epoch>` -- master node's **boot number** (a counter the master node increments on
+  every boot; only its low 3 bits are advertised, see *Recovery*) as last seen by this node.
+* `<overhead%>` -- measured control-plane airtime as a percentage of the data-frame
+  airtime transmitted.
+* `<ackms>` -- derived per-hop ACK timeout for the current datarate.
+* `<standby>` -- `1` when this node is a passive standby master (see *Standby master* below).
 
 `ATC+MESHTOPO=?` returns the topology map **this node** knows, as a single line
 with one entry per known node, entries separated by `|`:
@@ -94,14 +109,17 @@ with one entry per known node, entries separated by `|`:
 ATC+MESHTOPO=<node addr>:<parent addr>:<btaddr>[:<neighbour addr>=<link cost>,...]|<node addr>:<parent addr>:<btaddr>[:...]|...
 ```
 
-`node addr` is the node the entry describes (the device's own address for its own
-row, a descendant's for a row it passed rootward), `parent addr` is that node's
-parent address (`0` = none), `btaddr` is that node's full 48-bit device id (12 hex
-chars, MSB first) -- a node always resolves its own, and the **master node**
-resolves every address from its address <-> device-id map, so on any other node
-only its own row carries a non-zero `btaddr` -- and the trailing list is the
-neighbours it hears as `<neighbour addr>=<link cost>` (omitted when none). A node
-that knows no rows returns the empty reply `ATC+MESHTOPO=`. Every
+with fields:
+
+* `<node addr>` -- the node the entry describes (the device's own address for its own
+  row, a descendant's for a row it passed rootward).
+* `<parent addr>` -- that node's parent address (`0` = none).
+* `<btaddr>` -- that node's full 48-bit device id (12 hex chars, MSB first): a node
+  always resolves its own, and the **master node** resolves every address from its
+  address <-> device-id map, so on any other node only its own row carries a non-zero `btaddr`.
+* trailing list -- the neighbours it hears as `<neighbour addr>=<link cost>` (omitted when none).
+
+A node that knows no rows returns the empty reply `ATC+MESHTOPO=`. Every
 node serves its **own** row (live from its neighbour table) plus a row for each
 **descendant** whose report it has passed rootward, so the master node -- being the
 root -- covers the whole network while any other node sees only the part of the
@@ -127,12 +145,16 @@ Addresses travel in the AT interface, so the host is updated in lock-step:
   binary: OK + data + rssiH + rssiL + snr + status + srcaddr + btaddr(6)
   ```
 
-  `srcaddr` is the mesh source of the delivered frame (the node that injected it);
-  in P2P mode it is `0`. `btaddr` is that node's full 48-bit device id (12 hex
-  chars, MSB first). **Only the master node can resolve it** -- it holds the
-  address <-> device-id map (`mesh_lookup_device_id`) -- so on a non-master, on
-  the standby master, and in P2P mode `btaddr` is six zero bytes. The master node
-  uses `srcaddr` to learn which node to ACK.
+  with fields:
+
+  * `srcaddr` -- mesh source of the delivered frame (the node that injected it);
+    `0` in P2P mode.
+  * `btaddr` -- that node's full 48-bit device id (12 hex chars, MSB first).
+    **Only a root node can resolve it for another address** -- the active master
+    holds the authoritative address <-> device-id map, and a **standby master**
+    holds a best-effort shadow of it (see *Standby master*); both resolve via
+    `mesh_lookup_device_id`. On any other node (and in P2P mode) it is six zero
+    bytes. The master node uses `srcaddr` to learn which node to ACK.
 
 ## Wire format
 
@@ -143,27 +165,24 @@ as the sanity gate). The header is **3 bytes** (24 bits, no waste), MSB-first:
 | bits | field | notes |
 |------|-------|-------|
 | 4 | type | message type, `0`-`9` (see **Message types** below) |
-| 1 | flags | reserved; always `0` today (see **Header flags**) |
+| 4 | version | protocol version (currently `4`) |
 | 4 | src | source address (0-15) |
 | 4 | dst | destination (0-15; also carries the assigned address / acked origin) |
 | 3 | hops | beacon: hop-count to the master node; data: TTL (max 4) |
 | 5 | seq | dedup key `(src,seq)`, 32-value window |
-| 3 | version | protocol version (currently `3`) |
 
 ```
-byte0 = type<<4 | flags<<3 | src>>1
-byte1 = (src&1)<<7 | dst<<3 | hops
-byte2 = seq<<3 | version
+byte0 = type<<4 | version
+byte1 = src<<4  | dst
+byte2 = hops<<5 | seq
 ```
 
-**Header flags.** The 1-bit `flags` field is **reserved and always `0`** today.
-There is no "ack requested" flag: the master node answers a delivered uplink with an
-explicit `LINK_ACK` when it has no next hop whose forward it could overhear the way a
-relay node does -- except when the sender is a **direct child** of the master, whose
-single hop is confirmed by the application-layer ACK instead, so no `LINK_ACK` is
-spent on it. The only defined bit, `HAS_PATH` (0x01), is a
-reserved hook for carrying an explicit source path in the payload instead of
-relying on per-hop routing state; encoders send `0` and receivers ignore it.
+`type` and `version` share the **first byte**, and `src` and `dst` the **second**,
+so each address field sits on a nibble boundary. There is no "ack requested" flag:
+the master node answers a delivered uplink with an explicit `LINK_ACK` when it has
+no next hop whose forward it could overhear the way a relay node does -- except
+when the sender is a **direct child** of the master, whose single hop is confirmed
+by the application-layer ACK instead, so no `LINK_ACK` is spent on it.
 
 The WiRoc payload follows verbatim and is stripped of the header before delivery to
 the host. Control beacons carry a **1-byte** control payload after the header:
@@ -343,7 +362,7 @@ whose mesh MAC does **not** retransmit (a lost hop is recovered by the applicati
 retry, not the link layer). This trades one `LINK_ACK` frame per direct-child uplink
 for relying on the app ACK at a latency the single hop makes negligible. The timeout is **derived from the datarate**: it is
 `~2x` the airtime of the frame being sent plus one timer tick, floored at 500 ms
-(reported as `ackms` by `ATC+MESHMAP?`).
+(reported as `ackms` by `ATC+MESHSTATE?`).
 
 Per-hop ACKs are *not* a liveness mechanism (a quiet node is indistinguishable from
 a dead one); liveness is beacon-driven, and the end-to-end WiRoc ACK is
@@ -474,11 +493,27 @@ the uplinks it receives), and **auto-promotes** itself to active master if the
 active master stops answering. The standby role and the active-master role are
 mutually exclusive (`ATC+ACTIVEMASTER=1` clears standby and vice-versa).
 
+**Shadow state.** Apart from staying silent, the standby runs the same root-side
+logic as the active master. Because every rootward flow converges on the master,
+a standby placed in earshot of the master overhears the **final hop** of each one
+and absorbs it, shadowing the master's state:
+
+* `ADDR_ASSIGN` and `ADDR_CLAIM` -- the address <-> device-id bindings, so its
+  `ATC+REC` / `ATC+MESHTOPO` report the origin's `btaddr` like the master's; and
+* `TOPOLOGY` and `ADDR_ALIVE` -- the node/link graph and liveness aggregates.
+
+Silence is enforced at a single gate (the only radio-send call site), so this
+costs **no channel load** and needs no per-path checks. The shadow map is
+best-effort: a standby only learns the bindings it overhears while running, so a
+node that attached before the standby booted shows a zero `btaddr` until it
+re-claims (which it does on the next master restart or epoch change).
+
 **Placement.** Put the standby within earshot of the active master *and* of the
 master's direct children -- there it hears every uplink as it converges on the
-master, plus the master's own responses. The forwarding and the failure detection
-both depend on that: a standby that can hear uplinks but not the master's
-downlinks cannot distinguish "the master is dead" from "I am out of range".
+master, plus the master's own responses. The forwarding, the shadow state, and the
+failure detection all depend on that: a standby that can hear uplinks but not the
+master's downlinks cannot distinguish "the master is dead" from "I am out of
+range".
 
 **Liveness probe.** The standby judges the master alive on the **application-layer
 ACK only** -- the downlink the master's host sends back to an uplink's origin
@@ -510,7 +545,7 @@ throughput figures elsewhere in this document are unchanged by its presence.
 every node detects the change, re-adopts its address and re-claims -- the new master
 rebuilds its RAM-only allocator from those claims, then routes and delivers
 uplinks as any master does. The promotion is persisted, so it survives a power
-cycle. The `ATC+MESHMAP` field `standby` reports the role.
+cycle. The `ATC+MESHSTATE` field `standby` reports the role.
 
 ## Tunables
 
@@ -627,7 +662,7 @@ the master node hop-by-hop (flooding only when a node is route-less) instead of 
 `O(N)` of a flood, and the **aggregated `ADDR_ALIVE`** collapses per-node liveness into
 one single-hop subtree bitmap per **relay** node (a leaf sends nothing), so the liveness
 plane is `O(F)` transmissions per round independent of tree depth. The host can
-**measure** the resulting ratio live via `ATC+MESHMAP?` (`overhead%`). The header and
+**measure** the resulting ratio live via `ATC+MESHSTATE?` (`overhead%`). The header and
 the per-uplink ACK are proportional terms (one per data frame), so they set a floor on
 this ratio.
 
@@ -804,7 +839,7 @@ relay-count terms (beacons, aggregates, table flood) dominate -- the two optima 
 A flood reversed this relation, because the ACK then cost one frame per relay node.
 Steering the ACK along the subtree bitmaps removes that term with no wire change: the
 bitmaps are already on air in the `ADDR_ALIVE` aggregates, so no reverse source-route
-(`HAS_PATH`) is needed.
+is needed.
 
 ### Realistic throughput (store-and-forward included)
 
@@ -867,7 +902,7 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
 | `mesh_wire.h` / `mesh_wire.cpp` | pure 3-byte header codec (host-tested) |
 | `mesh_alloc.h` / `mesh_alloc.cpp` | pure master-node address allocator (host-tested) |
 | `mesh_route.h` / `mesh_route.cpp` | pure link metric + parent selection (host-tested) |
-| `custom_at.cpp` | AT integration (`MESH`/`ACTIVEMASTER`/`STANDBYMASTER`/`MESHMAP`/`MESHTOPO`, `SEND`/`REC`) |
+| `custom_at.cpp` | AT integration (`MESH`/`ACTIVEMASTER`/`STANDBYMASTER`/`MESHSTATE`/`MESHTOPO`, `SEND`/`REC`) |
 | `MessageQueue.h` | `SourceAddr` carried from RX to `ATC+REC` |
 | `test/` | host `g++` unit tests for the pure modules |
 
@@ -883,7 +918,7 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
   `ATC+SEND` arrives at the master node's `ATC+REC` with `srcaddr` = its own address; an
   app-level ACK sent back with `ATC+SEND=<addr>:...` reaches it.
 * **Narrowband**: run two devices at `ATC+P2P=0:<freq>:<sf>:7:<cr>:...` (31.25 kHz) for SF5
-  and SF8; verify join, uplink, downlink, and that `ATC+MESHMAP?` reports the derived
+  and SF8; verify join, uplink, downlink, and that `ATC+MESHSTATE?` reports the derived
   `ackms` and the measured `overhead%`.
 * **Lab, multi-hop**: three nodes in a line with the far one out of the master node's
   range -> it reaches the master node through the middle relay node; perturb SNR and confirm
@@ -900,7 +935,7 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
   intervals. Reboot a non-master node -> it keeps / re-joins its address.
 * **Standby master**: set `ATC+STANDBYMASTER=1` on a node placed near the master node
   and confirm (a) it forwards the uplink traffic to its own `ATC+REC`, (b) it emits
-  nothing (sniff; no beacon/join), (c) `ATC+MESHMAP?` reports `standby=1` while
+  nothing (sniff; no beacon/join), (c) `ATC+MESHSTATE?` reports `standby=1` while
   `ACTIVEMASTER`/address are 0, and (d) it does **not** promote while the master node
   answers. Power off the master node: confirm it keeps forwarding for
   `MESH_STANDBY_MIN_WINDOW_MS` and then promotes (epoch bump), and the other nodes
@@ -949,7 +984,7 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
   node was deaf is caught by the `ADDR_TABLE` bitmap miss (the node sees its bit clear
   for `MESH_TABLE_MISS_LIMIT` floods and re-joins), not by a periodic claim.
 * Downlink is steered along the tree by the `ADDR_ALIVE` subtree bitmaps rather than a
-  recorded reverse source-route (the `HAS_PATH` flag stays reserved). The steer is
+  recorded reverse source-route. The steer is
   best-effort: it needs the bitmaps to be current, so a node whose parent has not yet
   reported it -- e.g. a relay node that just rebooted and has not heard a silent leaf
   child re-claim -- is unreachable by downlink until the next aggregate or re-join; the

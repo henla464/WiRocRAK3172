@@ -26,7 +26,7 @@ int receive_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int mesh_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int activemaster_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int standbymaster_handler(SERIAL_PORT port, char *cmd, stParam *param);
-int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param);
 void send_cb(void);
@@ -90,9 +90,9 @@ bool init_mesh_at(void)
 								(char *)"Set this node as a passive standby master (listens, forwards uplinks to the host and takes over if the active master dies). Usage: ATC+STANDBYMASTER=<0|1>",
 								(char *)"STANDBYMASTER", standbymaster_handler,
 								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
-	ok &= api.system.atMode.add((char *)"MESHMAP",
-								(char *)"Get mesh state. Usage: ATC+MESHMAP=?",
-								(char *)"MESHMAP", meshmaps_handler,
+	ok &= api.system.atMode.add((char *)"MESHSTATE",
+								(char *)"Get mesh state. Usage: ATC+MESHSTATE=?",
+								(char *)"MESHSTATE", meshstate_handler,
 								RAK_ATCMD_PERM_READ);
 	ok &= api.system.atMode.add((char *)"MESHTOPO",
 								(char *)"Get the topology map this node knows. Usage: ATC+MESHTOPO=?",
@@ -278,25 +278,29 @@ int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param)
 }
 
 /**
- * @brief Get mesh state. Usage: ATC+MESHMAP=?
+ * @brief Get mesh state. Usage: ATC+MESHSTATE=?
  *        Returns
  *        '<enabled>:<is master>:<own addr>:<txq>:<state>:<alloc>:<parent addr>:<hops>:<path cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>'
- *        where <enabled> is 1 when mesh mode is on, <is master> is 1 on the
- *        gateway, <own addr> is this node's mesh address (0 = unassigned) and
- *        <txq> is the mesh transmit-queue depth -- module-generated frames still
- *        queued for the radio, 0..8 (0 = idle; 8 = full, so new frames dropped).
- *        <state> is 0=unassigned 1=joining 2=joined, <alloc> is the number
- *        of addresses the master has allocated, <parent addr> is the current parent
- *        address (0 = none), <hops>/<path cost> are the route to the master,
- *        <neighbour-count> is the live neighbour count, <epoch> is the master's
- *        boot number (incremented on every boot; only its low 3 bits ride the
- *        beacon) as last seen by this node,
- *        <overhead%> is the measured control-plane airtime as a percentage of
- *        the data-frame airtime transmitted, <ackms> is the derived per-hop
- *        ACK timeout (datarate dependent) and <standby> is 1 when this node is
- *        a passive standby master (M7).
+ *        with fields:
+ *          - <enabled>          1 when mesh mode is on
+ *          - <is master>        1 on the gateway
+ *          - <own addr>         this node's mesh address (0 = unassigned)
+ *          - <txq>              mesh transmit-queue depth -- module-generated frames
+ *                               still queued for the radio, 0..8 (0 = idle; 8 = full,
+ *                               so new frames are dropped)
+ *          - <state>            0=unassigned 1=joining 2=joined
+ *          - <alloc>            number of addresses the master has allocated
+ *          - <parent addr>      current parent address (0 = none)
+ *          - <hops>/<path cost> route to the master
+ *          - <neighbour-count>  live neighbour count
+ *          - <epoch>            master's boot number (incremented on every boot; only
+ *                               its low 3 bits ride the beacon) as last seen by this node
+ *          - <overhead%>        measured control-plane airtime as a percentage of the
+ *                               data-frame airtime transmitted
+ *          - <ackms>            derived per-hop ACK timeout (datarate dependent)
+ *          - <standby>          1 when this node is a passive standby master (M7)
  */
-int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
+int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if ((param->argc == 1 && !strcmp(param->argv[0], "?")) || param->argc == 0)
 	{
@@ -331,13 +335,15 @@ int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
  *        any other node sees only the part of the tree it is on the path for.
  *        Each row is
  *        '<node addr>:<parent addr>:<btaddr>:<neighbour addr>=<link cost>,...'
- *        where <node addr> is the node the row describes (your own address, or a
- *        descendant's whose report passed through you), <parent addr> is that
- *        node's parent address (0 = none), <btaddr> is that node's full 6-byte
- *        device id as 12 hex chars (resolved for its own row by any node and for
- *        every row by the master; six zero bytes when unknown), and the trailing
- *        list is the neighbours it hears, with their link costs (omitted when
- *        none).
+ *        with fields:
+ *          - <node addr>    the node the row describes (your own address, or a
+ *                           descendant's whose report passed through you)
+ *          - <parent addr>  that node's parent address (0 = none)
+ *          - <btaddr>       that node's full 6-byte device id as 12 hex chars
+ *                           (resolved for its own row by any node and for every row
+ *                           by the master; six zero bytes when unknown)
+ *          - trailing list  the neighbours it hears, with their link costs
+ *                           (omitted when none)
  *        Successive rows are joined with '|' on one output line; a node that
  *        knows no rows prints the empty reply 'ATC+MESHTOPO='.  A row ages out
  *        after MESH_TOPO_HOLD_MS; the reports are best-effort, refreshed
@@ -1231,8 +1237,8 @@ int receive_handler(SERIAL_PORT port, char *cmd, stParam *param)
             LoraMeessage_t msg;
             if (MessageQueue_deQueue(&incomingMessageQueue, &msg))
             {
-                /* Origin's full BT address; zeros unless this node (the master)
-                 * can resolve the source address. */
+                /* Origin's full BT address; zeros unless this node (the master,
+                 * or a standby shadowing it) can resolve the source address. */
                 uint8_t srcBt[MESH_NODE_DEVICE_ID_LEN] = {0};
                 mesh_lookup_device_id(msg.SourceAddr, srcBt);
                 atcmd_printf("OK");

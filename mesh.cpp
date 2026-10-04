@@ -202,12 +202,14 @@ static uint8_t  s_topo_cost[MESH_ADDR_MAX + 1][MESH_ADDR_MAX + 1]; /* link cost 
 static bool     s_topo_due;
 static uint32_t s_topo_next_ms;
 
-/* --- M7: standby master (passive observer) ----------------------------- */
-/* A standby transmits nothing.  It mirrors overheard uplinks to its host and,
- * if the active master stops answering, promotes itself (see the M7 section).
- * s_master_alive_ms is refreshed by every frame from the master and drives the
- * backstop; the probe tracks one overheard uplink at a time, expecting the
- * application ACK (a downlink back to the origin) within PROBE_MS. */
+/* --- M7: standby master (silent shadow root) --------------------------- */
+/* A standby transmits nothing (single silence gate in mesh_tx_radio_send).  It
+ * otherwise mirrors the master: it shadows the address <-> device-id map and
+ * topology from the rootward control frames it overhears, mirrors uplinks to its
+ * host, and -- if the active master stops answering -- promotes itself (see the
+ * M7 section).  s_master_alive_ms is refreshed by every frame from the master and
+ * drives the backstop; the probe tracks one overheard uplink at a time, expecting
+ * the application ACK (a downlink back to the origin) within PROBE_MS. */
 static bool     s_master_seen;      /* a master frame has been heard (gates probe)*/
 static uint32_t s_master_alive_ms;  /* last frame heard from the master         */
 static bool     s_probe_active;     /* an uplink probe is in flight             */
@@ -395,6 +397,13 @@ static bool mesh_tx_radio_send(const uint8_t *frame, uint8_t len)
     mesh_header_t h;
     uint32_t air;
 
+    /* THE silence guarantee: a passive standby never puts anything on air.
+     * Every transmit path funnels through here (the only api.lora.psend caller),
+     * so this single gate is what makes the observer silent -- regardless of
+     * which RX handlers or housekeeping it runs. */
+    if (mesh_is_standby()) {
+        return false;
+    }
     if (!api.lora.psend(len, (uint8_t *)frame, true)) {
         return false;
     }
@@ -447,8 +456,7 @@ static void mesh_tx_schedule(void)
 {
     uint32_t now, delay;
 
-    if (s_tx_fast_armed || !mesh_is_enabled() || mesh_is_standby() ||
-        s_txq_count == 0) {
+    if (s_tx_fast_armed || !mesh_is_enabled() || s_txq_count == 0) {
         return;
     }
     now = millis();
@@ -482,11 +490,12 @@ static void mesh_timer_cb(void *)
 
     now = millis();
 
-    /* Standby master (M7): observe only -- never emit a beacon or join, and run
-     * the liveness detector instead of the master / node branches below. */
+    /* Standby master (M7): a silent shadow root.  Run its liveness detector,
+     * then fall through the common flow -- a standby is not the master, so it
+     * skips the master-only housekeeping below; anything it would transmit is
+     * dropped by the silence gate. */
     if (mesh_is_standby()) {
         mesh_standby_tick(now);
-        return;
     }
 
     /* Beacons: the master and every routable node advertise periodically so
@@ -858,6 +867,26 @@ void mesh_set_address(uint8_t address)
     s_cfg.address = (uint8_t)(address & MESH_ADDR_MASK);
 }
 
+/* The active master and a passive standby both maintain the master-owned tables
+ * (address <-> device-id map, topology, liveness): a standby is a "shadow root"
+ * that mirrors the master's state without transmitting (mesh_tx_radio_send drops
+ * every frame it would send). */
+static bool mesh_is_root(void)
+{
+    return mesh_is_master() || mesh_is_standby();
+}
+
+/* True when a frame's header `dst` addresses this node.  A standby additionally
+ * treats the master's well-known address as its own, so it absorbs the rootward
+ * traffic that reaches the master on its final hop (claims, liveness aggregates,
+ * topology reports) even though it holds no address of its own. */
+static bool mesh_addressed_to_me(uint8_t dst)
+{
+    return dst != MESH_ADDR_NONE &&
+           (dst == mesh_get_address() ||
+            (mesh_is_standby() && dst == MESH_MASTER_ADDR));
+}
+
 bool mesh_has_node_device_id(void)
 {
     for (uint8_t i = 0; i < MESH_NODE_DEVICE_ID_LEN; i++) {
@@ -897,8 +926,9 @@ bool mesh_lookup_device_id(uint8_t addr, uint8_t out[MESH_NODE_DEVICE_ID_LEN])
         mesh_get_node_device_id(out);
         return true;
     }
-    /* Only the master holds the address <-> device-id map for the rest. */
-    if (!mesh_is_master()) {
+    /* The active master holds the full map; a standby holds a best-effort shadow
+     * of it (learned from overheard ADDR_ASSIGN / ADDR_CLAIM frames). */
+    if (!mesh_is_root()) {
         return false;
     }
     return mesh_alloc_device_id(addr, out);
@@ -912,6 +942,9 @@ bool mesh_send_frame(const uint8_t *frame, uint8_t len)
 {
     mesh_header_t h;
 
+    if (mesh_is_standby()) {
+        return false;                   /* an observer enqueues nothing (never transmits) */
+    }
     if (!mesh_is_enabled() || len == 0 || len > MESH_MAX_FRAME) {
         return false;
     }
@@ -955,7 +988,7 @@ uint8_t mesh_master_alloc_count(void)
 /* ======================================================================= */
 
 /* Build a frame (header + optional control payload) into out; return length. */
-static uint8_t mesh_build_frame(uint8_t *out, uint8_t type, uint8_t flags,
+static uint8_t mesh_build_frame(uint8_t *out, uint8_t type,
                                 uint8_t src, uint8_t dst, uint8_t hops, uint8_t seq,
                                 const uint8_t *payload, uint8_t plen)
 {
@@ -963,7 +996,6 @@ static uint8_t mesh_build_frame(uint8_t *out, uint8_t type, uint8_t flags,
 
     h.version = MESH_WIRE_VERSION;
     h.type    = type;
-    h.flags   = flags;
     h.src     = src;
     h.dst     = dst;
     h.hops    = hops;
@@ -991,7 +1023,7 @@ static bool mesh_send_flood(uint8_t type, uint8_t dst, uint8_t hops,
     uint8_t len;
 
     s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x1F);
-    len = mesh_build_frame(frame, type, 0, mesh_get_address(), dst, hops, seq,
+    len = mesh_build_frame(frame, type, mesh_get_address(), dst, hops, seq,
                            payload, plen);
     mesh_mark_seen(type, mesh_get_address(), seq, payload);
     return mesh_send_frame(frame, len);
@@ -1012,7 +1044,7 @@ static void mesh_relay_flood(const mesh_header_t *h, const uint8_t *payload, uin
     if (h->hops <= 1) {
         return;                         /* TTL exhausted */
     }
-    flen = mesh_build_frame(frame, h->type, h->flags, h->src, h->dst,
+    flen = mesh_build_frame(frame, h->type, h->src, h->dst,
                             (uint8_t)(h->hops - 1), h->seq, payload, plen);
     mesh_mark_seen(h->type, h->src, h->seq, payload);
     mesh_send_frame(frame, flen);
@@ -1094,6 +1126,15 @@ static void mesh_rx_addr_assign(const mesh_header_t *h, const uint8_t *payload, 
         return;
     }
     addr = (uint8_t)(h->dst & MESH_ADDR_MASK);
+    if (mesh_is_standby()) {
+        /* Shadow root: learn the master's address <-> device-id binding from the
+         * assignment it overhears (payload = device id, header dst = address).
+         * Record only -- never transmit, so the flood is not relayed. */
+        if (addr >= MESH_FIRST_SLAVE_ADDR && addr <= MESH_ADDR_MAX) {
+            mesh_alloc_claim(payload, addr);
+        }
+        return;
+    }
     if (!mesh_is_master()) {
         if (memcmp(payload, s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN) == 0) {
             if (addr >= MESH_FIRST_SLAVE_ADDR) {
@@ -1459,7 +1500,7 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
     }
     seq = s_data_seq;
     s_data_seq = (uint8_t)((s_data_seq + 1) & 0x1F);
-    flen = mesh_build_frame(frame, MESH_TYPE_DATA_UPLINK, 0,
+    flen = mesh_build_frame(frame, MESH_TYPE_DATA_UPLINK,
                             mesh_get_address(), s_route.parent_addr,
                             MESH_DEFAULT_TTL, seq, payload, len);
 
@@ -1507,7 +1548,7 @@ static void mesh_send_link_ack(uint8_t acked_src, uint8_t acked_seq)
     uint8_t flen;
 
     payload[0] = acked_seq;
-    flen = mesh_build_frame(frame, MESH_TYPE_LINK_ACK, 0, mesh_get_address(),
+    flen = mesh_build_frame(frame, MESH_TYPE_LINK_ACK, mesh_get_address(),
                             acked_src, 0, 0, payload, 1);
     mesh_send_frame(frame, flen);
 }
@@ -1553,7 +1594,7 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
     if (h->hops <= 1 || s_route.parent_addr == MESH_ADDR_NONE) {
         return;                         /* TTL exhausted / no route */
     }
-    flen = mesh_build_frame(frame, MESH_TYPE_DATA_UPLINK, h->flags, h->src,
+    flen = mesh_build_frame(frame, MESH_TYPE_DATA_UPLINK, h->src,
                             s_route.parent_addr, (uint8_t)(h->hops - 1), h->seq,
                             payload, plen);
     if (mesh_send_frame(frame, flen)) {
@@ -1625,7 +1666,7 @@ bool mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len)
     }
     seq = s_data_seq;
     s_data_seq = (uint8_t)((s_data_seq + 1) & 0x1F);
-    flen = mesh_build_frame(frame, MESH_TYPE_DATA_DOWNLINK, 0, mesh_get_address(),
+    flen = mesh_build_frame(frame, MESH_TYPE_DATA_DOWNLINK, mesh_get_address(),
                             dst, MESH_DEFAULT_TTL, seq, payload, len);
     mesh_mark_seen(MESH_TYPE_DATA_DOWNLINK, mesh_get_address(), seq, payload);
 
@@ -1752,7 +1793,7 @@ static void mesh_send_claim(void)
         /* Rootward unicast to the parent. */
         seq = s_bcast_seq;
         s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x1F);
-        flen = mesh_build_frame(frame, MESH_TYPE_ADDR_CLAIM, 0,
+        flen = mesh_build_frame(frame, MESH_TYPE_ADDR_CLAIM,
                                 mesh_get_address(), s_route.parent_addr,
                                 MESH_DEFAULT_TTL, seq, claim, sizeof(claim));
         mesh_send_frame(frame, flen);
@@ -1795,7 +1836,7 @@ static void mesh_send_topology(void)
     }
     seq = s_bcast_seq;
     s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x1F);
-    flen = mesh_build_frame(frame, MESH_TYPE_TOPOLOGY, 0, mesh_get_address(),
+    flen = mesh_build_frame(frame, MESH_TYPE_TOPOLOGY, mesh_get_address(),
                             s_route.parent_addr, MESH_DEFAULT_TTL, seq,
                             payload, plen);
     mesh_send_frame(frame, flen);
@@ -1850,7 +1891,7 @@ static void mesh_send_alive(void)
     payload[1] = (uint8_t)(bm >> 8);
     seq = s_bcast_seq;
     s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x1F);
-    flen = mesh_build_frame(frame, MESH_TYPE_ALIVE, 0,
+    flen = mesh_build_frame(frame, MESH_TYPE_ALIVE,
                             mesh_get_address(), s_route.parent_addr,
                             MESH_DEFAULT_TTL, seq, payload, 2);
     mesh_send_frame(frame, flen);
@@ -1873,25 +1914,39 @@ static void mesh_forward_rootward(const mesh_header_t *h,
         /* We cannot forward rootward right now: fall back to a flood (origin's
          * src preserved, dst cleared) so the message can still reach the master
          * via another path. */
-        flen = mesh_build_frame(frame, h->type, 0, h->src,
+        flen = mesh_build_frame(frame, h->type, h->src,
                                 MESH_ADDR_NONE, (uint8_t)(h->hops - 1), h->seq,
                                 payload, plen);
         mesh_send_frame(frame, flen);
         return;
     }
-    flen = mesh_build_frame(frame, h->type, 0, h->src,
+    flen = mesh_build_frame(frame, h->type, h->src,
                             s_route.parent_addr, (uint8_t)(h->hops - 1), h->seq,
                             payload, plen);
     mesh_send_frame(frame, flen);       /* best effort; no pending retry */
 }
 
-/* Handle an incoming ADDR_CLAIM.  The master applies it to its table; an
- * intermediate node forwards a rootward unicast one hop toward its parent (or
- * converts it to a flood if it has lost its own parent); the flooded fallback
- * is relayed by everyone. */
+/* Handle an incoming ADDR_CLAIM.  The master applies it to its table; a standby
+ * records the binding (shadow root); an intermediate node forwards a rootward
+ * unicast one hop toward its parent (or converts it to a flood if it has lost its
+ * own parent); the flooded fallback is relayed by everyone. */
 static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     if (plen < MESH_NODE_DEVICE_ID_LEN) {
+        return;
+    }
+
+    if (mesh_is_standby()) {
+        /* Shadow root: learn the address <-> device-id binding (device id in the
+         * payload, the node's own address in header `src`) and the tree edge,
+         * without allocating or responding -- that is the active master's job. */
+        uint8_t addr = (uint8_t)(h->src & MESH_ADDR_MASK);
+        if (addr >= MESH_FIRST_SLAVE_ADDR && addr <= MESH_ADDR_MAX) {
+            mesh_alloc_claim(payload, addr);
+            if (plen >= MESH_NODE_DEVICE_ID_LEN + 1) {
+                mesh_topo_note_parent(addr, payload[MESH_NODE_DEVICE_ID_LEN]);
+            }
+        }
         return;
     }
 
@@ -1906,7 +1961,7 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
     }
 
     /* Rootward unicast: only the addressed next hop acts. */
-    if (h->dst != mesh_get_address()) {
+    if (!mesh_addressed_to_me(h->dst)) {
         return;                         /* not addressed to us */
     }
     if (mesh_is_master()) {
@@ -1960,7 +2015,7 @@ static void mesh_apply_topology(uint8_t src, const uint8_t *payload, uint8_t ple
  * its rootward path absorbs it -- so the master node learns the whole graph and
  * a relay learns its own subtree -- and a non-master forwards it one hop toward
  * its parent.  The flooded fallback (a relay that lost its own parent) is
- * absorbed only by the master (everyone else would pollute its map with nodes
+ * absorbed only by a root (everyone else would pollute its map with nodes
  * that are not its descendants) and relayed by everyone. */
 static void mesh_rx_topology(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
@@ -1968,19 +2023,19 @@ static void mesh_rx_topology(const mesh_header_t *h, const uint8_t *payload, uin
         return;
     }
     if (h->dst == MESH_ADDR_NONE) {
-        if (mesh_is_master()) {
+        if (mesh_is_root()) {
             mesh_apply_topology(h->src, payload, plen);
         }
         mesh_relay_flood(h, payload, plen);
         return;
     }
-    if (h->dst != mesh_get_address()) {
-        return;                         /* not addressed to us */
+    if (!mesh_addressed_to_me(h->dst)) {
+        return;                         /* not addressed to us (or our shadow root) */
     }
     /* We are a hop on the reporter's rootward path: absorb its row. */
     mesh_apply_topology(h->src, payload, plen);
-    if (mesh_is_master()) {
-        return;
+    if (mesh_is_root()) {
+        return;                         /* the root does not forward; a standby is silent */
     }
     mesh_forward_rootward(h, payload, plen);
 }
@@ -2068,21 +2123,22 @@ static void mesh_monitor_alive(const mesh_header_t *h,
 
 /* Handle an incoming ADDR_ALIVE: a single-hop subtree-liveness aggregate
  * addressed to us (its parent).  We never forward it.
- *   - master: book liveness for every address the child reported alive (so the
- *     eviction loop sees the whole subtree refreshed, not just the header src),
- *     record the sender as a known direct child, and remember which direct child
- *     covers each address (s_cover) for subtree-scoped eviction.
+ *   - root (the master, or a standby shadowing it): book liveness for every
+ *     address the child reported alive (so the eviction loop sees the whole
+ *     subtree refreshed, not just the header src), record the sender as a known
+ *     direct child, and remember which direct child covers each address (s_cover)
+ *     for subtree-scoped eviction.
  *   - relay: remember this child's subtree bitmap for our own next aggregate. */
 static void mesh_rx_alive(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     uint16_t bm;
     uint8_t  c;
 
-    if (h->dst != mesh_get_address()) {
+    if (!mesh_addressed_to_me(h->dst)) {
         /* Not addressed to us.  If it is our parent's own aggregate (a unicast
          * to our grandparent) we overhear it to monitor whether we are still
          * covered upstream (see mesh_monitor_alive). */
-        if (!mesh_is_master() && h->src == s_route.parent_addr) {
+        if (!mesh_is_root() && h->src == s_route.parent_addr) {
             mesh_monitor_alive(h, payload, plen);
         }
         return;                         /* single-hop aggregate: only the parent acts */
@@ -2093,7 +2149,7 @@ static void mesh_rx_alive(const mesh_header_t *h, const uint8_t *payload, uint8_
     bm = (uint16_t)(payload[0] | ((uint16_t)payload[1] << 8));
     c  = h->src;
 
-    if (mesh_is_master()) {
+    if (mesh_is_root()) {
         uint32_t now = millis();
         if (c < MESH_FIRST_SLAVE_ADDR || c > MESH_ADDR_MAX) {
             return;
@@ -2252,15 +2308,15 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
         }
     }
 
-    if (mesh_is_standby()) {
-        /* Passive observer (M7): dispatch only the two data types and return.
-         * Routing / forwarding handlers are skipped entirely so a standby can
-         * never enqueue a frame for the timer to transmit -- it stays silent. */
-        if (h.type == MESH_TYPE_DATA_UPLINK) {
-            mesh_rx_data_uplink(&h, payload, plen);
-        } else if (h.type == MESH_TYPE_DATA_DOWNLINK) {
-            mesh_rx_data_downlink(&h, payload, plen);
-        }
+    /* A standby master (M7) is a silent shadow root, not a routing node: it
+     * skips the join / neighbour / routing control types entirely and only
+     * observes -- it delivers data and absorbs the rootward control frames that
+     * reach the master (ADDR_ASSIGN / ADDR_CLAIM / ALIVE / TOPOLOGY, handled via
+     * mesh_addressed_to_me / mesh_is_root inside the handlers). */
+    if (mesh_is_standby() &&
+        (h.type == MESH_TYPE_BEACON ||
+         h.type == MESH_TYPE_JOIN_REQ ||
+         h.type == MESH_TYPE_ADDR_TABLE)) {
         return;
     }
 

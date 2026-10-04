@@ -12,33 +12,32 @@ int main()
 {
     /* --- Exhaustive round-trip over every field range --- */
     for (unsigned type = 0; type < MESH_TYPE_COUNT; ++type)
-    for (unsigned flags = 0; flags < 2; ++flags)
+    for (unsigned ver = 0; ver < 16; ++ver)
     for (unsigned src = 0; src < 16; ++src)
     for (unsigned dst = 0; dst < 16; ++dst)
     for (unsigned hops = 0; hops < 8; ++hops)
-    for (unsigned seq = 0; seq < 32; ++seq)
-    for (unsigned ver = 0; ver < 8; ++ver) {
-        mesh_header_t in { (uint8_t)ver, (uint8_t)type, (uint8_t)flags,
+    for (unsigned seq = 0; seq < 32; ++seq) {
+        mesh_header_t in { (uint8_t)type, (uint8_t)ver,
                            (uint8_t)src, (uint8_t)dst, (uint8_t)hops, (uint8_t)seq };
         uint8_t buf[MESH_HEADER_SIZE];
         mesh_wire_encode(buf, &in);
         mesh_header_t out;
         mesh_wire_decode(buf, &out);
-        if (out.version != in.version || out.type != in.type || out.flags != in.flags ||
+        if (out.version != in.version || out.type != in.type ||
             out.src != in.src || out.dst != in.dst || out.hops != in.hops || out.seq != in.seq) {
-            std::printf("FAIL rt type=%u flags=%u src=%u dst=%u hops=%u seq=%u ver=%u\n",
-                        type, flags, src, dst, hops, seq, ver);
+            std::printf("FAIL rt type=%u ver=%u src=%u dst=%u hops=%u seq=%u\n",
+                        type, ver, src, dst, hops, seq);
             return 1;
         }
     }
-    std::printf("round-trip: OK (16,777,216 combinations)\n");
+    std::printf("round-trip: OK (4,194,304 combinations)\n");
 
     /* --- Known bit vector (guards the exact bit layout) --- */
-    mesh_header_t h { MESH_WIRE_VERSION, MESH_TYPE_DATA_UPLINK,
-                      0, 5, 1, 2, 3 };
+    mesh_header_t h { MESH_TYPE_DATA_UPLINK, MESH_WIRE_VERSION,
+                      5, 1, 2, 3 };
     uint8_t b[MESH_HEADER_SIZE];
     mesh_wire_encode(b, &h);
-    assert(b[0] == 0x42 && b[1] == 0x8A && b[2] == 0x1B);
+    assert(b[0] == 0x44 && b[1] == 0x51 && b[2] == 0x43);
     std::printf("known vector: OK (%02X %02X %02X)\n", b[0], b[1], b[2]);
 
     /* --- Path length packing (4-bit addresses: ceil(n/2) bytes) --- */
