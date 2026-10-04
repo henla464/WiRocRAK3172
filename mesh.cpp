@@ -149,7 +149,10 @@ static uint32_t s_tx_backoff_ms;                /* current backoff window      *
 static uint32_t s_rand_state;                   /* xorshift PRNG state         */
 static bool     s_tx_fast_armed;                /* fast-drain one-shot is armed */
 
-/* Last unicast frame awaiting an implicit hop ACK (M4). */
+/* Last unicast frame awaiting a hop ACK (M4).  One slot per direction: a relay
+ * in the middle of the tree can have an uplink and a downlink in flight at the
+ * same time. */
+enum { MESH_PEND_UP = 0, MESH_PEND_DOWN, MESH_PEND_N };
 typedef struct {
     bool     active;
     uint8_t  frame[MESH_MAX_FRAME];
@@ -159,7 +162,7 @@ typedef struct {
     uint8_t  retries;
     uint32_t next_ms;
 } mesh_pending_t;
-static mesh_pending_t s_pending;
+static mesh_pending_t s_pending[MESH_PEND_N];
 
 /* --- M5: recovery / robustness ----------------------------------------- */
 static uint16_t s_boot_epoch;       /* master: this boot's epoch              */
@@ -320,7 +323,7 @@ static void mesh_state_clear(void)
     if (s_rand_state == 0) {
         s_rand_state = 0x1234567u;
     }
-    memset(&s_pending, 0, sizeof(s_pending));
+    memset(s_pending, 0, sizeof(s_pending));
 
     mesh_refresh_radio_params();
 
@@ -1071,17 +1074,28 @@ static bool mesh_send_broadcast(uint8_t type, uint8_t hops,
     return mesh_send_flood(type, MESH_ADDR_NONE, hops, payload, plen);
 }
 
+/* Rewrite a flooded frame to travel one hop further out, into `frame`; false
+ * when the TTL is spent and there is nothing left to relay. */
+static bool mesh_relay_frame(const mesh_header_t *h, const uint8_t *payload, uint8_t plen,
+                             uint8_t frame[MESH_MAX_FRAME], uint8_t *flen)
+{
+    if (h->hops <= 1) {
+        return false;
+    }
+    *flen = mesh_build_frame(frame, h->type, h->src, h->dst,
+                             (uint8_t)(h->hops - 1), h->seq, payload, plen);
+    return true;
+}
+
 /* Re-broadcast a flooded control frame once, decrementing the TTL. */
 static void mesh_relay_flood(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     uint8_t frame[MESH_MAX_FRAME];
     uint8_t flen;
 
-    if (h->hops <= 1) {
+    if (!mesh_relay_frame(h, payload, plen, frame, &flen)) {
         return;                         /* TTL exhausted */
     }
-    flen = mesh_build_frame(frame, h->type, h->src, h->dst,
-                            (uint8_t)(h->hops - 1), h->seq, payload, plen);
     mesh_mark_seen(h->type, h->src, h->seq, payload);
     mesh_send_frame(frame, flen);
 }
@@ -1492,29 +1506,36 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
 
 /* Remember a unicast frame so the timer can retransmit it if the next hop
  * does not visibly forward it (implicit ACK) within the timeout. */
-static void mesh_set_pending(const uint8_t *frame, uint8_t len, uint8_t src, uint8_t seq)
+static void mesh_set_pending(uint8_t slot, const uint8_t *frame, uint8_t len,
+                             uint8_t src, uint8_t seq)
 {
-    memcpy(s_pending.frame, frame, len);
-    s_pending.len     = len;
-    s_pending.src     = src;
-    s_pending.seq     = seq;
-    s_pending.retries = 0;
-    s_pending.active  = true;
-    s_pending.next_ms = millis() + mesh_link_ack_timeout_for(len);
+    mesh_pending_t *p = &s_pending[slot];
+
+    memcpy(p->frame, frame, len);
+    p->len     = len;
+    p->src     = src;
+    p->seq     = seq;
+    p->retries = 0;
+    p->active  = true;
+    p->next_ms = millis() + mesh_link_ack_timeout_for(len);
 }
 
 static void mesh_pending_tick(uint32_t now)
 {
-    if (!s_pending.active || (int32_t)(now - s_pending.next_ms) < 0) {
-        return;
+    for (uint8_t slot = 0; slot < MESH_PEND_N; slot++) {
+        mesh_pending_t *p = &s_pending[slot];
+
+        if (!p->active || (int32_t)(now - p->next_ms) < 0) {
+            continue;
+        }
+        if (p->retries >= MESH_LINK_RETRIES) {
+            p->active = false;          /* give up; the app-layer ACK covers it */
+            continue;
+        }
+        mesh_send_frame(p->frame, p->len);
+        p->retries++;
+        p->next_ms = now + mesh_link_ack_timeout_for(p->len);
     }
-    if (s_pending.retries >= MESH_LINK_RETRIES) {
-        s_pending.active = false;       /* give up; the app-layer ACK covers it */
-        return;
-    }
-    mesh_send_frame(s_pending.frame, s_pending.len);
-    s_pending.retries++;
-    s_pending.next_ms = now + mesh_link_ack_timeout_for(s_pending.len);
 }
 
 bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
@@ -1553,7 +1574,7 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
      * Its single hop is instead confirmed by the application-layer ACK, so it
      * arms nothing here and the mesh MAC does not retransmit. */
     if (s_route.parent_addr != MESH_MASTER_ADDR) {
-        mesh_set_pending(frame, flen, mesh_get_address(), seq);
+        mesh_set_pending(MESH_PEND_UP, frame, flen, mesh_get_address(), seq);
     }
     return true;
 }
@@ -1635,7 +1656,7 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
                             payload, plen);
     if (mesh_send_frame(frame, flen)) {
         /* Wait for our parent to forward it (implicit ACK); retry otherwise. */
-        mesh_set_pending(frame, flen, h->src, h->seq);
+        mesh_set_pending(MESH_PEND_UP, frame, flen, h->src, h->seq);
     }
 }
 
@@ -1708,18 +1729,36 @@ bool mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len)
 
     /* Host-originated: one immediate attempt; a busy channel goes back to the
      * host as a busy status (it owns the backoff / resend). */
-    return mesh_tx_radio_send(frame, flen);
+    if (!mesh_tx_radio_send(frame, flen)) {
+        return false;
+    }
+    /* Arm the hop ACK so a lost hop is retried by the mesh MAC (implicit link
+     * ACK), the mirror of mesh_send_uplink.  A direct child is the exception:
+     * that link is a single hop, so losing it costs the same to retry end to
+     * end, and the target sends no LINK_ACK for it (see mesh_rx_data_downlink);
+     * arming here would only spend MESH_LINK_RETRIES retransmissions that
+     * nothing can confirm. */
+    if (mesh_child_for(dst) != dst) {
+        mesh_set_pending(MESH_PEND_DOWN, frame, flen, mesh_get_address(), seq);
+    }
+    return true;
 }
 
 /* Node: a downlink is steered down the tree.  The target delivers it to its
  * host; every other node relays it one hop further only when a child's subtree
  * bitmap covers the target, i.e. only the branch that leads to the target ever
  * re-broadcasts.  A node off that branch stays silent, so the frame follows a
- * single path of length depth(target) instead of flooding.  It is best-effort
- * (no per-hop retry, since the target emits no forward the last relay could
- * overhear); the host resends if no application-layer ACK comes back. */
+ * single path of length depth(target) instead of flooding.  Every hop of that
+ * path is then retried on its own: a relay clears its pending by overhearing the
+ * next hop's forward, and the target -- which has no next hop -- clears its
+ * parent's with an explicit LINK_ACK.  That recovers a lost hop with one
+ * retransmission instead of the origin's whole uplink-and-downlink round trip,
+ * which is what the application-layer ACK would otherwise take. */
 static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
+    uint8_t frame[MESH_MAX_FRAME];
+    uint8_t flen;
+
     if (mesh_is_standby()) {
         /* The application ACK we are waiting for is a downlink from the master
          * back to the origin of the probed uplink: a live, responsive master.
@@ -1732,13 +1771,27 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
     }
     if (h->dst == mesh_get_address()) {
         mesh_deliver_to_host(payload, plen, h->src);
+        /* The path ends here, so there is no next hop whose forward our parent
+         * could overhear; we ack the final hop ourselves, the mirror of the
+         * master acking an uplink it terminated.  A direct child of the master
+         * sees the full TTL (no relay touched the frame) and is skipped: that
+         * hop is the master's own and it did not arm it (mesh_send_downlink). */
+        if (h->hops < MESH_DEFAULT_TTL) {
+            mesh_send_link_ack(h->src, h->seq);
+        }
         return;
     }
     if (mesh_is_master()) {
         return;                         /* the master originates downlinks */
     }
-    if (mesh_child_for(h->dst) != MESH_ADDR_NONE) {
-        mesh_relay_flood(h, payload, plen);
+    if (mesh_child_for(h->dst) != MESH_ADDR_NONE &&
+        mesh_relay_frame(h, payload, plen, frame, &flen)) {
+        mesh_mark_seen(h->type, h->src, h->seq, payload);
+        if (mesh_send_frame(frame, flen)) {
+            /* Wait for the next hop to carry it on (implicit ACK) -- or, when
+             * the next hop *is* the target, for the target's LINK_ACK. */
+            mesh_set_pending(MESH_PEND_DOWN, frame, flen, h->src, h->seq);
+        }
     }
 }
 
@@ -2406,21 +2459,19 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     payload = buf + MESH_HEADER_SIZE;
     plen    = (uint8_t)(len - MESH_HEADER_SIZE);
 
-    /* Link ACK (checked before dedup): clear our in-flight frame when we hear
-     * it forwarded (same origin+seq, addressed elsewhere) or explicitly acked
-     * by the master, which has no next hop to forward to. */
-    if (s_pending.active) {
-        uint8_t ack_src = 0xFF, ack_seq = 0xFF;
-        if (h.type == MESH_TYPE_DATA_UPLINK) {
-            ack_src = h.src;
-            ack_seq = h.seq;
-        } else if (h.type == MESH_TYPE_LINK_ACK && plen >= 1) {
-            ack_src = h.dst;            /* acked origin is in the header dst */
-            ack_seq = payload[0];
-        }
-        if (ack_src == s_pending.src && ack_seq == s_pending.seq &&
-            (h.type == MESH_TYPE_LINK_ACK || h.dst != mesh_get_address())) {
-            s_pending.active = false;
+    /* Link ACK (checked before dedup): clear an in-flight frame when we hear it
+     * carried on, or -- when it has no next hop left to be carried to --
+     * explicitly acked by whoever terminates it.  Both directions ack alike (see
+     * mesh_wire_ack_key); a pending is matched on the origin it is keyed to, so
+     * an uplink's ACK can never clear a downlink's pending or vice versa. */
+    for (uint8_t slot = 0; slot < MESH_PEND_N; slot++) {
+        mesh_pending_t *pend = &s_pending[slot];
+        uint8_t ack_src, ack_seq;
+
+        if (pend->active &&
+            mesh_wire_ack_key(&h, payload, plen, mesh_get_address(), &ack_src, &ack_seq) &&
+            ack_src == pend->src && ack_seq == pend->seq) {
+            pend->active = false;
         }
     }
 
@@ -2474,7 +2525,7 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     case MESH_TYPE_ADDR_TABLE:    mesh_rx_addr_table(&h, payload, plen);   break;
     case MESH_TYPE_DATA_UPLINK:   mesh_rx_data_uplink(&h, payload, plen);  break;
     case MESH_TYPE_DATA_DOWNLINK: mesh_rx_data_downlink(&h, payload, plen);break;
-    case MESH_TYPE_LINK_ACK:      /* implicit ACK only (M4) */             break;
+    case MESH_TYPE_LINK_ACK:      /* cleared the pending above; nothing else */ break;
     case MESH_TYPE_ADDR_CLAIM:    mesh_rx_addr_claim(&h, payload, plen);   break;
     case MESH_TYPE_ALIVE:         mesh_rx_alive(&h, payload, plen);        break;
     case MESH_TYPE_TOPOLOGY:      mesh_rx_topology(&h, payload, plen);     break;

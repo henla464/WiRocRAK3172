@@ -54,6 +54,47 @@ int main()
     assert(mesh_wire_path_bytes(16) == 8);
     std::printf("path bytes: OK\n");
 
+    /* --- Hop-level ACK keying: which received frame clears which pending --- */
+    {
+        uint8_t ack_src, ack_seq;
+        uint8_t pl[1] = { 0 };
+        mesh_header_t f;
+
+        /* A relay at 3 holding an in-flight uplink from origin 5 clears it when
+         * it hears the next hop carry the frame on -- same origin, addressed
+         * onward (to 2), not back to us. */
+        f = mesh_header_t{ MESH_TYPE_DATA_UPLINK, MESH_WIRE_VERSION, 5, 2, 2, 11 };
+        assert(mesh_wire_ack_key(&f, pl, 1, 3, &ack_src, &ack_seq) &&
+               ack_src == 5 && ack_seq == 11);
+
+        /* Our own copy of that uplink (addressed to us) confirms nothing. */
+        f.dst = 3;
+        assert(!mesh_wire_ack_key(&f, pl, 1, 3, &ack_src, &ack_seq));
+
+        /* A downlink is acked the same way, and its origin is the master (1),
+         * never a slave -- so the two directions cannot clear each other. */
+        f = mesh_header_t{ MESH_TYPE_DATA_DOWNLINK, MESH_WIRE_VERSION, 1, 9, 3, 4 };
+        assert(mesh_wire_ack_key(&f, pl, 1, 7, &ack_src, &ack_seq) &&
+               ack_src == 1 && ack_seq == 4);
+
+        /* A LINK_ACK acks the origin named in its header dst, read from its
+         * payload byte -- and counts even when we are the one addressed (an
+         * uplink origin hears the master's ACK for its own frame directly). */
+        f = mesh_header_t{ MESH_TYPE_LINK_ACK, MESH_WIRE_VERSION, 1, 2, 0, 0 };
+        pl[0] = 19;
+        assert(mesh_wire_ack_key(&f, pl, 1, 2, &ack_src, &ack_seq) &&
+               ack_src == 2 && ack_seq == 19);
+
+        /* A LINK_ACK missing its payload byte acks nothing. */
+        assert(!mesh_wire_ack_key(&f, pl, 0, 2, &ack_src, &ack_seq));
+
+        /* Control frames carry no hop ACK at all. */
+        f = mesh_header_t{ MESH_TYPE_BEACON, MESH_WIRE_VERSION, 5, 0, 1, 2 };
+        assert(!mesh_wire_ack_key(&f, pl, 1, 3, &ack_src, &ack_seq));
+
+        std::printf("ack key: OK\n");
+    }
+
     std::printf("ALL TESTS PASSED\n");
     return 0;
 }

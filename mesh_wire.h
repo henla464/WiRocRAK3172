@@ -24,6 +24,7 @@
 #define INC_MESH_WIRE_H_
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define MESH_WIRE_VERSION   1
 #define MESH_HEADER_SIZE    3
@@ -62,5 +63,17 @@ void mesh_wire_decode(const uint8_t in[MESH_HEADER_SIZE], mesh_header_t *h);
 
 /* Bytes required to pack an `n`-address (4-bit) source route: ceil(4n/8) = ceil(n/2). */
 uint8_t mesh_wire_path_bytes(uint8_t n);
+
+/* The frame's hop-level acknowledgement, if it carries one: write the (origin,
+ * seq) it confirms to `ack_src`/`ack_seq` and return true, else return false.
+ *
+ * A data frame is confirmed by the next hop carrying it on, which is heard as
+ * the same origin and seq addressed somewhere else; our own copy (addressed to
+ * us) is not a forward.  A LINK_ACK is confirmed by whoever the path ends at:
+ * it names the origin of the frame it acks in the header dst and carries that
+ * frame's seq as its only payload byte, so it counts even when addressed to us.
+ */
+bool mesh_wire_ack_key(const mesh_header_t *h, const uint8_t *payload, uint8_t plen,
+                       uint8_t self_addr, uint8_t *ack_src, uint8_t *ack_seq);
 
 #endif /* INC_MESH_WIRE_H_ */

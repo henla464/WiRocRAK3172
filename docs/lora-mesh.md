@@ -179,10 +179,12 @@ byte2 = hops<<5 | seq
 
 `type` and `version` share the **first byte**, and `src` and `dst` the **second**,
 so each address field sits on a nibble boundary. There is no "ack requested" flag:
-the master node answers a delivered uplink with an explicit `LINK_ACK` when it has
-no next hop whose forward it could overhear the way a relay node does -- except
-when the sender is a **direct child** of the master, whose single hop is confirmed
-by the application-layer ACK instead, so no `LINK_ACK` is spent on it.
+whoever the frame **terminates** at answers it with an explicit `LINK_ACK` when it
+has no next hop whose forward it could overhear the way a relay node does -- the
+master node for an uplink, the target for a downlink. When the master is the other
+end of that hop (a **direct child**, the one case that crossed no relay), no
+`LINK_ACK` is spent: the single hop is confirmed by the application-layer ACK
+instead.
 
 The WiRoc payload follows verbatim and is stripped of the header before delivery to
 the host. Control beacons carry a **1-byte** control payload after the header:
@@ -230,8 +232,8 @@ header is **not** repeated in the payload (header-field reuse).
 | 2 | `ADDR_ASSIGN` | 9 | flooded | `devid[6]`; **assigned address in header `dst`** | The master node's answer to a `JOIN_REQ` (and its re-assertion after an `ADDR_CLAIM`). The node whose node device id matches adopts and persists the address. A node that sees its own address given to a *different* node device id relinquishes it. |
 | 3 | `ADDR_TABLE` | 5 | flooded (relayed by relay nodes only) | `occupied_bitmap[2]` (16-bit; the master-node bit is always set) | The master node floods its occupied-address bitmap whenever the table **changes** (debounced) and as a slow periodic backstop, so nodes can reconcile. A node that sees its own bit clear for `MESH_TABLE_MISS_LIMIT` intervals relinquishes its address and re-joins. A leaf node does not relay it (see "Flood relay"). |
 | 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the master node. Each relay node dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
-| 5 | `DATA_DOWNLINK` | 3 + N | steered hop-by-hop down the tree (`dst` = target) | WiRoc payload (N bytes) | A WiRoc payload from the master node to one specific node. The target delivers it to its host; any other node re-broadcasts it one hop further **only when one of its children's subtree bitmaps covers the target**, so the frame follows the single branch that leads to the target (`depth(target)` transmissions) instead of flooding the tree. Best-effort (no per-hop retry); the host resends if the application-layer ACK does not return. |
-| 6 | `LINK_ACK` | 4 | broadcast (single hop) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, emitted only by the master node, which has no next hop whose forward it could overhear. It sends one for every `DATA_UPLINK` it delivers **except** one from a direct child: that single hop is confirmed by the application-layer ACK, so no `LINK_ACK` is spent (a direct child's uplink is the only one that arrives at the full TTL). Relay nodes use the implicit ACK instead. |
+| 5 | `DATA_DOWNLINK` | 3 + N | steered hop-by-hop down the tree (`dst` = target) | WiRoc payload (N bytes) | A WiRoc payload from the master node to one specific node. The target delivers it to its host; any other node re-broadcasts it one hop further **only when one of its children's subtree bitmaps covers the target**, so the frame follows the single branch that leads to the target (`depth(target)` transmissions) instead of flooding the tree. Each hop of that path is retried on its own (`MESH_LINK_RETRIES` times): a relay node clears its pending by overhearing the next hop carry the frame on, and the target -- which has no next hop -- answers with a `LINK_ACK` of its own (see *MAC / link reliability*). |
+| 6 | `LINK_ACK` | 4 | single hop, never relayed (`dst` = the acked origin, used as the match key) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, emitted by whichever node the frame **terminates** at, since that node has no next hop whose forward it could overhear: the master node for a `DATA_UPLINK`, the target for a `DATA_DOWNLINK`. It names the origin of the frame it acks in the header `dst` -- which is what the origin's pending is keyed to, so one matcher serves both directions even though the named origin may be many hops away and never receives the frame itself. It is skipped for a frame that crossed no relay (**a direct child of the master node**, the only frame that arrives at the full TTL): that single hop is confirmed by the application-layer ACK instead. Relay nodes use the implicit ACK. |
 | 7 | `ADDR_CLAIM` | 10 | rootward unicast (flood fallback) | `devid[6]\|parent[1]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted master node can rebuild its RAM-only table; the trailing byte reports its **current parent** (`0`=none), so a claim doubles as a parent report for the topology map. **Event-driven** -- sent on a new boot epoch, on boot, on re-attach, on a parent change, and when the depth >= 2 liveness watchdog sees our parent stop covering us; never on a plain timer. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead. |
 | 8 | `ADDR_ALIVE` | 5 | single hop to the parent (absorbed, never forwarded) | `subtree_bitmap[2]` (16-bit; bit `a` = "address `a` is alive in my subtree") | Periodic liveness **aggregate**, so the master node does not evict a deep idle node (whose beacon is link-local and never reaches it). Each node sets its own bit and ORs in the bitmap reported by each of its children, so **one frame covers a whole subtree**; the parent absorbs it and does not forward it, so the union of the master node's direct children's bitmaps covers every non-master node each round. **Only a relay node sends one** (a leaf is covered by its parent from its beacon); the master node refreshes last-heard for **every** set bit. Sent while the node holds a parent. |
 | 9 | `TOPOLOGY` | 4 + 2K | rootward unicast (`dst` = parent) | `parent[1]\|{addr[1]\|cost[1]}*` (K neighbours) | The reporting node's view of the graph: its current parent and the neighbours it hears, each with its link cost. **Event-driven** (attach / re-parent) plus a slow backstop; **best-effort** (the backstop recovers a loss). Every node on its rootward path absorbs it, so the master node sees the whole network and a relay node sees its own subtree; a relay node also forwards it one hop rootward. Read the local view with `ATC+MESHTOPO?`. |
@@ -316,9 +318,15 @@ as a routing table: at each hop exactly one node -- the one on the branch that l
 the target -- re-broadcasts, so the frame travels a single path of `depth(target)` hops
 instead of flooding. A relay node re-publishes its aggregate promptly when a **new**
 child appears (not just on the periodic interval), so a freshly attached node becomes
-routable without waiting a whole interval. The steer is best-effort (there is no forward
-to overhear at the last hop, so no per-hop retry); the host resends if no
-application-layer ACK comes back.
+routable without waiting a whole interval. Each hop of the path is retried on its own
+(`MESH_LINK_RETRIES` times, on the same per-hop timeout the uplink uses): a relay node
+clears its pending when it overhears the next hop carry the frame on, and the **target**,
+having no next hop to overhear, sends the `LINK_ACK` that releases its parent. So a lost
+hop costs one retransmission rather than the origin's whole uplink-and-downlink round
+trip -- which is what waiting for the application-layer ACK would cost. A target that is
+a **direct child** of the master node is the exception: that path is a single hop with no
+relay in it, so retrying it end to end costs the same, and neither the master nor the
+target spends a frame on it (see *MAC / link reliability*).
 
 ## Channel access (listen before talk)
 
@@ -355,17 +363,29 @@ is checked first there too.
 
 ## MAC / link reliability
 
-Uplink unicasts are remembered in a single pending slot. A relay node clears its pending
-frame when it **overhears the next hop forward the same `(origin,seq)`** -- an
-implicit ACK -- and otherwise retransmits up to `MESH_LINK_RETRIES` times at the
-per-hop ACK timeout, then gives up. The **master node has no next hop to overhear**, so
-it emits an explicit `LINK_ACK` (acked origin in the header `dst`, acked seq in the
-payload) after delivering an uplink -- **unless the sender is a direct child of the
-master**. A direct child has no forward to overhear and gets no `LINK_ACK`; its single
-hop is confirmed end-to-end by the **application-layer ACK**, so it is the one uplink
-whose mesh MAC does **not** retransmit (a lost hop is recovered by the application
-retry, not the link layer). This trades one `LINK_ACK` frame per direct-child uplink
-for relying on the app ACK at a latency the single hop makes negligible. The timeout is **derived from the datarate**: it is
+Every mesh unicast is remembered until the next hop is seen to carry it on. A node holds
+**one pending slot per direction** (a relay node in the middle of the tree can have an
+uplink and a downlink in flight at once). A relay node clears a pending frame when it
+**overhears the next hop forward the same `(origin,seq)`** -- an implicit ACK -- and
+otherwise retransmits up to `MESH_LINK_RETRIES` times at the per-hop ACK timeout, then
+gives up and leaves the rest to the application-layer ACK.
+
+A node the frame **terminates** at has no next hop to overhear and so answers explicitly:
+it emits a `LINK_ACK` (acked origin in the header `dst`, acked seq in the payload) naming
+the origin of the frame it acks, which is what a relay node's pending is keyed to. That is
+the **master node** for a `DATA_UPLINK`, and the **target** for a `DATA_DOWNLINK`; the same
+matcher serves both, and because the two origins are different addresses an uplink's ACK
+can never clear a downlink's pending or the reverse.
+
+The exception in both directions is a frame that crossed **no relay at all** -- a
+**direct child of the master node**, the only frame that arrives at the full TTL. That path
+is a single hop, so there is no chain to shortcut: retrying it end to end costs exactly
+what a per-hop retry would, and the mesh MAC does **not** retransmit it in either
+direction. Its single hop is confirmed by the **application-layer ACK**, at a latency the
+single hop makes negligible. This trades one `LINK_ACK` frame per direct-child exchange
+for relying on the app ACK.
+
+The timeout is **derived from the datarate**: it is
 `~2x` the airtime of the frame being sent plus one timer tick, floored at 500 ms
 (reported as `ackms` by `ATC+MESHSTATE?`).
 
@@ -692,10 +712,10 @@ For the frame sizes (CR 4/5, preamble 8, CRC on), approximate airtimes are:
 Two structural facts matter: the **fixed per-frame cost** (preamble + header symbols
 = 12.25 symbols) is large -- at SF7 a 4-byte ACK spends ~40% of its airtime on the
 preamble, so *fewer, larger frames beat many small frames* -- and the **proportional**
-terms (the 3-byte header and the per-uplink ACK) never amortise, while only the
+terms (the 3-byte header and the per-hop ACK) never amortise, while only the
 **fixed-rate** control terms do.
 
-The overhead budget is `[header + per-uplink ACK + beacons + liveness + table] / data
+The overhead budget is `[header + per-hop ACK + beacons + liveness + table] / data
 airtime`. The design cuts it several ways: **4-bit addresses (14 non-master nodes max)** roughly
 halve the beacon term, the **adaptive beacon** back-off plus **leaf suppression**
 (only relay nodes and the master node beacon at the full rate) cut the steady-state beacon
@@ -706,7 +726,8 @@ the master node hop-by-hop (flooding only when a node is route-less) instead of 
 one single-hop subtree bitmap per **relay** node (a leaf sends nothing), so the liveness
 plane is `O(F)` transmissions per round independent of tree depth. The host can
 **measure** the resulting ratio live via `ATC+MESHSTATE?` (`overhead%`). The header and
-the per-uplink ACK are proportional terms (one per data frame), so they set a floor on
+the per-hop ACKs are proportional terms (one per data frame that crosses a relay -- up to
+two per exchange, one per leg), so they set a floor on
 this ratio.
 
 ### Control-plane occupancy
@@ -771,7 +792,7 @@ change-triggered `ADDR_TABLE` floods on top of the backstop counted here.
 (beacons, liveness aggregates and the table flood -- everything counted here) stays
 **under 10%
 of total wall-clock time**. `LINK_ACK` is deliberately excluded from both the
-target and the table: it is a per-uplink cost that scales with data traffic, not a
+target and the table: it is a per-hop cost that scales with data traffic, not a
 fixed control-plane load. At the 300 s liveness-aggregate interval the target holds for
 **every
 topology up to 14 nodes across the whole SF5-SF8 range** (worst cell: the
@@ -781,22 +802,24 @@ average-2-hop 14-node tree at SF8, 4.9%).
 
 A WiRoc *punch* round trip costs: one **uplink** `DATA` (15-byte payload -> 18-byte
 frame) over `d_avg` hops; one **`LINK_ACK`** (4 bytes) from the master node (relay nodes
-use the implicit ACK, which costs no frame) -- but only when the punch originates **two
-or more hops** from the master node, since a **direct child**'s uplink is answered by
-this very application-layer ACK instead; and one **downlink** ACK `DATA` (7-byte payload
+use the implicit ACK, which costs no frame); one **downlink** ACK `DATA` (7-byte payload
 -> 10-byte frame) **steered back down the tree**, so it also costs `d_avg` hops rather than one
-transmission per relay node. (Here `airN` is the airtime of an N-byte frame, so
+transmission per relay node; and one further **`LINK_ACK`** from that downlink's target
+for the same reason -- the last hop of each leg terminates at a node with no forward left
+to overhear. (Here `airN` is the airtime of an N-byte frame, so
 `air4` is a 4-byte `LINK_ACK`, `air10` a 10-byte downlink and `air18` an 18-byte
-uplink.) One exchange is therefore `d_avg*(air18 + air10) + air4`
-of airtime when the origin is not a direct child, and `d_avg*(air18 + air10)` (one frame
-fewer) when it is. The network-wide rate (one exchange at a time, error-free channel, no
+uplink.) One exchange is therefore `d_avg*(air18 + air10) + 2*air4`
+of airtime when the origin is not a direct child, and `d_avg*(air18 + air10)` (both ACKs
+absent) when it is: a punch from a **direct child** of the master node crosses no relay,
+so both of its single hops are left to the application-layer ACK. The network-wide rate
+(one exchange at a time, error-free channel, no
 retransmits) is `60 / exchange` punches per minute. Retries, busy backoff and per-hop
-implicit-ACK waits make these figures upper bounds, and the steer is best-effort (a
-lost hop costs the ACK, which the host then resends). They are also **airtime only** --
+implicit-ACK waits make these figures upper bounds. They are also **airtime only** --
 the store-and-forward wait between hops is quantified under *Realistic throughput* below.
 
-**Punches per minute, network-wide** (15-byte uplink / 7-byte downlink; the `LINK_ACK` term is
-included for every origin, so a punch from a direct child is slightly faster than shown).
+**Punches per minute, network-wide** (15-byte uplink / 7-byte downlink; both `LINK_ACK`
+terms are included for every origin, so a punch from a direct child is slightly faster
+than shown).
 
 `nodes` is the number of **non-master nodes** (the master node, address 1, is not
 counted); `d_avg` is the **mean hop count** from a node to the master node (the
@@ -865,14 +888,15 @@ average 2 hops:
 relay nodes = 10 (M + 4 + 5)   d_avg = 2.1
 ```
 
-| tree | uplink unicast `d_avg x 369 ms` | `LINK_ACK` (master node) | steered ACK unicast `d_avg x 289 ms` | exchange | punches/min |
+| tree | uplink unicast `d_avg x 369 ms` | `LINK_ACK` x2 (master + target) | steered ACK unicast `d_avg x 289 ms` | exchange | punches/min |
 |---|---|---|---|---|---|
-| deep tree | 1328 ms | 246 ms | **3.6 x 289 = 1040 ms** | 2614 ms | 23 |
-| average 1.5 hops | 554 ms | 246 ms | **1.5 x 289 = 434 ms** | 1234 ms | **49** |
-| average 2 hops | 775 ms | 246 ms | **2.1 x 289 = 607 ms** | 1628 ms | 37 |
+| deep tree | 1328 ms | 2 x 246 = 492 ms | **3.6 x 289 = 1040 ms** | 2860 ms | 21 |
+| average 1.5 hops | 554 ms | 2 x 246 = 492 ms | **1.5 x 289 = 434 ms** | 1480 ms | **41** |
+| average 2 hops | 775 ms | 2 x 246 = 492 ms | **2.1 x 289 = 607 ms** | 1874 ms | 32 |
 
-(`LINK_ACK` is a single 4-byte frame from the master node per uplink -- 246 ms at SF8 --
-and is absent for a punch whose origin is a direct child.)
+(`LINK_ACK` is a 4-byte frame -- 246 ms at SF8 -- sent by the master node for the uplink
+and by the downlink's target for the last hop of the return leg; both are absent for a
+punch whose origin is a direct child.)
 
 So the **average 1.5-hop tree** is the best case: it has the shortest uplinks *and* the
 shortest steered ACK. The deep tree is the worst case for throughput (longest paths
@@ -884,7 +908,7 @@ on air in the `ADDR_ALIVE` aggregates, so no reverse source-route is needed.
 ### Realistic throughput (store-and-forward included)
 
 The tables above count **on-air airtime only** -- an exchange is the frames packed
-edge-to-edge, `d_avg*(air18+air10)+air4`, as if a relay forwarded the instant it
+edge-to-edge, `d_avg*(air18+air10)+2*air4`, as if a relay forwarded the instant it
 heard a frame. In practice each hop also pays a **store-and-forward wait**: every
 transmission is queued and drained later, so the gap between hearing a frame and
 forwarding it is dead air. That wait is set by whichever drains the queue first:
@@ -896,15 +920,16 @@ forwarding it is dead air. That wait is set by whichever drains the queue first:
   next `MESH_TIMER_PERIOD_MS` (200 ms) tick, whose per-node phase is what spreads
   competing flood relays.
 
-The punch exchange is point-to-point, so its relayed hops -- and the master's
-`LINK_ACK` -- ride the fast path (the origin's uplink and the master's downlink
+The punch exchange is point-to-point, so its relayed hops -- and both
+`LINK_ACK`s (the master's and the downlink target's) -- ride the fast path (the
+origin's uplink and the master's downlink
 first hop are host-originated and sent immediately). **Every relayed hop waits on
 average 25 ms** (`10 + 30/2`), uniformly 10-40 ms, instead of half a tick. The
 exchange has about `d_avg` hops on the uplink and `d_avg` on the steered-ACK leg,
 so add roughly
 
 ```
-T_real  ~=  d_avg*(air18 + air10) + air4  +  2*d_avg*25 ms
+T_real  ~=  d_avg*(air18 + air10) + 2*air4  +  2*d_avg*25 ms
              \_____ airtime (as tabulated) _____/   \_ fast store-and-forward, mean _/
 ```
 
@@ -914,15 +939,15 @@ The result is a **practical upper bound**:
 
 | topology | nodes (non-master) | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
-| **deep tree**              | 4  | 131 | 84 | 51 | 30 |
-|                           | 9  | 101 | 65 | 40 | 23 |
-|                           | 14 | 93 | 60 | 37 | 21 |
-| **average 1.5 hops**       | 4  | 207 | 132 | 80 | 46 |
-|                           | 9  | 196 | 125 | 75 | 44 |
-|                           | 14 | 207 | 132 | 80 | 46 |
-| **average 2 hops**         | 4  | 160 | 103 | 62 | 36 |
-|                           | 9  | 160 | 103 | 62 | 36 |
-|                           | 14 | 153 | 98 | 60 | 35 |
+| **deep tree**              | 4  | 121 | 76 | 46 | 27 |
+|                           | 9  | 95 | 60 | 37 | 21 |
+|                           | 14 | 88 | 56 | 34 | 19 |
+| **average 1.5 hops**       | 4  | 184 | 114 | 69 | 39 |
+|                           | 9  | 175 | 109 | 65 | 37 |
+|                           | 14 | 184 | 114 | 69 | 39 |
+| **average 2 hops**         | 4  | 146 | 92 | 55 | 31 |
+|                           | 9  | 146 | 92 | 55 | 31 |
+|                           | 14 | 140 | 88 | 53 | 31 |
 
 Like the tables above these are **punches per minute** for a single closed-loop flow
 (the host sends the next punch only after the previous ACK). The per-hop term is a
@@ -1018,11 +1043,12 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
   may be the *promoted* node rather than the returning one, so the active gateway can
   change. Recovery from a genuinely deaf or dead side (a master that cannot hear the
   other, or a hung host) is still manual.
-* A **direct child** of the master node gets no `LINK_ACK`, so it does not retransmit
-  its uplink at the mesh layer -- it relies entirely on the application-layer ACK
-  (and retry). This is safe only because WiRoc's protocol acknowledges its messages; a
-  direct child whose traffic is *not* acknowledged at the application layer has no
-  link-layer retry (a deeper node still does, via the implicit ACK).
+* A **direct child** of the master node gets no `LINK_ACK` in either direction, so neither
+  its uplink nor a downlink to it is retransmitted at the mesh layer -- both rely entirely
+  on the application-layer ACK (and retry). This is safe only because WiRoc's protocol
+  acknowledges its messages; a direct child whose traffic is *not* acknowledged at the
+  application layer has no link-layer retry (a deeper node still does, via the implicit
+  ACK).
 * The 4-bit space caps the network at 14 non-master nodes; addresses are recycled on eviction.
 * `hops` is 3 bits (max 7 hops, we cap at 4) and `seq` is 5 bits (32-value dedup
   window, matching `MESH_DEDUP_SIZE`).

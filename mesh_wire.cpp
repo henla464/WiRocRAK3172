@@ -28,3 +28,25 @@ uint8_t mesh_wire_path_bytes(uint8_t n)
 {
     return (uint8_t)(((uint16_t)n * 4 + 7) / 8);
 }
+
+bool mesh_wire_ack_key(const mesh_header_t *h, const uint8_t *payload, uint8_t plen,
+                       uint8_t self_addr, uint8_t *ack_src, uint8_t *ack_seq)
+{
+    if (h->type == MESH_TYPE_DATA_UPLINK || h->type == MESH_TYPE_DATA_DOWNLINK) {
+        if (h->dst == self_addr) {
+            return false;               /* our own copy, not the next hop's forward */
+        }
+        *ack_src = h->src;              /* a carried-on data frame keeps its origin */
+        *ack_seq = h->seq;
+        return true;
+    }
+    if (h->type == MESH_TYPE_LINK_ACK) {
+        if (plen < 1) {
+            return false;
+        }
+        *ack_src = h->dst;              /* acked origin rides in the header dst */
+        *ack_seq = payload[0];
+        return true;
+    }
+    return false;
+}
