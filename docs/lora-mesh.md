@@ -407,7 +407,7 @@ has no neighbour at all it keeps listening until beacons return.
   hop, never forwarded) and folds it into its own next aggregate; the master node
   refreshes last-heard for **every** set bit. So one frame covers a whole subtree
   and the liveness plane costs `O(relays)` single-hop frames per round --
-  independent of tree depth and node count, unlike the old per-hop keepalive.
+  independent of tree depth and node count.
   **Only relay nodes send one:** a leaf sends nothing and is covered by its parent,
   which learns it when it joins / re-attaches (the child's event-driven
   `ADDR_CLAIM` is addressed to and forwarded by that parent) and keeps it fresh
@@ -711,14 +711,14 @@ this ratio.
 
 ### Control-plane occupancy
 
-The tables above are per-frame costs; these measure how much of the channel the
-**module-generated** control plane occupies by itself (no data traffic), as a
-percentage of wall-clock time -- i.e. the fraction of the time the single channel is
-busy with mesh housekeeping. They count **beacons, `ADDR_ALIVE` aggregates and the
-`ADDR_TABLE` flood**, and exclude `LINK_ACK` (which only exists alongside an uplink) and
-application data. `ADDR_CLAIM`s and `TOPOLOGY` reports are event-driven (plus a slow
-backstop) and contribute negligibly in steady state, so they are not counted.
-Everything is derived from the airtimes above and the
+The tables above are **per-frame costs in milliseconds**; this section measures how
+much of the channel the **module-generated** control plane occupies by itself (no data
+traffic), as a percentage of wall-clock time -- i.e. the fraction of the time the single
+channel is busy with mesh housekeeping. The figures count **beacons, `ADDR_ALIVE`
+aggregates and the `ADDR_TABLE` flood**, and exclude `LINK_ACK` (which only exists
+alongside an uplink) and application data. `ADDR_CLAIM`s and `TOPOLOGY` reports are
+event-driven (plus a slow backstop) and contribute negligibly in steady state, so they
+are not counted. Everything is derived from the airtimes above and the
 live tunables: relay nodes and the master node beacon every `MESH_BEACON_MAX_MS` (90 s),
 a leaf node every `3x` that (270 s); every **relay** node sends a single-hop `ADDR_ALIVE`
 aggregate (5 bytes) once per `MESH_ALIVE_INTERVAL_MS` (300 s) -- **one frame per relay node,
@@ -737,8 +737,8 @@ liveness% = (F-1)*A5/3000        (one single-hop aggregate per non-master relay;
 table%    = F*T5/3000            (master flood + one relay per non-leaf node)
 ```
 
-`SD` below is the sum of node depths (the uplink hop-cost); unlike the old per-hop
-keepalive, liveness no longer scales with it.
+`SD` below is the sum of node depths (the uplink hop-cost); liveness does not scale
+with it.
 
 | topology | F = non-leaf nodes (incl. master node) | L = leaf nodes | SD = sum of node depths |
 |---|---|---|---|
@@ -761,10 +761,10 @@ keepalive, liveness no longer scales with it.
 |                           | 14 | 0.7% | 1.4% | 2.4% | 4.9% |
 
 The idle control plane stays within a few percent even at SF8. The worst cell -- the
-average-2-hop 14-node tree -- reaches 4.9%, now **beacon-dominated** (beacons 3.2%,
-table 0.8%, liveness 0.8%); aggregation made the liveness term `O(F)` (relay count) and
-depth-free, and restricting it to relay nodes dropped the leaf frames entirely, so
-the adaptive/leaf beacon back-off is the remaining lever on the worst case. Churn adds
+average-2-hop 14-node tree -- reaches 4.9%, **beacon-dominated** (beacons 3.2%,
+table 0.8%, liveness 0.8%); the aggregated liveness term is `O(F)` (relay count) and
+depth-free, and only relay nodes send one, so the adaptive/leaf beacon back-off is the
+remaining lever on the worst case. Churn adds
 change-triggered `ADDR_TABLE` floods on top of the backstop counted here.
 
 **Control-plane target.** The design goal is that this module-generated traffic
@@ -816,14 +816,13 @@ factor.
 |                           | 9  | 2.0  | 219 | 124 | 70 | 38 |
 |                           | 14 | 2.1  | 210 | 119 | 67 | 37 |
 
-Because the ACK is steered, the **number of relay nodes no longer enters the exchange
-cost** -- only the hop count `d_avg` does (see below).
+Because the ACK is steered, the **exchange cost depends only on the hop count
+`d_avg`**, not on the number of relay nodes (see below).
 
-### Why the balanced trees now win
+### Why the balanced trees win
 
 Both legs are **unicasts of `d_avg` hops**, so the exchange cost tracks the hop count
-and nothing else. The flood -- which used to scale with the number of relay nodes and
-so rewarded the deep tree -- is gone. A balanced tree puts most nodes one or two hops
+and nothing else. A balanced tree puts most nodes one or two hops
 from the master node, so both the uplink and the steered ACK are short. The three N=14
 shapes (`r` = relay node, `l` = leaf node):
 
@@ -876,13 +875,11 @@ relay nodes = 10 (M + 4 + 5)   d_avg = 2.1
 and is absent for a punch whose origin is a direct child.)
 
 So the **average 1.5-hop tree** is the best case: it has the shortest uplinks *and* the
-shortest steered ACK. The deep tree is now the worst case for throughput (longest paths
+shortest steered ACK. The deep tree is the worst case for throughput (longest paths
 on both legs), even though it stays the best for the idle control plane, where the
 relay-count terms (beacons, aggregates, table flood) dominate -- the two optima differ.
-A flood reversed this relation, because the ACK then cost one frame per relay node.
-Steering the ACK along the subtree bitmaps removes that term with no wire change: the
-bitmaps are already on air in the `ADDR_ALIVE` aggregates, so no reverse source-route
-is needed.
+Steering the ACK along the subtree bitmaps costs no extra wire: the bitmaps are already
+on air in the `ADDR_ALIVE` aggregates, so no reverse source-route is needed.
 
 ### Realistic throughput (store-and-forward included)
 
@@ -911,9 +908,9 @@ T_real  ~=  d_avg*(air18 + air10) + air4  +  2*d_avg*25 ms
              \_____ airtime (as tabulated) _____/   \_ fast store-and-forward, mean _/
 ```
 
-Because the fixed per-hop term is now small (25 ms), it is **no longer SF-scaling-
-dominated**: it is a modest, roughly constant penalty that the long SF8 frames
-already dwarf. The result is a **practical upper bound**:
+Because the fixed per-hop term is small (25 ms), it is **not SF-scaling-dominated**:
+it is a modest, roughly constant penalty that the long SF8 frames already dwarf.
+The result is a **practical upper bound**:
 
 | topology | nodes (non-master) | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
