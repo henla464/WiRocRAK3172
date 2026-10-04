@@ -38,7 +38,7 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
 | `ATC+STANDBYMASTER=<0\|1>` | Designate this node as a passive standby master (persisted). `ATC+STANDBYMASTER?` reads it. |
 | `ATC+MESHNODEDEVICEID=<12 hex>` | Set the 6-byte node device id (persisted). `ATC+MESHNODEDEVICEID?` reads it back. |
 | `ATC+MESHMAP=?` | Diagnostics (see below). |
-| `ATC+MESHTOPO=?` | Dump the topology map this node knows, one line per node (see below). |
+| `ATC+MESHTOPO=?` | Dump the topology map this node knows, one line with rows separated by `|` (see below). |
 | `ATC+P2P=<runcfg>:...,[:<mesh>:<master>:<standby>:<deviceid>]` | Mesh flags and node device id as trailing params of the P2P config command. |
 
 A device only joins the network once mesh mode is enabled **and** it has a node
@@ -83,15 +83,18 @@ percentage of the data-frame airtime transmitted; `ackms` is the derived
 per-hop ACK timeout for the current datarate; and `standby` is `1` when this node
 is a passive standby master (see *Standby master* below).
 
-`ATC+MESHTOPO=?` returns the topology map **this node** knows, one line per known
-node:
+`ATC+MESHTOPO=?` returns the topology map **this node** knows, as a single line
+with one entry per known node, entries separated by `|`:
 
 ```
-ATC+MESHTOPO=<addr>:<parent>:<neighbour addr>=<cost>,<neighbour addr>=<cost>,...
+ATC+MESHTOPO=<node addr>:<parent addr>[:<neighbour addr>=<link cost>,...]|<node addr>:<parent addr>[:...]|...
 ```
 
-`addr` is the node, `parent` is its parent address (`0` = none), and the trailing
-list is the neighbours it hears as `<neighbour addr>=<cost>` (omitted when none). Every
+`node addr` is the node the entry describes (the device's own address for its own
+row, a descendant's for a row it passed rootward), `parent addr` is that node's
+parent address (`0` = none), and the trailing list is the neighbours it hears as
+`<neighbour addr>=<link cost>` (omitted when none). A node that knows no rows
+returns the empty reply `ATC+MESHTOPO=`. Every
 node serves its **own** row (live from its neighbour table) plus a row for each
 **descendant** whose report it has passed rootward, so the master node -- being the
 root -- covers the whole network while any other node sees only the part of the

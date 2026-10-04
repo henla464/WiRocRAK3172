@@ -317,19 +317,23 @@ int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
 
 
 /**
- * @brief Get the topology map this node knows: one line per known node.
+ * @brief Get the topology map this node knows: one line, rows separated by '|'.
  *        Usage: ATC+MESHTOPO=?
  *
  *        Every node serves what it knows: its own row (live from the neighbour
  *        table) plus a row for each descendant whose report it has passed
  *        rootward.  The master node, being the root, covers the whole network;
  *        any other node sees only the part of the tree it is on the path for.
- *        Each line is
- *        'ATC+MESHTOPO=<addr>:<parent>:<neighbour addr>=<cost>,<neighbour addr>=<cost>,...'
- *        where <parent> is the node's parent address (0 = none) and the trailing
- *        list is the neighbours it hears, with their link costs (omitted when
- *        none).  A row ages out after MESH_TOPO_HOLD_MS; the reports are
- *        best-effort, refreshed event-driven and by a slow backstop.
+ *        Each row is
+ *        '<node addr>:<parent addr>:<neighbour addr>=<link cost>,<neighbour addr>=<link cost>,...'
+ *        where <node addr> is the node the row describes (your own address, or a
+ *        descendant's whose report passed through you), <parent addr> is that
+ *        node's parent address (0 = none), and the trailing list is the
+ *        neighbours it hears, with their link costs (omitted when none).
+ *        Successive rows are joined with '|' on one output line; a node that
+ *        knows no rows prints the empty reply 'ATC+MESHTOPO='.  A row ages out
+ *        after MESH_TOPO_HOLD_MS; the reports are best-effort, refreshed
+ *        event-driven and by a slow backstop.
  */
 int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
@@ -337,18 +341,21 @@ int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param)
 	{
 		mesh_topo_row_t row;
 		uint8_t n = mesh_topo_row_count();
+		bool first = true;
+		atcmd_printf("%s=", cmd);
 		for (uint8_t i = 0; i < n; i++)
 		{
 			if (!mesh_topo_row(i, &row))
 				continue;
-			atcmd_printf("%s=%d:%d", cmd, row.addr, row.parent);
+			atcmd_printf("%s%d:%d", first ? "" : "|", row.addr, row.parent);
+			first = false;
 			for (uint8_t j = 0; j < row.count; j++)
 			{
 				atcmd_printf("%s%d=%d", (j == 0) ? ":" : ",",
 							 row.neighbor[j], row.cost[j]);
 			}
-			atcmd_printf("\r\n");
 		}
+		atcmd_printf("\r\n");
 		return AT_NO_STATUS;
 	}
 	return AT_PARAM_ERROR;
