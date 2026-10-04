@@ -73,7 +73,10 @@ resending the whole P2P config.)
 
 `ATC+MESHMAP=?` returns
 `MESHMAP=<enabled>:<is master>:<own addr>:<txq>:<state>:<alloc>:<parent addr>:<hops>:<path cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>`
-where `own addr` is this node's mesh address (`0` = unassigned); `state` is `0`=unassigned,
+where `enabled` is `1` when mesh mode is on, `is master` is `1` on the gateway;
+`own addr` is this node's mesh address (`0` = unassigned); `txq` is the mesh
+**transmit-queue depth** -- module-generated frames still queued for the radio,
+`0..8` (`0` = idle; `8` = full, so new frames are dropped); `state` is `0`=unassigned,
 `1`=joining, `2`=joined; `alloc` is the number of
 addresses the master node has handed out; `parent addr` is the current next hop (`0`=none);
 `hops`/`path cost` are the route to the master node; `neighbour-count` is the live neighbour
