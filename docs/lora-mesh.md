@@ -60,15 +60,13 @@ can be fed straight back as a set command.
 | argc | params |
 |------|--------|
 | 13 | `<runcfg>` + 12 radio params |
-| 16 | `<runcfg>` + 12 radio params + `<mesh>:<master>:<deviceid>` (legacy tail) |
 | 17 | `<runcfg>` + 12 radio params + `<mesh>:<master>:<standby>:<deviceid>` |
 
 `<runcfg>` is a single digit at `argv[0]`; the 12 radio parameters are unchanged
-from the legacy `ATC+P2P`. In the mesh tail the **device id is always the last
+from the legacy `ATC+P2P`. In the mesh tail the **device id is the last
 parameter**; `<master>` and `<standby>` are 0/1 flags and are **mutually
-exclusive** (sending both as 1 is rejected with `AT_PARAM_ERROR`). The 16-argument
-form (no `<standby>`) is the legacy tail and leaves the standby flag untouched.
-Any other argument count is rejected. (Mesh can also be enabled and its roles/id
+exclusive** (sending both as 1 is rejected with `AT_PARAM_ERROR`). Any other
+argument count is rejected. (Mesh can also be enabled and its roles/id
 set with the standalone `ATC+MESH` / `ATC+ACTIVEMASTER` / `ATC+STANDBYMASTER` /
 `ATC+MESHNODEDEVICEID` commands, which is how a node changes one field without
 resending the whole P2P config.)

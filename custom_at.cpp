@@ -438,7 +438,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         }
         return AT_NO_STATUS;
     }
-    else if ((param->argc == 13 || param->argc == 16 || param->argc == 17)
+    else if ((param->argc == 13 || param->argc == 17)
              && !strcmp(param->argv[0], "0"))
     {
         uint32_t frequency,spreading_factor,bandwidth,coding_rate,preamble_length,
@@ -452,11 +452,9 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		uint8_t o_payload_len;
         uint8_t udrv_code;
         // argv[0] is the mandatory runtime-config selector (0 = stored config).
-        // Optional trailing <mesh>:<master>:<standby>:<deviceid> parameters.
-        // argc == 16 is the legacy <mesh>:<master>:<deviceid> form; argc == 17
-        // adds the standby flag.  The device id is always the last parameter.
-        bool haveMeshParams = (param->argc >= 16);
-        bool haveStandbyParam = (param->argc >= 17);
+        // Optional trailing <mesh>:<master>:<standby>:<deviceid> parameters
+        // (argc == 17).  The device id is the last parameter.
+        bool haveMeshParams = (param->argc >= 17);
         uint32_t mesh_enabled = 0, is_master = 0, is_standby = 0;
         uint8_t mesh_device_id[MESH_NODE_DEVICE_ID_LEN] = {0};
 
@@ -508,20 +506,17 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
                 return AT_PARAM_ERROR;
             if (0 != at_check_digital_uint32_t(param->argv[14], &is_master))
                 return AT_PARAM_ERROR;
-            if (haveStandbyParam)
-            {
-                if (0 != at_check_digital_uint32_t(param->argv[15], &is_standby))
-                    return AT_PARAM_ERROR;
-            }
+            if (0 != at_check_digital_uint32_t(param->argv[15], &is_standby))
+                return AT_PARAM_ERROR;
             if (mesh_enabled > 1 || is_master > 1 || is_standby > 1)
                 return AT_PARAM_ERROR;
             // The two roles are mutually exclusive.
             if (is_master && is_standby)
                 return AT_PARAM_ERROR;
             // The node device id is mandatory whenever the mesh tail is present;
-            // it is always the last parameter.
+            // it is the last parameter.
             {
-                const char *devid = param->argv[param->argc - 1];
+                const char *devid = param->argv[16];
                 uint32_t tlen = (uint32_t)strlen(devid);
                 if (tlen != MESH_NODE_DEVICE_ID_LEN * 2)
                     return AT_PARAM_ERROR;
@@ -602,8 +597,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         {
             mesh_set_enabled(mesh_enabled != 0);
             mesh_set_master(is_master != 0);
-            if (haveStandbyParam)
-                mesh_set_standby(is_standby != 0);
+            mesh_set_standby(is_standby != 0);
             mesh_set_node_device_id(mesh_device_id);
             mesh_config_save();
         }
@@ -632,7 +626,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         //Check and return error code
         return at_error_code_form_udrv(udrv_code);
     }
-    else if ((param->argc == 13 || param->argc == 16 || param->argc == 17)
+    else if ((param->argc == 13 || param->argc == 17)
              && !strcmp(param->argv[0], "1")) { //for runtime setting
         uint32_t frequency,spreading_factor,bandwidth,coding_rate,preamble_length,
 			txpower, low_data_rate_optimize, crc_on, rxgain, drf1268dscompatmode,
@@ -643,11 +637,9 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		uint8_t o_payload_len;
         uint8_t udrv_code;
         // argv[0] is the mandatory runtime-config selector (1 = runtime config).
-        // Optional trailing <mesh>:<master>:<standby>:<deviceid> parameters.
-        // argc == 16 is the legacy <mesh>:<master>:<deviceid> form; argc == 17
-        // adds the standby flag.  The device id is always the last parameter.
-        bool haveMeshParams = (param->argc >= 16);
-        bool haveStandbyParam = (param->argc >= 17);
+        // Optional trailing <mesh>:<master>:<standby>:<deviceid> parameters
+        // (argc == 17).  The device id is the last parameter.
+        bool haveMeshParams = (param->argc >= 17);
         uint32_t mesh_enabled = 0, is_master = 0, is_standby = 0;
         uint8_t mesh_device_id[MESH_NODE_DEVICE_ID_LEN] = {0};
         bool o_useRuntimeConfig = get_useRuntimeConfigP2P();
@@ -723,20 +715,17 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
                 return AT_PARAM_ERROR;
             if (0 != at_check_digital_uint32_t(param->argv[14], &is_master))
                 return AT_PARAM_ERROR;
-            if (haveStandbyParam)
-            {
-                if (0 != at_check_digital_uint32_t(param->argv[15], &is_standby))
-                    return AT_PARAM_ERROR;
-            }
+            if (0 != at_check_digital_uint32_t(param->argv[15], &is_standby))
+                return AT_PARAM_ERROR;
             if (mesh_enabled > 1 || is_master > 1 || is_standby > 1)
                 return AT_PARAM_ERROR;
             // The two roles are mutually exclusive.
             if (is_master && is_standby)
                 return AT_PARAM_ERROR;
             // The node device id is mandatory whenever the mesh tail is present;
-            // it is always the last parameter.
+            // it is the last parameter.
             {
-                const char *devid = param->argv[param->argc - 1];
+                const char *devid = param->argv[16];
                 uint32_t tlen = (uint32_t)strlen(devid);
                 if (tlen != MESH_NODE_DEVICE_ID_LEN * 2)
                     return AT_PARAM_ERROR;
@@ -807,8 +796,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         {
             mesh_set_enabled(mesh_enabled != 0);
             mesh_set_master(is_master != 0);
-            if (haveStandbyParam)
-                mesh_set_standby(is_standby != 0);
+            mesh_set_standby(is_standby != 0);
             mesh_set_node_device_id(mesh_device_id);
             mesh_config_save();
         }
