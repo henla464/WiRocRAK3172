@@ -30,14 +30,18 @@ int main()
             return 1;
         }
     }
-    std::printf("round-trip: OK (4,194,304 combinations)\n");
+    std::printf("round-trip: OK (%u combinations)\n",
+                (unsigned)MESH_TYPE_COUNT * 16u * 16u * 16u * 8u * 32u);
 
     /* --- Known bit vector (guards the exact bit layout) --- */
     mesh_header_t h { MESH_TYPE_DATA_UPLINK, MESH_WIRE_VERSION,
                       5, 1, 2, 3 };
     uint8_t b[MESH_HEADER_SIZE];
     mesh_wire_encode(b, &h);
-    assert(b[0] == 0x44 && b[1] == 0x51 && b[2] == 0x43);
+    /* byte0 carries type in the high nibble and version in the low one; derived
+     * from the macro so a version bump does not have to touch this vector. */
+    assert(b[0] == ((MESH_TYPE_DATA_UPLINK << 4) | MESH_WIRE_VERSION) &&
+           b[1] == 0x51 && b[2] == 0x43);
     std::printf("known vector: OK (%02X %02X %02X)\n", b[0], b[1], b[2]);
 
     /* --- Path length packing (4-bit addresses: ceil(n/2) bytes) --- */

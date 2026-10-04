@@ -232,6 +232,18 @@ bool    mesh_topo_row(uint8_t index, mesh_topo_row_t *out);
 #define MESH_STANDBY_MIN_SNR         (-6)    /* only probe uplinks heard at least this
                                               * well (dB) */
 
+/* --- M8 master conflict (lowest device id wins) ------------------------- */
+/* A master that (re)boots does not serve immediately: it broadcasts a
+ * MASTER_QUERY carrying its device id and listens for MESH_MASTER_QUERY_WINDOW_MS
+ * for a rival master.  A rival answers with MASTER_ANNOUNCE (its id), or stands
+ * down if it is junior (higher id).  "Lowest device id wins" is a total order
+ * every node computes identically, so exactly one master survives and no
+ * tie-break is needed -- this turns the old "two masters coexist until a manual
+ * fix" split-brain into an automatic, bounded resolution. */
+#define MESH_MASTER_QUERY_WINDOW_MS  1000   /* booting master listens this long  */
+#define MESH_MASTER_QUERY_RETRY_MS   300    /* ... re-broadcasting the query every */
+                                            /*     this long while contending     */
+
 /* Master boot epoch last heard (0 while unknown). */
 uint16_t mesh_get_epoch(void);
 

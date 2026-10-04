@@ -165,7 +165,7 @@ as the sanity gate). The header is **3 bytes** (24 bits, no waste), MSB-first:
 | bits | field | notes |
 |------|-------|-------|
 | 4 | type | message type, `0`-`9` (see **Message types** below) |
-| 4 | version | protocol version (currently `4`) |
+| 4 | version | protocol version (currently `1`) |
 | 4 | src | source address (0-15) |
 | 4 | dst | destination (0-15; also carries the assigned address / acked origin) |
 | 3 | hops | beacon: hop-count to the master node; data: TTL (max 4) |
@@ -235,8 +235,10 @@ header is **not** repeated in the payload (header-field reuse).
 | 7 | `ADDR_CLAIM` | 10 | rootward unicast (flood fallback) | `devid[6]\|parent[1]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted master node can rebuild its RAM-only table; the trailing byte reports its **current parent** (`0`=none), so a claim doubles as a parent report for the topology map. **Event-driven** -- sent on a new boot epoch, on boot, on re-attach, on a parent change, and when the depth >= 2 liveness watchdog sees our parent stop covering us; never on a plain timer. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead. |
 | 8 | `ADDR_ALIVE` | 5 | single hop to the parent (absorbed, never forwarded) | `subtree_bitmap[2]` (16-bit; bit `a` = "address `a` is alive in my subtree") | Periodic liveness **aggregate**, so the master node does not evict a deep idle node (whose beacon is link-local and never reaches it). Each node sets its own bit and ORs in the bitmap reported by each of its children, so **one frame covers a whole subtree**; the parent absorbs it and does not forward it, so the union of the master node's direct children's bitmaps covers every non-master node each round. **Only a relay node sends one** (a leaf is covered by its parent from its beacon); the master node refreshes last-heard for **every** set bit. Sent while the node holds a parent. |
 | 9 | `TOPOLOGY` | 4 + 2K | rootward unicast (`dst` = parent) | `parent[1]\|{addr[1]\|cost[1]}*` (K neighbours) | The reporting node's view of the graph: its current parent and the neighbours it hears, each with its link cost. **Event-driven** (attach / re-parent) plus a slow backstop; **best-effort** (the backstop recovers a loss). Every node on its rootward path absorbs it, so the master node sees the whole network and a relay node sees its own subtree; a relay node also forwards it one hop rootward. Read the local view with `ATC+MESHTOPO?`. |
+| 10 | `MASTER_QUERY` | 9 | broadcast (single hop, not relayed) | `devid[6]`; `src` = 1 | A (re)booting master asks "is another master already here?" -- see **Master conflict** below. |
+| 11 | `MASTER_ANNOUNCE` | 9 | broadcast (single hop, not relayed) | `devid[6]`; `src` = 1 | A master stating its identity so two masters can compare device ids and the junior one stand down. |
 
-All sizes include the fixed 3-byte header. The control types (0, 1, 2, 3, 6, 7, 8) have
+All sizes include the fixed 3-byte header. The control types (0, 1, 2, 3, 6, 7, 8, 10, 11) have
 a fixed length; the two data types (4, 5) are `3 + N`, where `N` is the verbatim
 WiRoc payload (WiRoc punch payloads are typically 15 or 27 bytes, giving 18 or 30
 bytes on air), and `TOPOLOGY` (9) is `4 + 2K` for `K` neighbours. A frame cannot
@@ -274,7 +276,11 @@ leaf node advertises at a reduced rate -- see "Adaptive beacon" below). A
 node picks as parent the neighbour minimising `link_cost + n.path_cost`.
 
 **SNR is preferred to RSSI** (RSSI saturates and is dominated by the noise floor;
-SNR reflects the demodulation margin). Per-neighbour SNR is smoothed with an EWMA.
+SNR reflects the demodulation margin). Per-neighbour SNR is smoothed with an
+**EWMA** -- an *exponentially weighted moving average*, `new = 0.75*old + 0.25*sample`
+(here the integer form `(old*3 + sample)/4`). Each fresh beacon counts a quarter and
+older ones fade out, so it damps single-reading noise over a ~4-beacon window while
+still following a genuine change within a few beacons.
 The link cost is a **margin over the current spreading factor's LoRa demodulation
 floor** (which depends on SF, not bandwidth), so the metric stays meaningful when
 the datarate is retuned:
@@ -285,9 +291,6 @@ the datarate is retuned:
 | 6  | -5.0 dB | margin >= 12.5 dB | >= 7.5 dB | >= 2.5 dB | below |
 | 7  | -7.5 dB | margin >= 12.5 dB | >= 7.5 dB | >= 2.5 dB | below |
 | 8  | -10.0 dB | margin >= 12.5 dB | >= 7.5 dB | >= 2.5 dB | below |
-
-At SF7 this reproduces the classic fixed thresholds (`>= +5`, `0..+5`, `-5..0`,
-`< -5` dB); at other SFs the whole scale shifts by the difference in demod floor.
 
 Because the metric is a summed cost, a **2-hop all-good path (cost 2) beats a weak
 direct link (cost 6)**: the node deliberately chooses the extra reliable hop.
@@ -336,8 +339,10 @@ How a busy channel is handled depends on who wants the transmission:
   spreads competing relay forwarders (that decorrelation is worth more than the
   latency there). After a busy verdict the drain holds off for a **randomised backoff**
   that starts at `MESH_TX_BACKOFF_MIN_MS` and **doubles per consecutive busy attempt**
-  up to `MESH_TX_BACKOFF_MAX_MS`, resetting after a clean send. The random draw (from a
-  per-node xorshift PRNG) stops nodes that just collided from retrying in lockstep.
+  up to `MESH_TX_BACKOFF_MAX_MS`, resetting after a clean send. The random draw stops
+  nodes that just collided from retrying in lockstep; it comes from a per-node
+  **xorshift PRNG** -- a *pseudo-random number generator*, a tiny deterministic
+  shift-and-XOR routine seeded per node from its boot time.
 * **Host-originated traffic** (`ATC+SEND`, i.e. an uplink or a master-node downlink) is
   **not queued**. The frame is tried **once, immediately**: if the channel is busy
   the AT handler returns `AT_BUSY_ERROR` and the **host owns the backoff and
@@ -534,10 +539,19 @@ For each uplink it overhears (deduplicated to one per `(src,seq)`):
 The standby promotes itself after `MESH_STANDBY_MISS_LIMIT` consecutive misses
 **spread over at least `MESH_STANDBY_MIN_WINDOW_MS`** (70 s). The window is longer
 than a normal master reboot, so a reboot resets the run and does **not** cause a
-takeover. A separate **backstop** promotes after `MESH_STANDBY_BACKSTOP_MS` without
-*any* frame from the master (a beacon, downlink, ACK or table): this covers an idle
-network and a standby that boots into an already-dead network. The standby never
-beacons or joins, and it is not a member of the tree. Because it transmits
+takeover.
+
+Because this probe is driven by uplinks it has two blind spots: an **idle network** --
+one where no node is sending uplink messages (no punches) -- gives it nothing to probe,
+and a standby that **boots into an already-dead network** never hears the master and so
+never arms a probe. A separate, traffic-independent
+**backstop** covers both: it promotes after `MESH_STANDBY_BACKSTOP_MS` with *no*
+frame from the master of any kind (beacon, downlink, ACK or table). That window is
+3x the master's slowest beacon interval (`MESH_BEACON_MAX_MS`), and a live master
+always beacons within that interval, so it can never trip the backstop -- 270 s of
+silence therefore honestly means the master is gone.
+
+The standby never beacons or joins, and it is not a member of the tree. Because it transmits
 nothing it adds **no channel load**: the control-plane occupancy and punch
 throughput figures elsewhere in this document are unchanged by its presence.
 
@@ -546,6 +560,34 @@ every node detects the change, re-adopts its address and re-claims -- the new ma
 rebuilds its RAM-only allocator from those claims, then routes and delivers
 uplinks as any master does. The promotion is persisted, so it survives a power
 cycle. The `ATC+MESHSTATE` field `standby` reports the role.
+
+### Master conflict
+
+If the old master is powered back on after a takeover it comes up believing it is
+the master too -- two nodes both claiming address 1. This is resolved automatically,
+by a rule every master computes identically: **the lowest node device id wins.**
+
+A master does not serve the instant it boots. It first runs a **solo check**:
+it stays silent (no beacon, no joins, no table) and broadcasts a `MASTER_QUERY`
+carrying its device id, listening for `MESH_MASTER_QUERY_WINDOW_MS`. A rival master
+answers:
+
+* a **junior** master (higher device id) hears the query, sees a senior rival, and
+  **demotes itself to standby** (it clears address 1, becomes the silent shadow
+  root of M7, and can take over again if that master later dies);
+* a **senior** master answers with `MASTER_ANNOUNCE` (its device id), so the
+  booting master compares, finds the rival senior, and demotes.
+
+If no rival answers within the window, the booting master asserts and serves. The
+same comparison runs continuously: a **serving** master that hears any frame
+sourced from address 1 that it did not send (it never hears its own frames) answers
+with its identity, so two masters that were booted apart and only later came into
+range resolve the moment they hear each other. Because "lowest device id wins" is a
+total order, exactly one master survives -- there is no tie-break and no flapping.
+
+The check only matters while a rival is actually present: a lone master reboot pays
+at most `MESH_MASTER_QUERY_WINDOW_MS` (1 s) before it serves, and a settled network
+carries no `MASTER_QUERY`/`MASTER_ANNOUNCE` traffic at all.
 
 ## Tunables
 
@@ -579,6 +621,8 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_STANDBY_MIN_WINDOW_MS` | 70000 | standby master: the misses must span at least this long (a shorter reboot does not promote) |
 | `MESH_STANDBY_BACKSTOP_MS` | 270000 | standby master: no frame from the master for this long -> promote (3x `MESH_BEACON_MAX_MS`) |
 | `MESH_STANDBY_MIN_SNR` | -6 | standby master: only uplinks heard at least this well (dB) are probed |
+| `MESH_MASTER_QUERY_WINDOW_MS` | 1000 | booting master: listen for a rival master this long before serving |
+| `MESH_MASTER_QUERY_RETRY_MS` | 300 | booting master: re-broadcast the `MASTER_QUERY` this often while listening |
 
 **Adaptive beacon.** Each node's beacon interval starts at `MESH_BEACON_FAST_MS`
 and **doubles per stable interval** up to `MESH_BEACON_MAX_MS`, and is **reset to
@@ -626,12 +670,11 @@ index `7`; "32 kHz" is really 31.25 kHz) with SF5-SF8. Set it with
 runtime-config selector) -- `service_lora_p2p_set_bandwidth()` takes the raw
 index, so `7` passes straight through.
 
-At 31.25 kHz every frame's airtime is `4x` the 125 kHz value, so the control plane
-dominates. The firmware computes airtimes from the live radio parameters
+The firmware computes airtimes from the live radio parameters
 (`service_lora_p2p_get_sf()/_get_bandwidth()`) using
 `Tsym = 2^SF / BW` and
 `n = 8 + max(ceil((8L - 4SF + 28 + 16)/(4(SF - 2DE))), 0) * (CR + 4)`.
-For the v3 frame sizes (CR 4/5, preamble 8, CRC on), approximate airtimes are:
+For the frame sizes (CR 4/5, preamble 8, CRC on), approximate airtimes are:
 
 | on-air frame | bytes | SF5 | SF6 | SF7 | SF8 |
 |---|---|---|---|---|---|
@@ -943,6 +986,12 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
   window): confirm **no** promotion. Also confirm a reboot of the master node's **host**
   (radio still up) eventually promotes -- the app-ACK probe, not the beacon, is what
   detects it.
+* **Master conflict**: after a standby has promoted, power the old master back on.
+  Confirm it does **not** immediately beacon (listen for `MESH_MASTER_QUERY_WINDOW_MS`),
+  that exactly one of the two keeps address 1 (the one with the lower device id, per
+  `ATC+MESHNODEDEVICEID?`), and that the other reports `standby=1`. Confirm nodes do
+  not churn (no repeated re-claims) once the conflict resolves, and that a lone master
+  reboot is back to serving within ~1 s.
 * **Flood pruning / change-triggered table**: add a node and confirm the master node
   emits an `ADDR_TABLE` within ~`MESH_TABLE_DEBOUNCE_MS` (sniff, or watch the new
   node's fast adoption) rather than waiting for the backstop; confirm a fresh
@@ -963,13 +1012,15 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
 
 * The active master node is a single point of failure unless a **standby master** is
   deployed. The standby makes the recovery automatic but is itself constrained: it
-  must be placed where it hears both the uplinks and the master's downlinks; its
+  must be placed where it hears both the uplinks and the master's downlinks, and its
   probe is blind to traffic that is legitimately never acknowledged at the
-  application layer (such traffic is read as a missed ACK); and the
-  `MESH_STANDBY_MIN_WINDOW_MS` guard only **bounds** split-brain -- a genuine outage
-  means the promoted node owns address 1 thereafter, and recovery from an
-  unexpected reappearance of the old master (or from the two hosts both now holding
-  a gateway feed) is manual.
+  application layer (such traffic is read as a missed ACK). An old master that
+  reappears after a takeover is resolved automatically by the **master conflict**
+  rule (lowest device id wins, see above), but note the choice is by device id, not
+  by "who was there first": the node with the lower device id keeps address 1, which
+  may be the *promoted* node rather than the returning one, so the active gateway can
+  change. Recovery from a genuinely deaf or dead side (a master that cannot hear the
+  other, or a hung host) is still manual.
 * A **direct child** of the master node gets no `LINK_ACK`, so it does not retransmit
   its uplink at the mesh layer -- it relies entirely on the application-layer ACK
   (and retry). This is safe only because WiRoc's protocol acknowledges its messages; a

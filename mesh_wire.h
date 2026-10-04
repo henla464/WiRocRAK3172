@@ -25,7 +25,7 @@
 
 #include <stdint.h>
 
-#define MESH_WIRE_VERSION   4
+#define MESH_WIRE_VERSION   1
 #define MESH_HEADER_SIZE    3
 
 /* Message type (4 bits). Includes the count so it doubles as "invalid" bound. */
@@ -40,6 +40,8 @@ typedef enum {
     MESH_TYPE_ADDR_CLAIM,       /* rootward: { devid, parent }, bind addr<->devid */
     MESH_TYPE_ALIVE,            /* single hop: { subtree_bitmap }, liveness      */
     MESH_TYPE_TOPOLOGY,         /* rootward: { parent, {addr,cost}* }, map      */
+    MESH_TYPE_MASTER_QUERY,     /* broadcast: { devid }, "who is master?", see M8 */
+    MESH_TYPE_MASTER_ANNOUNCE,  /* broadcast: { devid }, a master states its id  */
     MESH_TYPE_COUNT
 } mesh_type_t;
 

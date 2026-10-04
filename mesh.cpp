@@ -226,6 +226,15 @@ static uint32_t s_mon_parent_ms;    /* when we adopted that parent             *
 static uint32_t s_parent_alive_ms;  /* last parent aggregate overheard (0=none)*/
 static uint32_t s_mon_claim_ms;     /* last monitor-triggered re-claim (0=none)*/
 
+/* --- M8: master conflict (lowest device id wins) ----------------------- */
+/* A (re)booted master does not serve until it has proven it is alone (or the
+ * senior of the two): it starts "contending", broadcasting MASTER_QUERY and
+ * listening for a rival before it beacons/answers joins.  s_master_serving is
+ * false while contending; s_contend_until_ms == 0 means "not yet armed". */
+static bool     s_master_serving;       /* master passed the solo check          */
+static uint32_t s_contend_until_ms;     /* probation deadline (0 = not armed)     */
+static uint32_t s_contend_next_ms;      /* next MASTER_QUERY retry                */
+
 /* Defined in the M3 section below; used by the timer. */
 static void mesh_emit_beacon(void);
 static void mesh_check_parent_staleness(uint32_t now);
@@ -245,6 +254,13 @@ static void mesh_monitor_tick(uint32_t now);
 /* Defined in the M7 section below; used by the timer. */
 static void mesh_standby_tick(uint32_t now);
 static void mesh_standby_takeover(void);
+
+/* Defined in the M8 section below; used by the timer / RX. */
+static void mesh_master_contend_tick(uint32_t now);
+static void mesh_rx_master_query(const mesh_header_t *h, const uint8_t *payload, uint8_t plen);
+static void mesh_rx_master_announce(const mesh_header_t *h, const uint8_t *payload, uint8_t plen);
+static void mesh_master_demote_to_standby(void);
+static void mesh_master_announce_send(void);
 
 /* Fast forward path: a point-to-point frame is drained by a one-shot timer
  * rather than waiting for the next housekeeping tick (see mesh_tx_schedule). */
@@ -342,6 +358,12 @@ static void mesh_state_clear(void)
     s_mon_parent_ms   = 0;
     s_parent_alive_ms = 0;
     s_mon_claim_ms    = 0;
+
+    /* M8 master conflict.  A master (re)enters its solo check on every fresh
+     * start; a non-master never runs it (guarded by mesh_is_master()). */
+    s_master_serving  = false;
+    s_contend_until_ms = 0;
+    s_contend_next_ms  = 0;
 
     mesh_alloc_reset();
     s_table_ver_seen = mesh_alloc_version();    /* no pending flood after reset */
@@ -496,6 +518,11 @@ static void mesh_timer_cb(void *)
      * dropped by the silence gate. */
     if (mesh_is_standby()) {
         mesh_standby_tick(now);
+    } else if (mesh_is_master() && !s_master_serving) {
+        /* A master that has not yet passed its solo check (M8) serves nothing:
+         * it only probes for a rival, then asserts or stands down. */
+        mesh_master_contend_tick(now);
+        return;
     }
 
     /* Beacons: the master and every routable node advertise periodically so
@@ -828,11 +855,19 @@ bool mesh_is_master(void)
 
 void mesh_set_master(bool master)
 {
+    bool was = mesh_is_master();
+
     if (master) {
         s_cfg.flags |= MESH_FLAG_MASTER;
         s_cfg.flags &= (uint8_t)~MESH_FLAG_STANDBY; /* roles are exclusive */
     } else {
         s_cfg.flags &= (uint8_t)~MESH_FLAG_MASTER;
+    }
+    if (master != was) {
+        /* A role change restarts the solo check: a fresh master must re-prove
+         * it is alone before it serves. */
+        s_master_serving   = false;
+        s_contend_until_ms = 0;
     }
     mesh_apply_role();
     mesh_update_state();
@@ -850,6 +885,7 @@ void mesh_set_standby(bool standby)
         s_cfg.flags &= (uint8_t)~MESH_FLAG_MASTER;  /* roles are exclusive */
         /* An observer holds no address and is not a tree member. */
         s_cfg.address = MESH_ADDR_NONE;
+        s_master_serving = false;       /* no longer a serving master         */
         mesh_state_clear();
     } else {
         s_cfg.flags &= (uint8_t)~MESH_FLAG_STANDBY;
@@ -2222,6 +2258,99 @@ static void mesh_standby_takeover(void)
     mesh_config_save();
 }
 
+/* ======================================================================= */
+/*  M8: master conflict (lowest device id wins)                            */
+/* ======================================================================= */
+
+/* Total order on two device ids: -1 if a < b, +1 if a > b, 0 if equal.  Both
+ * masters compute it identically, so exactly one steps down and the result is
+ * stable -- no tie-break, no oscillation. */
+static int mesh_devid_cmp(const uint8_t *a, const uint8_t *b)
+{
+    int c = memcmp(a, b, MESH_NODE_DEVICE_ID_LEN);
+    return (c < 0) ? -1 : (c > 0) ? 1 : 0;
+}
+
+/* Advertise our identity so a rival master can compare device ids. */
+static void mesh_master_announce_send(void)
+{
+    uint8_t own[MESH_NODE_DEVICE_ID_LEN];
+
+    mesh_get_node_device_id(own);
+    mesh_send_broadcast(MESH_TYPE_MASTER_ANNOUNCE, 1, own, sizeof(own));
+}
+
+/* A master with a lower device id exists: stand down and observe it.  We become
+ * a standby (M7) -- silent, shadowing, and able to take over again if that master
+ * later dies -- and arm its heartbeat (we have just heard a master). */
+static void mesh_master_demote_to_standby(void)
+{
+    mesh_set_standby(true);             /* clears master + address, resets state */
+    s_master_seen     = true;
+    s_master_alive_ms = millis();
+    mesh_config_save();                 /* persist the role across a reboot      */
+}
+
+/* A rival asked "who is master?".  Lowest device id wins: if we are junior we
+ * stand down; if we are senior we stop contending and answer. */
+static void mesh_rx_master_query(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
+{
+    uint8_t own[MESH_NODE_DEVICE_ID_LEN];
+
+    if (!mesh_is_master() || h->src != MESH_MASTER_ADDR ||
+        plen < MESH_NODE_DEVICE_ID_LEN) {
+        return;                         /* a query is for masters only */
+    }
+    mesh_get_node_device_id(own);
+    if (mesh_devid_cmp(payload, own) < 0) {
+        mesh_master_demote_to_standby();
+        return;
+    }
+    s_master_serving   = true;          /* we are senior: assert and reply */
+    s_contend_until_ms = 0;
+    mesh_master_announce_send();
+}
+
+/* A rival stated its identity.  If it is senior, stand down; else it is the one
+ * that yields (it will hear our announce / query in turn). */
+static void mesh_rx_master_announce(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
+{
+    uint8_t own[MESH_NODE_DEVICE_ID_LEN];
+
+    if (!mesh_is_master() || h->src != MESH_MASTER_ADDR ||
+        plen < MESH_NODE_DEVICE_ID_LEN) {
+        return;
+    }
+    mesh_get_node_device_id(own);
+    if (mesh_devid_cmp(payload, own) < 0) {
+        mesh_master_demote_to_standby();
+    }
+}
+
+/* Tick for a master that has not yet proven it is alone: broadcast the query so
+ * a rival answers, then assert if nothing senior turns up within the window. */
+static void mesh_master_contend_tick(uint32_t now)
+{
+    uint8_t own[MESH_NODE_DEVICE_ID_LEN];
+
+    if (s_contend_until_ms == 0) {      /* arm on the first tick */
+        s_contend_until_ms = now + MESH_MASTER_QUERY_WINDOW_MS;
+        /* Jitter the first query so two masters booting together do not answer
+         * each other in lockstep. */
+        s_contend_next_ms  = now + (mesh_rand() % MESH_MASTER_QUERY_RETRY_MS);
+        return;
+    }
+    if ((int32_t)(now - s_contend_next_ms) >= 0) {
+        mesh_get_node_device_id(own);
+        mesh_send_broadcast(MESH_TYPE_MASTER_QUERY, 1, own, sizeof(own));
+        s_contend_next_ms = now + MESH_MASTER_QUERY_RETRY_MS;
+    }
+    if ((int32_t)(now - s_contend_until_ms) >= 0) {
+        s_master_serving   = true;      /* nobody senior answered: we are master */
+        s_contend_until_ms = 0;
+    }
+}
+
 uint16_t mesh_get_epoch(void)
 {
     return mesh_is_master() ? s_boot_epoch : s_master_epoch;
@@ -2308,6 +2437,24 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
         }
     }
 
+    /* A master that has not yet passed its solo check (M8) serves nothing: it
+     * handles only the conflict handshake, so a booting master cannot hand out
+     * addresses or relay while it is still undecided. */
+    if (mesh_is_master() && !s_master_serving &&
+        h.type != MESH_TYPE_MASTER_QUERY &&
+        h.type != MESH_TYPE_MASTER_ANNOUNCE) {
+        return;
+    }
+
+    /* A frame sourced from address 1 that we did not send (a node never hears
+     * its own frames) proves a rival master exists.  A serving master answers a
+     * rival's beacon with its identity (M8) so the two can compare and the
+     * junior one stand down; a contending master waits for the handshake above. */
+    if (mesh_is_master() && s_master_serving && h.src == MESH_MASTER_ADDR &&
+        h.type == MESH_TYPE_BEACON) {
+        mesh_master_announce_send();
+    }
+
     /* A standby master (M7) is a silent shadow root, not a routing node: it
      * skips the join / neighbour / routing control types entirely and only
      * observes -- it delivers data and absorbs the rootward control frames that
@@ -2331,6 +2478,8 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     case MESH_TYPE_ADDR_CLAIM:    mesh_rx_addr_claim(&h, payload, plen);   break;
     case MESH_TYPE_ALIVE:         mesh_rx_alive(&h, payload, plen);        break;
     case MESH_TYPE_TOPOLOGY:      mesh_rx_topology(&h, payload, plen);     break;
+    case MESH_TYPE_MASTER_QUERY:  mesh_rx_master_query(&h, payload, plen);    break;
+    case MESH_TYPE_MASTER_ANNOUNCE: mesh_rx_master_announce(&h, payload, plen);break;
     default:                                                               break;
     }
 }
