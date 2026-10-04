@@ -72,10 +72,11 @@ set with the standalone `ATC+MESH` / `ATC+ACTIVEMASTER` / `ATC+STANDBYMASTER` /
 resending the whole P2P config.)
 
 `ATC+MESHMAP=?` returns
-`MESHMAP=<enabled>:<master>:<addr>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>`
-where `state` is `0`=unassigned, `1`=joining, `2`=joined; `alloc` is the number of
-addresses the master node has handed out; `parent` is the current next hop (`0`=none);
-`hops`/`cost` are the route to the master node; `neighbour-count` is the live neighbour
+`MESHMAP=<enabled>:<is master>:<own addr>:<txq>:<state>:<alloc>:<parent addr>:<hops>:<path cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>`
+where `own addr` is this node's mesh address (`0` = unassigned); `state` is `0`=unassigned,
+`1`=joining, `2`=joined; `alloc` is the number of
+addresses the master node has handed out; `parent addr` is the current next hop (`0`=none);
+`hops`/`path cost` are the route to the master node; `neighbour-count` is the live neighbour
 count; `epoch` is the master node's **boot number** -- a counter the master node increments
 on every boot -- as last seen by this node (only its low 3 bits are advertised;
 see *Recovery*); `overhead%` is the measured control-plane airtime as a

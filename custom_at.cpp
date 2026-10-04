@@ -279,10 +279,10 @@ int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param)
 /**
  * @brief Get mesh state. Usage: ATC+MESHMAP=?
  *        Returns
- *        '<enabled>:<is master>:<own address>:<txq>:<state>:<alloc>:<parent>:<hops>:<cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>'
+ *        '<enabled>:<is master>:<own addr>:<txq>:<state>:<alloc>:<parent addr>:<hops>:<path cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>'
  *        where <state> is 0=unassigned 1=joining 2=joined, <alloc> is the number
- *        of addresses the master has allocated, <parent> is the current parent
- *        address (0 = none), <hops>/<cost> are the route to the master,
+ *        of addresses the master has allocated, <parent addr> is the current parent
+ *        address (0 = none), <hops>/<path cost> are the route to the master,
  *        <neighbour-count> is the live neighbour count, <epoch> is the master's
  *        boot number (incremented on every boot; only its low 3 bits ride the
  *        beacon) as last seen by this node,
