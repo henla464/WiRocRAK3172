@@ -32,6 +32,7 @@ int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param);
 void send_cb(void);
 void cad_cb(bool detect);
 void receive_cb(rui_lora_p2p_recv_t recv_data_pkg);
+static void p2p_printf_hex(uint8_t *pdata, uint16_t len);
 
 unsigned long start_send;
 
@@ -329,11 +330,14 @@ int meshmaps_handler(SERIAL_PORT port, char *cmd, stParam *param)
  *        rootward.  The master node, being the root, covers the whole network;
  *        any other node sees only the part of the tree it is on the path for.
  *        Each row is
- *        '<node addr>:<parent addr>:<neighbour addr>=<link cost>,<neighbour addr>=<link cost>,...'
+ *        '<node addr>:<parent addr>:<btaddr>:<neighbour addr>=<link cost>,...'
  *        where <node addr> is the node the row describes (your own address, or a
  *        descendant's whose report passed through you), <parent addr> is that
- *        node's parent address (0 = none), and the trailing list is the
- *        neighbours it hears, with their link costs (omitted when none).
+ *        node's parent address (0 = none), <btaddr> is that node's full 6-byte
+ *        device id as 12 hex chars (resolved for its own row by any node and for
+ *        every row by the master; six zero bytes when unknown), and the trailing
+ *        list is the neighbours it hears, with their link costs (omitted when
+ *        none).
  *        Successive rows are joined with '|' on one output line; a node that
  *        knows no rows prints the empty reply 'ATC+MESHTOPO='.  A row ages out
  *        after MESH_TOPO_HOLD_MS; the reports are best-effort, refreshed
@@ -351,7 +355,10 @@ int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		{
 			if (!mesh_topo_row(i, &row))
 				continue;
-			atcmd_printf("%s%d:%d", first ? "" : "|", row.addr, row.parent);
+			uint8_t bt[MESH_NODE_DEVICE_ID_LEN] = {0};
+			mesh_lookup_device_id(row.addr, bt);
+			atcmd_printf("%s%d:%d:", first ? "" : "|", row.addr, row.parent);
+			p2p_printf_hex(bt, sizeof(bt));
 			first = false;
 			for (uint8_t j = 0; j < row.count; j++)
 			{

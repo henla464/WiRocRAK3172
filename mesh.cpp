@@ -886,15 +886,20 @@ void mesh_get_node_device_id(uint8_t out[MESH_NODE_DEVICE_ID_LEN])
 
 bool mesh_lookup_device_id(uint8_t addr, uint8_t out[MESH_NODE_DEVICE_ID_LEN])
 {
-    if (!mesh_is_master()) {
-        return false;                   /* only the master holds the addr <-> id map */
+    if (addr == MESH_ADDR_NONE) {
+        return false;
     }
-    if (addr == MESH_MASTER_ADDR) {
+    /* A node always knows its own device id (its own address is its own row). */
+    if (addr == mesh_get_address()) {
         if (!mesh_has_node_device_id()) {
             return false;
         }
         mesh_get_node_device_id(out);
         return true;
+    }
+    /* Only the master holds the address <-> device-id map for the rest. */
+    if (!mesh_is_master()) {
+        return false;
     }
     return mesh_alloc_device_id(addr, out);
 }

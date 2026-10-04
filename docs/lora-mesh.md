@@ -91,14 +91,17 @@ is a passive standby master (see *Standby master* below).
 with one entry per known node, entries separated by `|`:
 
 ```
-ATC+MESHTOPO=<node addr>:<parent addr>[:<neighbour addr>=<link cost>,...]|<node addr>:<parent addr>[:...]|...
+ATC+MESHTOPO=<node addr>:<parent addr>:<btaddr>[:<neighbour addr>=<link cost>,...]|<node addr>:<parent addr>:<btaddr>[:...]|...
 ```
 
 `node addr` is the node the entry describes (the device's own address for its own
 row, a descendant's for a row it passed rootward), `parent addr` is that node's
-parent address (`0` = none), and the trailing list is the neighbours it hears as
-`<neighbour addr>=<link cost>` (omitted when none). A node that knows no rows
-returns the empty reply `ATC+MESHTOPO=`. Every
+parent address (`0` = none), `btaddr` is that node's full 48-bit device id (12 hex
+chars, MSB first) -- a node always resolves its own, and the **master node**
+resolves every address from its address <-> device-id map, so on any other node
+only its own row carries a non-zero `btaddr` -- and the trailing list is the
+neighbours it hears as `<neighbour addr>=<link cost>` (omitted when none). A node
+that knows no rows returns the empty reply `ATC+MESHTOPO=`. Every
 node serves its **own** row (live from its neighbour table) plus a row for each
 **descendant** whose report it has passed rootward, so the master node -- being the
 root -- covers the whole network while any other node sees only the part of the
