@@ -136,6 +136,31 @@ int main(void)
     mesh_route_select(n, NEIGH_MAX, &cur, 9, MESH_PARENT_HYSTERESIS, &out);
     CHECK(out.parent_addr == 4);
 
+    /* --- a neighbour already at the hop limit is not a usable parent ----- */
+    std::memset(n, 0, sizeof(n));
+    put(n, 0, 3, 100, 0, MESH_DEFAULT_TTL);
+    cur.parent_addr = MESH_ADDR_NONE;
+    mesh_route_select(n, NEIGH_MAX, &cur, 9, MESH_PARENT_HYSTERESIS, &out);
+    CHECK(out.parent_addr == MESH_ADDR_NONE);
+
+    /* --- one hop below the limit still is, and puts us exactly at it ----- */
+    std::memset(n, 0, sizeof(n));
+    put(n, 0, 3, 100, 0, MESH_DEFAULT_TTL - 1);
+    cur.parent_addr = MESH_ADDR_NONE;
+    mesh_route_select(n, NEIGH_MAX, &cur, 9, MESH_PARENT_HYSTERESIS, &out);
+    CHECK(out.parent_addr == 3);
+    CHECK(out.self_hops == MESH_DEFAULT_TTL);
+
+    /* --- hysteresis must not grandfather an over-deep current parent ----- */
+    std::memset(n, 0, sizeof(n));
+    put(n, 0, 3, 100, 0, MESH_DEFAULT_TTL);   /* current parent, now too deep */
+    put(n, 1, 4, 20,  3, 1);                  /* valid but costly */
+    cur.parent_addr = 3;
+    cur.self_cost   = 1;
+    cur.self_hops   = MESH_DEFAULT_TTL + 1;
+    mesh_route_select(n, NEIGH_MAX, &cur, 9, MESH_PARENT_HYSTERESIS, &out);
+    CHECK(out.parent_addr == 4);              /* abandoned, not kept */
+
     if (g_failures == 0) {
         std::printf("ALL TESTS PASSED\n");
         return 0;

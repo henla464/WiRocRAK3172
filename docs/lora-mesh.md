@@ -277,7 +277,9 @@ truth for their own address via flash (see *Recovery*).
 All routable nodes emit a **beacon** advertising
 `path cost = link_cost(self,parent) + parent.path_cost` and their hop-count (a
 leaf node advertises at a reduced rate -- see "Adaptive beacon" below). A
-node picks as parent the neighbour minimising `link_cost + n.path_cost`.
+node picks as parent the neighbour minimising `link_cost + n.path_cost`. A
+neighbour already at the hop limit is never a candidate: attaching to it would put
+this node past the limit, where its uplinks could no longer reach the root.
 
 **SNR is preferred to RSSI** (RSSI saturates and is dominated by the noise floor;
 SNR reflects the demodulation margin). Per-neighbour SNR is smoothed with an
@@ -299,7 +301,8 @@ the datarate is retuned:
 Because the metric is a summed cost, a **2-hop all-good path (cost 2) beats a weak
 direct link (cost 6)**: the node deliberately chooses the extra reliable hop.
 Parent switching requires a hysteresis margin to avoid flapping, and a stale parent
-(no beacon for `3x` the current interval) is dropped immediately.
+(no beacon for `3x` the current interval) is dropped immediately -- as is one that
+has become ineligible by reaching the hop limit, which the margin does not protect.
 
 ### Uplink
 
@@ -634,7 +637,7 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_LINK_RETRIES` | 3 | link retransmits (timeout is derived, see MAC) |
 | `MESH_TX_BACKOFF_MIN_MS` / `MESH_TX_BACKOFF_MAX_MS` | 40 / 1280 | queued-frame backoff after a busy CAD (window bounds, doubles per attempt; the delay waited is drawn from the window's upper half, so 20-40 ms at first) |
 | `MESH_TX_FAST_MS` / `MESH_TX_FAST_JITTER_MS` | 10 / 30 | fast drain delay for a point-to-point frame (base + random jitter) before it is sent, instead of waiting for the 200 ms housekeeping tick |
-| `MESH_DEFAULT_TTL` | 4 | max hops |
+| `MESH_DEFAULT_TTL` | 4 | max hops: frame TTL, and the tree depth a node will attach at |
 | `MESH_NEIGHBOR_MAX` | 8 | tracked neighbours per node |
 | `MESH_PARENT_HYSTERESIS` | 1 | cost margin required to switch parent |
 | `MESH_TOPO_INTERVAL_MS` | 300000 | topology-report backstop period (a re-parent also triggers an immediate report) |

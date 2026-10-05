@@ -38,6 +38,15 @@ static void mesh_route_clear(mesh_route_t *r)
     r->self_hops   = 0;
 }
 
+/* A neighbour may be our parent only if taking it keeps us inside the hop
+ * limit: our own depth becomes its advertised hop-count plus one, so a
+ * neighbour already at the limit cannot be one. */
+static bool mesh_parent_eligible(const mesh_route_neighbor_t *c, uint8_t self_addr)
+{
+    return c->addr != MESH_ADDR_NONE && c->addr != self_addr &&
+           c->hops < MESH_DEFAULT_TTL;
+}
+
 void mesh_route_select(const mesh_route_neighbor_t *n, uint8_t count,
                        const mesh_route_t *cur, uint8_t self_addr,
                        uint8_t hysteresis, mesh_route_t *out)
@@ -51,7 +60,7 @@ void mesh_route_select(const mesh_route_neighbor_t *n, uint8_t count,
         const mesh_route_neighbor_t *c = &n[i];
         uint8_t total;
 
-        if (c->addr == MESH_ADDR_NONE || c->addr == self_addr) {
+        if (!mesh_parent_eligible(c, self_addr)) {
             continue;
         }
         total = (uint8_t)(c->link_cost + c->cost);
@@ -72,7 +81,11 @@ void mesh_route_select(const mesh_route_neighbor_t *n, uint8_t count,
     if (cur->parent_addr != MESH_ADDR_NONE) {
         for (i = 0; i < count; i++) {
             if (n[i].addr == cur->parent_addr) {
-                cur_total = (uint8_t)(n[i].link_cost + n[i].cost);
+                /* An ineligible current parent is left at 0xFF so the
+                 * hysteresis below cannot keep us attached to it. */
+                if (mesh_parent_eligible(&n[i], self_addr)) {
+                    cur_total = (uint8_t)(n[i].link_cost + n[i].cost);
+                }
                 break;
             }
         }
@@ -87,8 +100,5 @@ void mesh_route_select(const mesh_route_neighbor_t *n, uint8_t count,
     out->parent_addr = best->addr;
     out->parent_cost = best->cost;
     out->self_cost   = (uint8_t)(best->link_cost + best->cost);
-    out->self_hops   = (uint8_t)(best->hops + 1);
-    if (out->self_hops > MESH_DEFAULT_TTL) {
-        out->self_hops = MESH_DEFAULT_TTL;
-    }
+    out->self_hops   = (uint8_t)(best->hops + 1);   /* <= the hop limit, by eligibility */
 }
