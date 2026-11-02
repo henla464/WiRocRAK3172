@@ -29,6 +29,16 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg);
 
 unsigned long start_send;
 
+/* A config write stops reception and re-applies the radio settings, which also
+ * aborts any transmission in flight -- the auto-ACK can start from the RX
+ * interrupt while the write is running.  That TX never completes, so release
+ * the busy indication here instead of waiting for a callback that won't come. */
+static void release_tx_indicator(void)
+{
+    digitalWrite(LORA_AUX, HIGH);
+    digitalWrite(LED_RED_TRANSMIT, HIGH);
+}
+
 
 bool init_status_at(void)
 {
@@ -318,6 +328,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 
         set_useRuntimeConfigP2P(false);
         api.lora.precv(65533);
+        release_tx_indicator();
         return AT_OK;
 
         STEP_ATP2P_CHECK_ERROR_CODE:
@@ -337,6 +348,8 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		service_lora_p2p_set_fix_length_payload(o_fix_length_payload);
 		
         api.lora.precv(65533);
+		
+        release_tx_indicator();
         //Check and return error code
         return at_error_code_form_udrv(udrv_code);
     }
@@ -478,6 +491,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         set_useRuntimeConfigP2P(true);
         service_lora_p2p_config();
         api.lora.precv(65533);
+        release_tx_indicator();
         return AT_OK;
 
         STEP_ATP2P2_CHECK_ERROR_CODE:
@@ -498,6 +512,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 			service_lora_p2p_set_fix_length_payload(o_fix_length_payload);
         }
         api.lora.precv(65533);
+        release_tx_indicator();
         //Check and return error code
         return at_error_code_form_udrv(udrv_code);
     }
