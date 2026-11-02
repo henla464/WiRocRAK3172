@@ -50,9 +50,9 @@ void setup() {
     
     if (!init_config_at())
 	{
-		Serial.printf("SETUP Add custom AT command P2P Config fail\r\n");
+		Serial.printf("SETUP Add custom AT command P2P/P2PM Config fail\r\n");
 	} else {
-        Serial.printf("SETUP Custom AT command P2P Config initialized\r\n");
+        Serial.printf("SETUP Custom AT command P2P/P2PM Config initialized\r\n");
     }
 
     if (!init_send_at())

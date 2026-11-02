@@ -41,7 +41,16 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
 | `ATC+MESHNODEDEVICEID=<12 hex>` | Set the 6-byte node device id (persisted). `ATC+MESHNODEDEVICEID?` reads it back. |
 | `ATC+MESHSTATE=?` | Diagnostics (see below). |
 | `ATC+MESHTOPO=?` | Dump the topology map this node knows, one line with rows separated by `|` (see below). |
-| `ATC+P2P=<runcfg>:...,[:<mesh>:<root>:<standby>:<deviceid>]` | Mesh flags and node device id as trailing params of the P2P config command. |
+| `ATC+P2PM=<runcfg>:...,[:<mesh>:<root>:<standby>:<deviceid>]` | Mesh-aware P2P config: mesh flags and node device id as trailing params. |
+| `ATC+P2P=<...>` | Original legacy P2P config, kept for old hosts (see below). |
+
+> **`ATC+P2P` vs `ATC+P2PM`.** The mesh-aware config command is `ATC+P2PM`, whose
+> layout is **not** compatible with the original `ATC+P2P` (it adds a mandatory
+> leading runtime selector and an optional mesh tail). The original `ATC+P2P`
+> command is still registered for pre-mesh hosts; it has the legacy layout and
+> **forces mesh mode off** (persisted), so `ATC+SEND`/`ATC+REC` keep their plain
+> P2P semantics. Old hosts therefore cannot enable the mesh or supply a node
+> device id, and using `ATC+P2P` on a mesh-configured device disables the mesh.
 
 A device only joins the network once mesh mode is enabled **and** it has a node
 device id and it is not the root node. A node with **no node device id** neither
@@ -53,9 +62,9 @@ provisioned by the host from the host's own Bluetooth address, so it is unique
 per node. It rides only the `JOIN_REQ` / `ADDR_ASSIGN` / `ADDR_CLAIM` control
 frames, never the data frames.
 
-**`ATC+P2P` layout.** The runtime-config selector is the **first parameter and
+**`ATC+P2PM` layout.** The runtime-config selector is the **first parameter and
 is mandatory**; the 12 radio parameters follow, then the optional mesh tail.
-`ATC+P2P=?` returns the same layout -- its first field is the active selector --
+`ATC+P2PM=?` returns the same layout -- its first field is the active selector --
 so the query output can be fed straight back as a set command.
 
 | argc | params |
@@ -693,7 +702,7 @@ not yet have a parent whose forward it could rely on.
 
 The mesh is designed to run at **31.25 kHz bandwidth** (the RAK bandwidth *enum*
 index `7`; "32 kHz" is really 31.25 kHz) with SF5-SF8. Set it with
-`ATC+P2P=0:<freq>:<sf>:7:<cr>:...` (the leading `0` is the mandatory
+`ATC+P2PM=0:<freq>:<sf>:7:<cr>:...` (the leading `0` is the mandatory
 runtime-config selector) -- `service_lora_p2p_set_bandwidth()` takes the raw
 index, so `7` passes straight through.
 
@@ -989,7 +998,7 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
   designate one as the root node -> the other node joins and is assigned an address; its
   `ATC+SEND` arrives at the root node's `ATC+REC` with `srcaddr` = its own address; an
   app-level ACK sent back with `ATC+SEND=<addr>:...` reaches it.
-* **Narrowband**: run two devices at `ATC+P2P=0:<freq>:<sf>:7:<cr>:...` (31.25 kHz) for SF5
+* **Narrowband**: run two devices at `ATC+P2PM=0:<freq>:<sf>:7:<cr>:...` (31.25 kHz) for SF5
   and SF8; verify join, uplink, downlink, and that `ATC+MESHSTATE?` reports the derived
   `ackms` and the measured `overhead%`.
 * **Lab, multi-hop**: three nodes in a line with the far one out of the root node's

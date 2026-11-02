@@ -20,8 +20,10 @@ extern "C" {
 
 
 int status_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int features_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int send_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int config_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int config_handler_legacy(SERIAL_PORT port, char *cmd, stParam *param);
 int receive_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int mesh_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int activeroot_handler(SERIAL_PORT port, char *cmd, stParam *param);
@@ -36,22 +38,50 @@ static void p2p_printf_hex(uint8_t *pdata, uint16_t len);
 
 unsigned long start_send;
 
+/* A config write stops reception and re-applies the radio settings, which also
+ * aborts any transmission in flight -- the auto-ACK can start from the RX
+ * interrupt while the write is running.  That TX never completes, so release
+ * the busy indication here instead of waiting for a callback that won't come. */
+static void release_tx_indicator(void)
+{
+    digitalWrite(LORA_AUX, HIGH);
+    digitalWrite(LED_RED_TRANSMIT, HIGH);
+}
+
 
 bool init_status_at(void)
 {
-	return api.system.atMode.add((char *)"STATUS",
+	bool ok = true;
+	ok &= api.system.atMode.add((char *)"STATUS",
 								 (char *)"Get device information",
 								 (char *)"STATUS", status_handler,
 								 RAK_ATCMD_PERM_READ);
+	ok &= api.system.atMode.add((char *)"FEATURES",
+								 (char *)"Get firmware capabilities. Usage: ATC+FEATURES=?",
+								 (char *)"FEATURES", features_handler,
+								 RAK_ATCMD_PERM_READ);
+	return ok;
 }
 
 bool init_config_at(void)
 {
+	bool ok = true;
 
-	return api.system.atMode.add((char *)"P2P",
-								 (char *)"Configure in P2P mode. Usage: ATC+P2P=<runtime config 0|1>:<frequency>:<spreading factor>:<bandwidth>:<coding rate>:<preamble length>:<tx power>:<low data rate optimize>:<crc on>:<rx gain>:<drf1268dscompatmode>:<sendack>:<payload length>[:<mesh>:<root>:<standby>:<deviceid>]",
-								 (char *)"P2P", config_handler,
+	// P2PM: mesh-aware P2P config.  This is NOT wire-compatible with the
+	// legacy ATC+P2P command: the runtime-config selector is the first
+	// parameter and an optional mesh tail may follow.  New hosts use this.
+	ok &= api.system.atMode.add((char *)"P2PM",
+								 (char *)"Configure in P2P mesh mode. Usage: ATC+P2PM=<runtime config 0|1>:<frequency>:<spreading factor>:<bandwidth>:<coding rate>:<preamble length>:<tx power>:<low data rate optimize>:<crc on>:<rx gain>:<drf1268dscompatmode>:<sendack>:<payload length>[:<mesh>:<root>:<standby>:<deviceid>]",
+								 (char *)"P2PM", config_handler,
 								 RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
+
+	// P2P: the original, legacy-compatible P2P config command kept for old
+	// hosts.  It has the same layout as the pre-mesh firmware on main.
+	ok &= api.system.atMode.add((char *)"P2P",
+								 (char *)"Configure in P2P mode. Usage: ATC+P2P=<frequency>:<spreading factor>:<bandwidth>:<coding rate>:<preamble length>:<tx power>:<low data rate optimize>:<crc on>:<rx gain>:<drf1268dscompatmode>:<sendack>:<payload length>",
+								 (char *)"P2P", config_handler_legacy,
+								 RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
+	return ok;
 }
 
 bool init_send_at(void)
@@ -160,6 +190,28 @@ int status_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		return AT_PARAM_ERROR;
 	}
 	return AT_OK;
+}
+
+// FEATURES //
+
+/**
+ * @brief Report firmware capabilities. Usage: ATC+FEATURES=?
+ *        Reply: 'ATC+FEATURES=<p2p>:<widechannels>:<narrowchannels>:<mesh>'
+ *          - <p2p>            1 when classic ATC+P2P is available
+ *          - <widechannels>   1 when the wide channels (BW index 7) work
+ *          - <narrowchannels> 1 when the narrow channels (BW index 4) work
+ *          - <mesh>           1 when the LoRa P2P mesh is present
+ *        New capabilities are appended as extra fields; hosts parse the
+ *        first four and ignore the rest.
+ */
+int features_handler(SERIAL_PORT port, char *cmd, stParam *param)
+{
+	if ((param->argc == 1 && !strcmp(param->argv[0], "?")) || param->argc == 0)
+	{
+		atcmd_printf("%s=1:1:1:1", cmd);
+		return AT_NO_STATUS;
+	}
+	return AT_PARAM_ERROR;
 }
 
 
@@ -628,6 +680,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 
         set_useRuntimeConfigP2P(false);
         api.lora.precv(65533);
+        release_tx_indicator();
         return AT_OK;
 
         STEP_ATP2P_CHECK_ERROR_CODE:
@@ -647,6 +700,8 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 		service_lora_p2p_set_fix_length_payload(o_fix_length_payload);
 		
         api.lora.precv(65533);
+		
+        release_tx_indicator();
         //Check and return error code
         return at_error_code_form_udrv(udrv_code);
     }
@@ -829,6 +884,7 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         set_useRuntimeConfigP2P(true);
         service_lora_p2p_config();
         api.lora.precv(65533);
+        release_tx_indicator();
         return AT_OK;
 
         STEP_ATP2P2_CHECK_ERROR_CODE:
@@ -849,6 +905,394 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 			service_lora_p2p_set_fix_length_payload(o_fix_length_payload);
         }
         api.lora.precv(65533);
+        release_tx_indicator();
+        //Check and return error code
+        return at_error_code_form_udrv(udrv_code);
+    }
+	else {
+        return AT_PARAM_ERROR;
+    }
+}
+
+
+/**
+ * @brief Configures the P2P parameters of the device (legacy ATC+P2P)
+ *
+ * This is the original command handler as it existed on the main branch,
+ * before the mesh work.  It is kept verbatim so that old hosts that speak
+ * the legacy ATC+P2P layout keep working.  The mesh-aware variant lives in
+ * config_handler() and is exposed as ATC+P2PM.
+ *
+ * Legacy layout: <frequency>:<spreading factor>:<bandwidth>:<coding rate>:
+ * <preamble length>:<tx power>:<low data rate optimize>:<crc on>:<rx gain>:
+ * <drf1268dscompatmode>:<sendack>:<payload length>[:<runtime config 0|1>]
+ *
+ * @param port Serial port used
+ * @param cmd char array with the received AT command
+ * @param param char array with the received AT command parameters
+ * @return int result of command parsing
+ * 			AT_OK AT command & parameters valid
+ * 			AT_PARAM_ERROR command or parameters invalid
+ */
+int config_handler_legacy(SERIAL_PORT port, char *cmd, stParam *param)
+{
+    if (param->argc == 1 && !strcmp(param->argv[0], "?"))
+    {
+        if (get_useRuntimeConfigP2P())
+        {
+            runtimeConfigP2P_t runtimeConfigP2P;
+            get_runtimeConfigP2P(&runtimeConfigP2P);
+            atcmd_printf("%s=", cmd);
+            atcmd_printf("%u:", runtimeConfigP2P.frequency);
+            atcmd_printf("%u:", runtimeConfigP2P.spreading_factor);
+            atcmd_printf("%u:", runtimeConfigP2P.bandwidth);
+            atcmd_printf("%u:", runtimeConfigP2P.coding_rate);
+            atcmd_printf("%u:", runtimeConfigP2P.preamble_length);
+            atcmd_printf("%u:", runtimeConfigP2P.txpower);
+			atcmd_printf("%d:", runtimeConfigP2P.low_data_rate_optimize);
+			atcmd_printf("%d:", runtimeConfigP2P.crc_on);
+            atcmd_printf("%d:", runtimeConfigP2P.rxgain);
+            atcmd_printf("%d:", runtimeConfigP2P.drf1268dscompatmode);
+            atcmd_printf("%d:", runtimeConfigP2P.sendack);
+			atcmd_printf("%u", runtimeConfigP2P.payload_len);
+        }
+        else
+	   	{
+            atcmd_printf("%s=", cmd);
+            atcmd_printf("%u:", service_lora_p2p_get_freq());
+            atcmd_printf("%u:", service_lora_p2p_get_sf());
+            atcmd_printf("%u:", service_lora_p2p_get_bandwidth());
+            atcmd_printf("%u:", service_lora_p2p_get_codingrate());
+            atcmd_printf("%u:", service_lora_p2p_get_preamlen());
+            atcmd_printf("%u:", service_lora_p2p_get_powerdbm());
+			atcmd_printf("%d:", service_lora_p2p_get_low_datarate_optimize());
+			atcmd_printf("%d:", service_lora_p2p_get_crcon());
+            atcmd_printf("%d:", service_lora_p2p_get_rxgain());
+            atcmd_printf("%d:", service_lora_p2p_get_drf1268dscompatmode());
+            atcmd_printf("%d:", service_lora_p2p_get_sendack());
+			atcmd_printf("%u", service_lora_p2p_get_payloadlen());
+        }
+        return AT_NO_STATUS;
+    }
+    else if (param->argc == 12 || (param->argc == 13 && !strcmp(param->argv[12],"0")))
+    {
+        uint32_t frequency,spreading_factor,bandwidth,coding_rate,preamble_length,
+			txpower, low_data_rate_optimize, crc_on, rxgain, drf1268dscompatmode,
+            sendack, payload_len;
+		bool b_crc_on, b_rxgain, b_low_data_rate_optimize, b_drf1268dscompatmode, b_sendack;
+        uint32_t o_frequency,o_spreading_factor,o_bandwidth,o_coding_rate,
+			o_preamble_length,o_txpower;
+		bool o_low_data_rate_optimize, o_crc_on, o_rxgain, o_drf1268dscompatmode,
+            o_sendack, o_fix_length_payload;
+		uint8_t o_payload_len;
+        uint8_t udrv_code;
+
+        // Preserve current p2p parameters
+        o_frequency = service_lora_p2p_get_freq();
+        o_spreading_factor = service_lora_p2p_get_sf();
+        o_bandwidth = service_lora_p2p_get_bandwidth();
+        o_coding_rate = service_lora_p2p_get_codingrate();
+        o_preamble_length = service_lora_p2p_get_preamlen();
+        o_txpower = service_lora_p2p_get_powerdbm();
+		o_low_data_rate_optimize = service_lora_p2p_get_low_datarate_optimize();
+		o_crc_on = service_lora_p2p_get_crcon();
+        o_rxgain = service_lora_p2p_get_rxgain();
+		o_payload_len = service_lora_p2p_get_payloadlen();
+        o_drf1268dscompatmode = service_lora_p2p_get_drf1268dscompatmode();
+        o_sendack = service_lora_p2p_get_sendack();
+		o_fix_length_payload = service_lora_p2p_get_fix_length_payload();
+
+        // Exchange parameters
+        if (0 != at_check_digital_uint32_t(param->argv[0], &frequency))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[1], &spreading_factor))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[2], &bandwidth))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[3], &coding_rate))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[4], &preamble_length))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[5], &txpower))
+            return AT_PARAM_ERROR;
+		if (0 != at_check_digital_uint32_t(param->argv[6], &low_data_rate_optimize))
+            return AT_PARAM_ERROR;
+		if (0 != at_check_digital_uint32_t(param->argv[7], &crc_on))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[8], &rxgain))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[9], &drf1268dscompatmode))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[10], &sendack))
+            return AT_PARAM_ERROR;
+		if (0 != at_check_digital_uint32_t(param->argv[11], &payload_len))
+            return AT_PARAM_ERROR;
+
+
+        if ((frequency < 150e6) || (frequency > 960e6))
+            return AT_PARAM_ERROR;
+
+        if ( spreading_factor < 5 || spreading_factor > 12)
+            return AT_PARAM_ERROR;
+
+        if (coding_rate > 4)
+            return AT_PARAM_ERROR;
+
+        if(preamble_length< 5 || preamble_length > 65535)
+            return AT_PARAM_ERROR;
+
+        if (txpower < 5 || txpower > 22)
+            return AT_PARAM_ERROR;
+
+		b_low_data_rate_optimize = low_data_rate_optimize != 0;
+		b_crc_on = crc_on != 0;
+		b_rxgain = rxgain != 0;
+        b_drf1268dscompatmode = drf1268dscompatmode != 0;
+        b_sendack = sendack != 0;
+
+		if (payload_len > 255)
+            return AT_PARAM_ERROR;
+
+        // Can only configure when recieve mode not enabled
+        api.lora.precv(0);
+
+        // Check and save parameters
+        udrv_code = service_lora_p2p_set_freq(frequency);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_set_sf((uint8_t)spreading_factor);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_set_bandwidth(bandwidth);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_set_codingrate((uint8_t)coding_rate);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_set_preamlen((uint16_t)preamble_length);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_set_powerdbm((uint8_t)txpower);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+		udrv_code = service_lora_p2p_set_low_datarate_optimize(b_low_data_rate_optimize);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+		udrv_code = service_lora_p2p_set_crcon(b_crc_on);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_set_rxgain(b_rxgain);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_set_drf1268dscompatmode(b_drf1268dscompatmode);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_set_sendack(b_sendack);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+		udrv_code = service_lora_p2p_set_payloadlen(payload_len);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+		udrv_code = service_lora_p2p_set_fix_length_payload(payload_len > 0);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P_CHECK_ERROR_CODE;
+
+        set_useRuntimeConfigP2P(false);
+        // A host that speaks the legacy ATC+P2P command is not mesh-aware, so
+        // force mesh off.  Otherwise ATC+SEND/ATC+REC would keep taking the
+        // mesh path (uplink/downlink routing) instead of plain P2P.
+        mesh_set_enabled(false);
+        mesh_config_save();
+        api.lora.precv(65533);
+        release_tx_indicator();
+        return AT_OK;
+
+        STEP_ATP2P_CHECK_ERROR_CODE:
+        //Restore the previous parameters
+        service_lora_p2p_set_freq(o_frequency);
+        service_lora_p2p_set_sf((uint8_t)o_spreading_factor);
+        service_lora_p2p_set_bandwidth(o_bandwidth);
+        service_lora_p2p_set_codingrate((uint8_t)o_coding_rate);
+        service_lora_p2p_set_preamlen((uint16_t)o_preamble_length);
+        service_lora_p2p_set_powerdbm((uint8_t)o_txpower);
+		service_lora_p2p_set_low_datarate_optimize(o_low_data_rate_optimize);
+		service_lora_p2p_set_crcon(o_crc_on);
+        service_lora_p2p_set_rxgain(o_rxgain);
+        service_lora_p2p_set_drf1268dscompatmode(o_drf1268dscompatmode);
+        service_lora_p2p_set_sendack(o_sendack);
+		service_lora_p2p_set_payloadlen((uint8_t)o_payload_len);
+		service_lora_p2p_set_fix_length_payload(o_fix_length_payload);
+
+        api.lora.precv(65533);
+
+        release_tx_indicator();
+        //Check and return error code
+        return at_error_code_form_udrv(udrv_code);
+    }
+    else if (param->argc == 13 && !strcmp(param->argv[12],"1")) { //for runtime setting
+        uint32_t frequency,spreading_factor,bandwidth,coding_rate,preamble_length,
+			txpower, low_data_rate_optimize, crc_on, rxgain, drf1268dscompatmode,
+            sendack, payload_len;
+        uint32_t o_frequency,o_spreading_factor,o_bandwidth,o_coding_rate,o_preamble_length,o_txpower;
+		bool o_low_data_rate_optimize, o_crc_on, o_rxgain, o_drf1268dscompatmode,
+            o_sendack, o_fix_length_payload;
+		uint8_t o_payload_len;
+        uint8_t udrv_code;
+        bool o_useRuntimeConfig = get_useRuntimeConfigP2P();
+        runtimeConfigP2P_t runtimeConfigP2P;
+
+        // Preserve current p2p parameters
+        if (o_useRuntimeConfig) {
+            get_runtimeConfigP2P(&runtimeConfigP2P);
+            o_frequency = runtimeConfigP2P.frequency;
+            o_spreading_factor = runtimeConfigP2P.spreading_factor;
+            if (SERVICE_LORA_P2P == service_lora_p2p_get_nwm()) {
+                o_bandwidth = runtimeConfigP2P.bandwidth;
+            }
+            else if (SERVICE_LORA_FSK == service_lora_p2p_get_nwm()) {
+                o_bandwidth = runtimeConfigP2P.fsk_rxbw;
+            }
+            o_coding_rate = runtimeConfigP2P.coding_rate;
+            o_preamble_length = runtimeConfigP2P.preamble_length;
+            o_txpower = runtimeConfigP2P.txpower;
+			o_low_data_rate_optimize = runtimeConfigP2P.low_data_rate_optimize;
+			o_crc_on = runtimeConfigP2P.crc_on;
+            o_rxgain = runtimeConfigP2P.rxgain;
+            o_drf1268dscompatmode = runtimeConfigP2P.drf1268dscompatmode;
+            o_sendack = runtimeConfigP2P.sendack;
+			o_payload_len = runtimeConfigP2P.payload_len;
+			o_fix_length_payload = runtimeConfigP2P.fix_length_payload;
+        }
+        else {
+            o_frequency = service_lora_p2p_get_freq();
+            o_spreading_factor = service_lora_p2p_get_sf();
+            o_bandwidth = service_lora_p2p_get_bandwidth();
+            o_coding_rate = service_lora_p2p_get_codingrate();
+            o_preamble_length = service_lora_p2p_get_preamlen();
+            o_txpower = service_lora_p2p_get_powerdbm();
+			o_low_data_rate_optimize = service_lora_p2p_get_low_datarate_optimize();
+			o_crc_on = service_lora_p2p_get_crcon();
+            o_rxgain = service_lora_p2p_get_rxgain();
+            o_drf1268dscompatmode = service_lora_p2p_get_drf1268dscompatmode();
+            o_sendack = service_lora_p2p_get_sendack();
+			o_payload_len = service_lora_p2p_get_payloadlen();
+			o_fix_length_payload = service_lora_p2p_get_fix_length_payload();
+        }
+
+        // Exchange parameters
+        if (0 != at_check_digital_uint32_t(param->argv[0], &frequency))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[1], &spreading_factor))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[2], &bandwidth))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[3], &coding_rate))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[4], &preamble_length))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[5], &txpower))
+            return AT_PARAM_ERROR;
+		if (0 != at_check_digital_uint32_t(param->argv[6], &low_data_rate_optimize))
+            return AT_PARAM_ERROR;
+		if (0 != at_check_digital_uint32_t(param->argv[7], &crc_on))
+            return AT_PARAM_ERROR;
+		if (0 != at_check_digital_uint32_t(param->argv[8], &rxgain))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[9], &drf1268dscompatmode))
+            return AT_PARAM_ERROR;
+        if (0 != at_check_digital_uint32_t(param->argv[10], &sendack))
+            return AT_PARAM_ERROR;
+		if (0 != at_check_digital_uint32_t(param->argv[11], &payload_len))
+            return AT_PARAM_ERROR;
+
+        // Compatible old SPEC for bandwidth
+        if (SERVICE_LORA_P2P == service_lora_p2p_get_nwm()) {
+            if( bandwidth == 125 ) {
+                bandwidth = 0;
+            }
+            else if( bandwidth == 250 ) {
+                bandwidth = 1;
+            }
+            else if( bandwidth == 500 ) {
+                bandwidth = 2;
+            }
+        }
+
+        // Check parameters
+		udrv_code = service_lora_p2p_check_runtime_freq(frequency);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P2_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_check_runtime_sf((uint8_t)spreading_factor);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P2_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_check_runtime_bandwidth(bandwidth);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P2_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_check_runtime_codingrate((uint8_t)coding_rate);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P2_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_check_runtime_preamlen((uint16_t)preamble_length);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P2_CHECK_ERROR_CODE;
+        udrv_code = service_lora_p2p_check_runtime_powerdbm((uint8_t)txpower);
+        if( udrv_code != UDRV_RETURN_OK)
+            goto STEP_ATP2P2_CHECK_ERROR_CODE;
+
+		if (payload_len > 255)
+			return AT_PARAM_ERROR;
+
+        runtimeConfigP2P.frequency = frequency;
+        runtimeConfigP2P.spreading_factor = (uint8_t)spreading_factor;
+        if (SERVICE_LORA_P2P == service_lora_p2p_get_nwm()) {
+            runtimeConfigP2P.bandwidth = bandwidth;
+        }
+        else if (SERVICE_LORA_FSK == service_lora_p2p_get_nwm()) {
+            runtimeConfigP2P.fsk_rxbw = bandwidth;
+        }
+        runtimeConfigP2P.coding_rate = (uint8_t)coding_rate;
+        runtimeConfigP2P.preamble_length = (uint16_t)preamble_length;
+        runtimeConfigP2P.txpower = (uint8_t)txpower;
+		runtimeConfigP2P.low_data_rate_optimize = low_data_rate_optimize != 0;
+		runtimeConfigP2P.crc_on = crc_on != 0;
+        runtimeConfigP2P.rxgain = rxgain != 0;
+        runtimeConfigP2P.drf1268dscompatmode = drf1268dscompatmode != 0;
+        runtimeConfigP2P.sendack = sendack != 0;
+		runtimeConfigP2P.payload_len = (uint8_t)payload_len;
+		runtimeConfigP2P.fix_length_payload = payload_len > 0;
+
+        // Can only configure when recieve mode not enabled
+        api.lora.precv(0);
+
+        set_runtimeConfigP2P(&runtimeConfigP2P);
+        set_useRuntimeConfigP2P(true);
+        service_lora_p2p_config();
+        // A host that speaks the legacy ATC+P2P command is not mesh-aware, so
+        // force mesh off (see config_handler_legacy stored-config branch).
+        mesh_set_enabled(false);
+        mesh_config_save();
+        api.lora.precv(65533);
+        release_tx_indicator();
+        return AT_OK;
+
+        STEP_ATP2P2_CHECK_ERROR_CODE:
+        //Restore the previous parameters
+        if (!o_useRuntimeConfig) {
+            service_lora_p2p_set_freq(o_frequency);
+            service_lora_p2p_set_sf((uint8_t)o_spreading_factor);
+            service_lora_p2p_set_bandwidth(o_bandwidth);
+            service_lora_p2p_set_codingrate((uint8_t)o_coding_rate);
+            service_lora_p2p_set_preamlen((uint16_t)o_preamble_length);
+            service_lora_p2p_set_powerdbm((uint8_t)o_txpower);
+			service_lora_p2p_set_low_datarate_optimize(o_low_data_rate_optimize);
+			service_lora_p2p_set_crcon(o_crc_on);
+            service_lora_p2p_set_rxgain(o_rxgain);
+            service_lora_p2p_set_drf1268dscompatmode(o_drf1268dscompatmode);
+            service_lora_p2p_set_sendack(o_sendack);
+			service_lora_p2p_set_payloadlen(o_payload_len);
+			service_lora_p2p_set_fix_length_payload(o_fix_length_payload);
+        }
+        api.lora.precv(65533);
+        release_tx_indicator();
         //Check and return error code
         return at_error_code_form_udrv(udrv_code);
     }
@@ -977,6 +1421,8 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
     if (sentOK) {
         return AT_OK;
     } else {
+        digitalWrite(LORA_AUX, HIGH);
+        digitalWrite(LED_RED_TRANSMIT, HIGH);
         return AT_BUSY_ERROR;
     }
 }
@@ -1025,7 +1471,45 @@ bool send_ack(bool drf1268dsCompatMode, uint8_t channelNumber, uint8_t calculate
     digitalWrite(LORA_AUX, LOW);
     /* CAD forced on (listen before talk) for the auto-ACK too. */
     bool ackSentOK = api.lora.psend(drf1268dsCompatMode ? 8:7, ackMsg, true);
+    if (!ackSentOK)
+    {
+        digitalWrite(LED_RED_TRANSMIT, HIGH);
+        digitalWrite(LORA_AUX, HIGH);
+    }
     return ackSentOK;
+}
+
+/* The auto-ACK must not run inside the radio interrupt.  receive_cb runs in the
+ * SUBGHZ ISR (RxDone -> receive_cb), and with CAD forced on psend waits for the
+ * CAD-done IRQ -- which cannot preempt that same ISR, so it would spin forever.
+ * Park the ACK here and let the RUI timer context send it. */
+static struct {
+    bool pending;
+    bool drf1268dsCompatMode;
+    uint8_t channelNumber;
+    uint8_t hash[2];
+} pendingAck;
+
+void send_pending_ack(void *)
+{
+    if (!pendingAck.pending)
+        return;
+    pendingAck.pending = false;
+    send_ack(pendingAck.drf1268dsCompatMode, pendingAck.channelNumber, pendingAck.hash);
+}
+
+static bool queue_ack(bool drf1268dsCompatMode, uint8_t channelNumber, uint8_t calculatedHash[2])
+{
+    if (pendingAck.pending)
+        return false;   /* one ACK in flight; the sender retries the punch */
+    pendingAck.pending = true;
+    pendingAck.drf1268dsCompatMode = drf1268dsCompatMode;
+    pendingAck.channelNumber = channelNumber;
+    pendingAck.hash[0] = calculatedHash[0];
+    pendingAck.hash[1] = calculatedHash[1];
+    api.system.timer.create(RAK_TIMER_4, send_pending_ack, RAK_TIMER_ONESHOT);
+    api.system.timer.start(RAK_TIMER_4, 1, NULL);
+    return true;
 }
 
 
@@ -1124,7 +1608,7 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
             {
                 // Hash matches! Send ack
                 uint8_t channelNumber = theMessage.Buffer[0]; // only valid, and only used when drf1268dsCompatMode = true
-                ackSentOK = send_ack(service_lora_p2p_get_drf1268dscompatmode(), channelNumber, calculatedHash);
+                ackSentOK = queue_ack(service_lora_p2p_get_drf1268dscompatmode(), channelNumber, calculatedHash);
             }
         }
         if (
@@ -1174,7 +1658,7 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
             {
                 // Hash matches! Send ack
                 uint8_t channelNumber = theMessage.Buffer[0]; // only valid, and only used when drf1268dsCompatMode = true
-                ackSentOK = send_ack(service_lora_p2p_get_drf1268dscompatmode(), channelNumber, calculatedHash);
+                ackSentOK = queue_ack(service_lora_p2p_get_drf1268dscompatmode(), channelNumber, calculatedHash);
                 
             }
         }
