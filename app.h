@@ -9,6 +9,7 @@
 #define MSG_TYPE_PUNCH_DOUBLE  0x08
 
 // Forward declarations
+bool wiroc_ack_requested(const uint8_t *buf, uint16_t len, uint16_t off, uint8_t hash[2]);
 bool init_status_at(void);
 bool init_send_at(void);
 bool init_config_at(void);

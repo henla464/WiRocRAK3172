@@ -1513,6 +1513,48 @@ static bool queue_ack(bool drf1268dsCompatMode, uint8_t channelNumber, uint8_t c
 }
 
 
+/* True when buf/len is a WiRoc punch frame that requests an ACK and whose
+ * hash validates; hash receives the two bytes the ACK must echo.  `off` skips
+ * the drf1268ds compat channel byte.  Shared by the plain-P2P auto-ACK and the
+ * mesh root's auto-ACK (mesh payloads carry no compat byte, off = 0). */
+bool wiroc_ack_requested(const uint8_t *buf, uint16_t len, uint16_t off, uint8_t hash[2])
+{
+    uint8_t d[27];
+    uint8_t header;
+
+    if (len <= off)
+        return false;
+    header = buf[off];
+    if (!(header & 0x80) || (header & 0x20))
+        return false;
+
+    if (len == 15 + off && ((header & 0x1F) == MSG_TYPE_PUNCH))
+    {
+        d[0] = buf[off+0];  d[1] = buf[off+4];  d[2] = buf[off+8];
+        d[3] = buf[off+2];  d[4] = buf[off+3];  d[5] = buf[off+5];
+        d[6] = buf[off+11]; d[7] = buf[off+6];  d[8] = buf[off+7];
+        d[9] = buf[off+9];  d[10] = buf[off+10]; d[11] = buf[off+12];
+        d[12] = buf[off+13]; d[13] = buf[off+14]; d[14] = buf[off+1];
+        shake128_2byte(hash, d + 1, 12);
+        return (hash[0] == d[13]) && (hash[1] == d[14]);
+    }
+    if (len == 27 + off && ((header & 0x1F) == MSG_TYPE_PUNCH_DOUBLE))
+    {
+        d[0] = buf[off+0];  d[1] = buf[off+5];  d[2] = buf[off+10];
+        d[3] = buf[off+2];  d[4] = buf[off+3];  d[5] = buf[off+4];
+        d[6] = buf[off+14]; d[7] = buf[off+6];  d[8] = buf[off+7];
+        d[9] = buf[off+18]; d[10] = buf[off+22]; d[11] = buf[off+8];
+        d[12] = buf[off+9]; d[13] = buf[off+11]; d[14] = buf[off+25];
+        d[15] = buf[off+12]; d[16] = buf[off+13]; d[17] = buf[off+15];
+        d[18] = buf[off+16]; d[19] = buf[off+17]; d[20] = buf[off+19];
+        d[21] = buf[off+20]; d[22] = buf[off+21]; d[23] = buf[off+23];
+        d[24] = buf[off+24]; d[25] = buf[off+1]; d[26] = buf[off+26];
+        shake128_2byte(hash, d + 1, 24);
+        return (hash[0] == d[25]) && (hash[1] == d[26]);
+    }
+    return false;
+}
+
 void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
 
     digitalWrite(LED_BLUE_RECEIVE, LOW);
@@ -1566,105 +1608,17 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
     Serial.printf("RSSI: %d SNR: %d\r\n", theMessage.Rssi, theMessage.Snr);
     
     uint8_t noOfBytesToRemoveFromStart = service_lora_p2p_get_drf1268dscompatmode() ? 1:0;
-    uint8_t header = theMessage.Buffer[noOfBytesToRemoveFromStart];
-    bool ackRequested = header & 0x80;
-    bool repeaterRequested = header & 0x20;
+    uint8_t ackHash[2];
     bool ackSentOK = false;
-    if (service_lora_p2p_get_sendack() && ackRequested && !repeaterRequested)
+    if (service_lora_p2p_get_sendack() &&
+        wiroc_ack_requested(theMessage.Buffer, theMessage.BufferSize,
+                            noOfBytesToRemoveFromStart, ackHash))
     {
-        LoraMeessage_t deInterleavedMsg;
-        if (
-                (theMessage.BufferSize == 15 + noOfBytesToRemoveFromStart) &&
-                ((theMessage.Buffer[noOfBytesToRemoveFromStart] & 0x1F) == MSG_TYPE_PUNCH)
-            )             
-        {
-            Serial.printf("Punch received\r\n");
-            deInterleavedMsg.Buffer[0] = theMessage.Buffer[0+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[1] = theMessage.Buffer[4+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[2] = theMessage.Buffer[8+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[3] = theMessage.Buffer[2+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[4] = theMessage.Buffer[3+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[5] = theMessage.Buffer[5+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[6] = theMessage.Buffer[11+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[7] = theMessage.Buffer[6+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[8] = theMessage.Buffer[7+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[9] = theMessage.Buffer[9+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[10] = theMessage.Buffer[10+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[11] = theMessage.Buffer[12+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[12] = theMessage.Buffer[13+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[13] = theMessage.Buffer[14+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[14] = theMessage.Buffer[1+noOfBytesToRemoveFromStart];
-
-            uint8_t calculatedHash[2];
-            shake128_2byte(calculatedHash, deInterleavedMsg.Buffer+1, 12);
-
-            Serial.printf("Calculated hash: %02X",calculatedHash[0]);
-            Serial.printf("%02X",calculatedHash[1]);
-            Serial.printf("  Received hash %02X",deInterleavedMsg.Buffer[13]);
-            Serial.printf("%02X\r\n",deInterleavedMsg.Buffer[14]);
-
-            if ((calculatedHash[0] ==  deInterleavedMsg.Buffer[13]) &&
-                (calculatedHash[1] ==  deInterleavedMsg.Buffer[14]))
-            {
-                // Hash matches! Send ack
-                uint8_t channelNumber = theMessage.Buffer[0]; // only valid, and only used when drf1268dsCompatMode = true
-                ackSentOK = queue_ack(service_lora_p2p_get_drf1268dscompatmode(), channelNumber, calculatedHash);
-            }
-        }
-        if (
-                (theMessage.BufferSize == 27 + noOfBytesToRemoveFromStart) &&
-                ((theMessage.Buffer[noOfBytesToRemoveFromStart] & 0x1F) == MSG_TYPE_PUNCH_DOUBLE)
-            )             
-        {
-            Serial.printf("Punch double received\r\n");
-            deInterleavedMsg.Buffer[0] = theMessage.Buffer[0+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[1] = theMessage.Buffer[5+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[2] = theMessage.Buffer[10+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[3] = theMessage.Buffer[2+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[4] = theMessage.Buffer[3+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[5] = theMessage.Buffer[4+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[6] = theMessage.Buffer[14+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[7] = theMessage.Buffer[6+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[8] = theMessage.Buffer[7+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[9] = theMessage.Buffer[18+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[10] = theMessage.Buffer[22+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[11] = theMessage.Buffer[8+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[12] = theMessage.Buffer[9+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[13] = theMessage.Buffer[11+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[14] = theMessage.Buffer[25+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[15] = theMessage.Buffer[12+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[16] = theMessage.Buffer[13+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[17] = theMessage.Buffer[15+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[18] = theMessage.Buffer[16+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[19] = theMessage.Buffer[17+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[20] = theMessage.Buffer[19+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[21] = theMessage.Buffer[20+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[22] = theMessage.Buffer[21+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[23] = theMessage.Buffer[23+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[24] = theMessage.Buffer[24+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[25] = theMessage.Buffer[1+noOfBytesToRemoveFromStart];
-            deInterleavedMsg.Buffer[26] = theMessage.Buffer[26+noOfBytesToRemoveFromStart];
-            
-            uint8_t calculatedHash[2];
-            shake128_2byte(calculatedHash, deInterleavedMsg.Buffer+1, 24);
-
-            Serial.printf("Calculated hash: %02X",calculatedHash[0]);
-            Serial.printf("%02X",calculatedHash[1]);
-            Serial.printf("  Received hash %02X",deInterleavedMsg.Buffer[25]);
-            Serial.printf("%02X\r\n",deInterleavedMsg.Buffer[26]);
-
-            if ((calculatedHash[0] ==  deInterleavedMsg.Buffer[25]) &&
-                (calculatedHash[1] ==  deInterleavedMsg.Buffer[26]))
-            {
-                // Hash matches! Send ack
-                uint8_t channelNumber = theMessage.Buffer[0]; // only valid, and only used when drf1268dsCompatMode = true
-                ackSentOK = queue_ack(service_lora_p2p_get_drf1268dscompatmode(), channelNumber, calculatedHash);
-                
-            }
-        }
-        if (ackSentOK) {
-            theMessage.Status |= 0x80; // set bit 7 to indicate ack already sent
-        }
+        ackSentOK = queue_ack(service_lora_p2p_get_drf1268dscompatmode(),
+                              theMessage.Buffer[0], ackHash);
+    }
+    if (ackSentOK) {
+        theMessage.Status |= 0x80; // set bit 7 to indicate ack already sent
     }
     MessageQueue_enQueue(&incomingMessageQueue, &theMessage);
         

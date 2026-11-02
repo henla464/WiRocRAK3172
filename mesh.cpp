@@ -16,6 +16,7 @@
 #include <string.h>
 #include "service_lora_p2p.h"   /* service_lora_p2p_get_sf()/..._get_bandwidth() */
 #include "mesh.h"
+#include "app.h"
 #include "mesh_alloc.h"
 #include "mesh_route.h"
 #include "MessageQueue.h"
@@ -241,7 +242,7 @@ static uint32_t s_contend_next_ms;      /* next ROOT_QUERY retry                
 /* Defined in the M3 section below; used by the timer. */
 static void mesh_emit_beacon(void);
 static void mesh_check_parent_staleness(uint32_t now);
-static void mesh_deliver_to_host(const uint8_t *payload, uint8_t len, uint8_t src);
+static void mesh_deliver_to_host(const uint8_t *payload, uint8_t len, uint8_t src, uint8_t status);
 static void mesh_pending_tick(uint32_t now);
 
 /* Defined in the M2 section below; used by the timer. */
@@ -1549,7 +1550,7 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
     }
     if (mesh_is_root()) {
         /* The root's own message is delivered straight to its host. */
-        mesh_deliver_to_host(payload, len, MESH_ROOT_ADDR);
+        mesh_deliver_to_host(payload, len, MESH_ROOT_ADDR, 0);
         return true;
     }
     if (s_state != MESH_STATE_JOINED || s_route.parent_addr == MESH_ADDR_NONE) {
@@ -1579,7 +1580,8 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
     return true;
 }
 
-static void mesh_deliver_to_host(const uint8_t *payload, uint8_t len, uint8_t src)
+static void mesh_deliver_to_host(const uint8_t *payload, uint8_t len, uint8_t src,
+                                uint8_t status)
 {
     LoraMeessage_t msg;
 
@@ -1590,7 +1592,7 @@ static void mesh_deliver_to_host(const uint8_t *payload, uint8_t len, uint8_t sr
     memcpy(msg.Buffer, payload, len);
     msg.Rssi       = s_rx_rssi;
     msg.Snr        = s_rx_snr;
-    msg.Status     = 0;
+    msg.Status     = status;
     msg.SourceAddr = src;
     MessageQueue_enQueue(&incomingMessageQueue, &msg);
 }
@@ -1620,7 +1622,7 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
          * the root delivers the uplinks it receives, then probe for the
          * root's application ACK.  Only one probe is in flight at a time, so
          * a node's two quick uplinks are not counted as two independent trials. */
-        mesh_deliver_to_host(payload, plen, h->src);
+        mesh_deliver_to_host(payload, plen, h->src, 0);
         if (!s_probe_active && s_root_seen &&
             s_rx_snr >= MESH_STANDBY_MIN_SNR) {
             s_probe_active   = true;
@@ -1630,7 +1632,21 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
         return;                         /* never forward / ack: an observer is silent */
     }
     if (mesh_is_root()) {
-        mesh_deliver_to_host(payload, plen, h->src);
+        /* Module-sent application ACK, mirroring the plain-P2P auto-ACK: the
+         * same 0x85 + hash x3 frame, so the host skips its own AckData when
+         * bit 0x80 is set on the delivered message.  mesh_send_downlink only
+         * enqueues, so this is safe in the RX interrupt. */
+        uint8_t ackHash[2];
+        uint8_t status = 0;
+        if (service_lora_p2p_get_sendack() &&
+            wiroc_ack_requested(payload, plen, 0, ackHash)) {
+            uint8_t ack[7] = {0x85, ackHash[0], ackHash[1],
+                              ackHash[0], ackHash[1], ackHash[0], ackHash[1]};
+            if (mesh_send_downlink(h->src, ack, sizeof(ack))) {
+                status = 0x80;
+            }
+        }
+        mesh_deliver_to_host(payload, plen, h->src, status);
         /* A relay node clears its pending on the next hop's forward (implicit
          * ACK); the root has no next hop to overhear, so it answers with an
          * explicit LINK_ACK.  The exception is a direct child of the root: its
@@ -1770,7 +1786,7 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
         return;                         /* never relay: an observer is not in the tree */
     }
     if (h->dst == mesh_get_address()) {
-        mesh_deliver_to_host(payload, plen, h->src);
+        mesh_deliver_to_host(payload, plen, h->src, 0);
         /* The path ends here, so there is no next hop whose forward our parent
          * could overhear; we ack the final hop ourselves, the mirror of the
          * root acking an uplink it terminated.  A direct child of the root
