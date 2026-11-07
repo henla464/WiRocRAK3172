@@ -643,7 +643,7 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_EVICT_MS` | 610000 | root-node eviction grace |
 | `MESH_MONITOR_TIMEOUT_MS` | 450000 | depth >= 2 node: no parent aggregate for this long -> re-claim (1.5x `MESH_ALIVE_INTERVAL_MS`; must stay under `MESH_EVICT_MS`) |
 | `MESH_RECOVER_MS` | 10000 | root-node post-boot recovery window |
-| `MESH_LINK_RETRIES` | 3 | link retransmits (timeout is derived, see MAC) |
+| `MESH_LINK_RETRIES` | 1 | link retransmits (timeout is derived, see MAC) |
 | `MESH_TX_BACKOFF_MIN_MS` / `MESH_TX_BACKOFF_MAX_MS` | 40 / 1280 | queued-frame backoff after a busy CAD (window bounds, doubles per attempt; the delay waited is drawn from the window's upper half, so 20-40 ms at first) |
 | `MESH_TX_FAST_MS` / `MESH_TX_FAST_JITTER_MS` | 10 / 30 | fast drain delay for a point-to-point frame (base + random jitter) before it is sent, instead of waiting for the 200 ms housekeeping tick |
 | `MESH_DEFAULT_TTL` | 4 | max hops: frame TTL, and the tree depth a node will attach at |

@@ -135,7 +135,7 @@ uint16_t mesh_get_overhead_pct(void);
 bool    mesh_send_uplink(const uint8_t *payload, uint8_t len);
 
 /* --- M4 MAC / downlink -------------------------------------------------- */
-#define MESH_LINK_RETRIES        3      /* retransmits before giving up       */
+#define MESH_LINK_RETRIES        1      /* retransmits before giving up       */
 
 /* Channel access: every transmission is preceded by a CAD (listen before
  * talk), forced on regardless of the module's persisted CAD setting.  When the
