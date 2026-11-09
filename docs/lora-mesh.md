@@ -153,8 +153,9 @@ Addresses travel in the AT interface, so the host is updated in lock-step:
   In **both** modes a busy channel (CAD) is reported back as `AT_BUSY_ERROR`; the
   host backs off and resends (see "Channel access"). In mesh mode a node that
   cannot hand a payload to the mesh at all -- no address, or an address but no
-  parent to route through -- answers `AT_NO_NETWORK_JOINED` instead, so an
-  unattached node is not mistaken for a busy channel.
+  parent to route through -- answers `NN` (the `AT_NO_NETWORK_JOINED` code,
+  shortened in the AT layer like `BU`) instead, so an unattached node is not
+  mistaken for a busy channel.
 * **`ATC+REC`** appends a **source address** and the origin's **6-byte Bluetooth
   address** to both response forms:
 
