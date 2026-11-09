@@ -142,6 +142,17 @@ static bool     s_lde;                          /* low-datarate optimize (DE) */
 static uint32_t s_air_ctrl;
 static uint32_t s_air_data;
 
+/* Transmit/receive counters, reported by ATC+MESHSTATE.  They separate the
+ * three ways a frame can silently fail to arrive: never transmitted (tx_busy),
+ * never heard (rx_assign), or heard and then not adopted (rx_assign - adopt). */
+static uint16_t s_tx_ok;                        /* psend accepted              */
+static uint16_t s_tx_busy;                      /* psend refused (busy / CAD)  */
+static uint16_t s_tx_assign;                    /* ADDR_ASSIGN queued for TX   */
+static uint16_t s_rx_any;                        /* frames decoded off the air  */
+static uint16_t s_rx_assign;                    /* ADDR_ASSIGN decoded         */
+static uint16_t s_adopt;                        /* ADDR_ASSIGN assigned to us  */
+static uint8_t  s_last_type;                    /* wire type of the last frame */
+
 /* --- Channel access (listen before talk) -------------------------------- */
 /* After a busy channel the queue drain holds off until s_tx_next_ms, drawing a
  * fresh random window from s_tx_backoff_ms (which doubles per busy attempt). */
@@ -171,6 +182,7 @@ static uint16_t s_root_epoch;     /* node: last epoch heard (0 = unknown)   */
 static bool     s_epoch_valid;      /* node: s_root_epoch is meaningful      */
 static bool     s_claim_due;        /* node: an ADDR_CLAIM is pending (event)  */
 static uint32_t s_alive_next_ms;    /* node: next periodic liveness aggregate  */
+static uint32_t s_reclaim_next_ms;  /* node: next claim while we have no route */
 static bool     s_had_parent;       /* node: had a parent on the previous tick*/
 static uint32_t s_boot_ms;          /* root: uptime reference for RECOVER   */
 static uint32_t s_heard_ms[MESH_ADDR_MAX + 1]; /* root: last frame per addr  */
@@ -317,6 +329,13 @@ static void mesh_state_clear(void)
     s_rx_snr         = 0;
     s_air_ctrl       = 0;
     s_air_data       = 0;
+    s_tx_ok          = 0;
+    s_tx_busy        = 0;
+    s_tx_assign      = 0;
+    s_rx_any         = 0;
+    s_rx_assign      = 0;
+    s_adopt          = 0;
+    s_last_type      = 0xFF;
     s_tx_next_ms     = 0;
     s_tx_backoff_ms  = MESH_TX_BACKOFF_MIN_MS;
     s_tx_fast_armed  = false;
@@ -334,6 +353,7 @@ static void mesh_state_clear(void)
     s_epoch_valid    = false;
     s_claim_due      = false;
     s_alive_next_ms  = 0;
+    s_reclaim_next_ms = 0;
     s_had_parent     = false;
     s_boot_ms        = millis();
     memset(s_heard_ms, 0, sizeof(s_heard_ms));
@@ -414,11 +434,17 @@ static uint32_t mesh_tx_backoff_draw(void)
     return half + (mesh_rand() % (half + 1));
 }
 
-/* Transmit one frame *now* with CAD forced on (listen before talk), whatever
- * the module's persisted CAD setting is.  Returns false when the radio is busy
- * or CAD found the channel busy; the caller decides whether to back off (queued
- * mesh traffic) or report busy to the host (host-originated traffic). */
-static bool mesh_tx_radio_send(const uint8_t *frame, uint8_t len)
+/* Transmit one frame *now*.  `cad` forces a listen-before-talk CAD whatever the
+ * module's persisted CAD setting is.  Returns false when the radio is busy or
+ * CAD found the channel busy; the caller decides whether to back off (queued
+ * mesh traffic) or report busy to the host (host-originated traffic).
+ *
+ * Host-originated frames pass cad = false: psend() runs the CAD synchronously
+ * inside the AT command, and at the mesh datarate a CAD blocks for longer than
+ * the WiRoc host's 100 ms reply window, so the frame would go out but the host
+ * would time the command out and report it unsent.  Those frames are tried once
+ * and the host owns the retry, so it carries the collision risk itself. */
+static bool mesh_tx_radio_send(const uint8_t *frame, uint8_t len, bool cad)
 {
     mesh_header_t h;
     uint32_t air;
@@ -430,9 +456,11 @@ static bool mesh_tx_radio_send(const uint8_t *frame, uint8_t len)
     if (mesh_is_standby()) {
         return false;
     }
-    if (!api.lora.psend(len, (uint8_t *)frame, true)) {
+    if (!api.lora.psend(len, (uint8_t *)frame, cad)) {
+        s_tx_busy++;
         return false;
     }
+    s_tx_ok++;
     /* Overhead accounting: bucket the frame's airtime as data or control. */
     mesh_wire_decode(frame, &h);
     air = mesh_frame_airtime_ms(len);
@@ -455,7 +483,7 @@ static void mesh_tx_drain(void)
     if ((int32_t)(now - s_tx_next_ms) < 0) {
         return;                             /* still in the post-busy backoff */
     }
-    if (mesh_tx_radio_send(s_txq[s_txq_head].buf, s_txq[s_txq_head].len)) {
+    if (mesh_tx_radio_send(s_txq[s_txq_head].buf, s_txq[s_txq_head].len, true)) {
         s_txq_head = (uint8_t)((s_txq_head + 1) % MESH_TX_QUEUE_SIZE);
         s_txq_count--;
         s_tx_backoff_ms = MESH_TX_BACKOFF_MIN_MS;   /* reset after a clean send */
@@ -638,7 +666,20 @@ static void mesh_timer_cb(void *)
              * change, a boot, or a re-attach -- never on a timer. */
             if (s_claim_due) {
                 mesh_send_claim();
-                s_claim_due = false;
+                s_claim_due       = false;
+                s_reclaim_next_ms = now + MESH_JOIN_INTERVAL_MAX_MS;
+            } else if (s_route.parent_addr == MESH_ADDR_NONE &&
+                       (int32_t)(now - s_reclaim_next_ms) >= 0) {
+                /* We hold an address but have no route -- we lost our parent,
+                 * or booted on the address in flash.  Every other transmit path
+                 * is gated on a parent and emitting a beacon needs one, so
+                 * without this the node goes silent for good: the root never
+                 * sees it, and a radio that has just refused a frame on CAD
+                 * stays in standby with receive disarmed until its next
+                 * transmit.  Claiming re-binds us at the root and re-arms the
+                 * receiver, so the next beacon gives us a parent. */
+                mesh_send_claim();
+                s_reclaim_next_ms = now + MESH_JOIN_INTERVAL_MAX_MS;
             }
             /* Periodic liveness: a subtree aggregate a deep idle node would
              * otherwise never get to the root (its beacon is link-local).
@@ -727,6 +768,17 @@ static uint32_t mesh_link_ack_timeout_for(uint8_t len)
 uint32_t mesh_get_link_ack_timeout_ms(void)
 {
     return mesh_link_ack_timeout_for((uint8_t)(MESH_HEADER_SIZE + 32));
+}
+
+void mesh_get_counters(mesh_counters_t *out)
+{
+    out->tx_ok     = s_tx_ok;
+    out->tx_busy   = s_tx_busy;
+    out->tx_assign = s_tx_assign;
+    out->rx_any    = s_rx_any;
+    out->rx_assign = s_rx_assign;
+    out->adopt     = s_adopt;
+    out->last_type = s_last_type;
 }
 
 uint16_t mesh_get_overhead_pct(void)
@@ -1018,6 +1070,15 @@ mesh_state_t mesh_get_state(void)
     return s_state;
 }
 
+bool mesh_is_attached(void)
+{
+    /* The root is always "attached": it delivers its own host's messages
+     * locally.  A node is attached once it holds an address and knows a parent
+     * to route through -- without one there is no transmit path at all. */
+    return mesh_is_root() ||
+           (s_state == MESH_STATE_JOINED && s_route.parent_addr != MESH_ADDR_NONE);
+}
+
 uint8_t mesh_root_alloc_count(void)
 {
     return mesh_alloc_count();
@@ -1107,7 +1168,8 @@ static void mesh_relay_flood(const mesh_header_t *h, const uint8_t *payload, uin
  * flood from its own parent (a parent is never a leaf -- it forwarded a rootward
  * unicast from the child that chose it).  Only used for floods whose recipients
  * are all attached (ADDR_TABLE, DATA_DOWNLINK); joins/assigns, which must reach
- * unattached nodes, are relayed by everyone. */
+ * unattached nodes, are relayed by every *attached* node (an unattached one has
+ * no route to contribute -- see mesh_rx_join_req). */
 static void mesh_relay_flood_gated(const mesh_header_t *h,
                                    const uint8_t *payload, uint8_t plen)
 {
@@ -1144,6 +1206,7 @@ static void mesh_mark_seen(uint8_t type, uint8_t src, uint8_t seq, const uint8_t
  * assigned address rides in the header `dst`, so no address byte is needed. */
 static void mesh_send_addr_assign(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN], uint8_t addr)
 {
+    s_tx_assign++;
     mesh_send_flood(MESH_TYPE_ADDR_ASSIGN, (uint8_t)(addr & MESH_ADDR_MASK),
                     MESH_DEFAULT_TTL, device_id, MESH_NODE_DEVICE_ID_LEN);
 }
@@ -1161,16 +1224,28 @@ static void mesh_rx_join_req(const mesh_header_t *h, const uint8_t *payload, uin
         if ((uint32_t)(millis() - s_boot_ms) >= MESH_RECOVER_MS) {
             uint8_t addr = mesh_alloc_assign(payload);
             if (addr != MESH_ADDR_NONE) {
+                /* A fresh address has no traffic yet; stamp it now or the
+                 * eviction backstop frees it on the very next tick whenever
+                 * this root's uptime already exceeds MESH_EVICT_MS. */
+                s_heard_ms[addr] = millis();
                 mesh_send_addr_assign(payload, addr);
             }
         }
+        return;                         /* the root terminates the join flood */
     }
-    mesh_relay_flood(h, payload, plen);
+    if (mesh_get_address() != MESH_ADDR_NONE) {
+        /* Only an attached node extends the flood.  An unattached one has no
+         * route to contribute, and re-broadcasting the echo of its own request
+         * makes it transmit over the very tick the root answers on -- which is
+         * how a joiner ends up never hearing its ADDR_ASSIGN. */
+        mesh_relay_flood(h, payload, plen);
+    }
 }
 
 /* Node: adopt an address the root assigned to our node device id (flooded). */
 static void mesh_rx_addr_assign(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
+    bool attached = mesh_get_address() != MESH_ADDR_NONE;
     uint8_t addr;
 
     if (plen < MESH_NODE_DEVICE_ID_LEN) {
@@ -1192,6 +1267,7 @@ static void mesh_rx_addr_assign(const mesh_header_t *h, const uint8_t *payload, 
                 if (mesh_get_address() != addr) {
                     mesh_set_address(addr);
                     mesh_config_save();
+                    s_adopt++;
                 }
                 mesh_update_state();
                 mesh_beacon_fast();     /* announce the new attachment quickly */
@@ -1205,7 +1281,12 @@ static void mesh_rx_addr_assign(const mesh_header_t *h, const uint8_t *payload, 
             mesh_beacon_fast();
         }
     }
-    mesh_relay_flood(h, payload, plen);
+    if (attached) {
+        /* Only a node that was already attached extends the flood: the adopter
+         * needs nothing further, and an unattached eavesdropper has nothing to
+         * route (same reasoning as the JOIN_REQ relay gate). */
+        mesh_relay_flood(h, payload, plen);
+    }
 }
 
 /* Node: reconcile our address with the root's occupied bitmap (flooded). */
@@ -1297,11 +1378,17 @@ uint8_t mesh_get_neighbor_count(void)
  * the tree edge carried by claims), so it sees the whole graph. */
 
 /* A row exists for our own address (live) and for any node whose report has
- * not aged out. */
+ * not aged out.  On the root, an address it has allocated but that never
+ * reported in also gets a row -- parentless, no links: it shows a node that
+ * holds an address but has not attached the tree yet, which is otherwise
+ * invisible (alloc is a count, not a name). */
 static bool mesh_topo_row_valid(uint8_t addr, uint32_t now)
 {
     if (addr == mesh_get_address()) {
         return true;                    /* our own row is always present */
+    }
+    if (mesh_alloc_occupies(addr)) {
+        return true;
     }
     return s_topo_age_ms[addr] != 0 &&
            (uint32_t)(now - s_topo_age_ms[addr]) <= MESH_TOPO_HOLD_MS;
@@ -1394,6 +1481,7 @@ static void mesh_check_parent_staleness(uint32_t now)
         memset(&s_route, 0, sizeof(s_route));   /* parent lost: re-attach */
         s_route.parent_addr = MESH_ADDR_NONE;
         s_had_parent = false;                   /* claim again when we re-attach */
+        s_reclaim_next_ms = 0;                  /* and claim right away */
         mesh_select_parent();
         if (s_route.parent_addr != MESH_ADDR_NONE) {
             mesh_beacon_fast();
@@ -1553,7 +1641,7 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
         mesh_deliver_to_host(payload, len, MESH_ROOT_ADDR, 0);
         return true;
     }
-    if (s_state != MESH_STATE_JOINED || s_route.parent_addr == MESH_ADDR_NONE) {
+    if (!mesh_is_attached()) {
         return false;                   /* no route yet */
     }
     seq = s_data_seq;
@@ -1565,7 +1653,7 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
     /* Host message: one immediate attempt.  If the channel is busy we return
      * false so the host backs off and resends -- the module does not queue or
      * retry it. */
-    if (!mesh_tx_radio_send(frame, flen)) {
+    if (!mesh_tx_radio_send(frame, flen, false)) {
         return false;
     }
     /* Arm the pending entry so a lost hop is still retried by the mesh MAC
@@ -1745,7 +1833,7 @@ bool mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len)
 
     /* Host-originated: one immediate attempt; a busy channel goes back to the
      * host as a busy status (it owns the backoff / resend). */
-    if (!mesh_tx_radio_send(frame, flen)) {
+    if (!mesh_tx_radio_send(frame, flen, false)) {
         return false;
     }
     /* Arm the hop ACK so a lost hop is retried by the mesh MAC (implicit link
@@ -1857,6 +1945,7 @@ static void mesh_root_apply_claim(const mesh_header_t *h, const uint8_t *payload
         /* claimed address taken by another node: assign a fresh one */
         uint8_t na = mesh_alloc_assign(payload);
         if (na != MESH_ADDR_NONE) {
+            s_heard_ms[na] = millis();  /* fresh: not silent, just new */
             mesh_send_addr_assign(payload, na);
         }
     }
@@ -2458,6 +2547,11 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     }
     s_rx_rssi = rssi;
     s_rx_snr  = snr;
+    s_rx_any++;
+    s_last_type = h.type;
+    if (h.type == MESH_TYPE_ADDR_ASSIGN) {
+        s_rx_assign++;                  /* decoded off the air; dedup below */
+    }
 
     /* Root liveness bookkeeping: refresh the last-heard time for a node as
      * long as it sends anything (beacon, uplink, claim or liveness aggregate);

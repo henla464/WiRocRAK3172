@@ -356,7 +356,9 @@ int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if ((param->argc == 1 && !strcmp(param->argv[0], "?")) || param->argc == 0)
 	{
-		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d", cmd,
+		mesh_counters_t c;
+		mesh_get_counters(&c);
+		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d", cmd,
 					 mesh_is_enabled() ? 1 : 0,
 					 mesh_is_root() ? 1 : 0,
 					 mesh_get_address(),
@@ -370,7 +372,14 @@ int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param)
 					 mesh_get_epoch(),
 					 mesh_get_overhead_pct(),
 					 (int)mesh_get_link_ack_timeout_ms(),
-					 mesh_is_standby() ? 1 : 0);
+					 mesh_is_standby() ? 1 : 0,
+					 c.tx_ok,
+					 c.tx_busy,
+					 c.tx_assign,
+					 c.rx_any,
+					 c.rx_assign,
+					 c.adopt,
+					 (int)c.last_type);
 		return AT_NO_STATUS;
 	}
 	return AT_PARAM_ERROR;
@@ -1410,14 +1419,18 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
         {
             digitalWrite(LORA_AUX, HIGH);
             digitalWrite(LED_RED_TRANSMIT, HIGH);
-            return AT_BUSY_ERROR;
+            /* Distinguish "the mesh cannot carry this at all" (no address /
+             * no parent) from "the radio refused the frame" (channel busy):
+             * only the latter is worth a host resend. */
+            return mesh_is_attached() ? AT_BUSY_ERROR : AT_NO_NETWORK_JOINED;
         }
         return AT_OK;
     }
 
-    /* CAD forced on: listen before talk, whatever the module's persisted CAD
-     * setting is.  A busy channel comes back as AT_BUSY_ERROR for the host. */
-    sentOK = api.lora.psend(datalen / 2, lora_data, true);
+    /* Legacy P2P: the persisted CAD setting applies, and a busy channel comes
+     * back as AT_BUSY_ERROR.  CAD is *not* forced here: it runs synchronously
+     * inside the AT command, and the host waits only ~100 ms for the reply. */
+    sentOK = api.lora.psend(datalen / 2, lora_data);
     if (sentOK) {
         return AT_OK;
     } else {

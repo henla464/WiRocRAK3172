@@ -116,6 +116,11 @@ bool    mesh_config_save(void);
 /* Join state of this node (UNASSIGNED / JOINING / JOINED). */
 mesh_state_t mesh_get_state(void);
 
+/* True when the mesh can take a payload from the host: this is the root (it
+ * delivers locally) or an attached node (address + parent).  False while the
+ * node is still joining or has lost its parent. */
+bool    mesh_is_attached(void);
+
 /* Number of addresses currently allocated by the root (diagnostics). */
 uint8_t mesh_root_alloc_count(void);
 
@@ -130,6 +135,22 @@ uint8_t mesh_get_neighbor_count(void);  /* live neighbours                    */
  * Diagnostic for the narrowband (31.25 kHz) 10% budget. */
 uint16_t mesh_get_overhead_pct(void);
 
+/* Transmit/receive counters since enable (diagnostics, reported by
+ * ATC+MESHSTATE).  They separate the three ways a frame can fail to arrive:
+ * not transmitted (tx_busy), not heard (rx_assign), or heard but not adopted
+ * (rx_assign - adopt). */
+typedef struct {
+    uint16_t tx_ok;         /* frames handed to the radio                  */
+    uint16_t tx_busy;       /* radio refused (busy / CAD found the channel) */
+    uint16_t tx_assign;     /* ADDR_ASSIGN frames queued for transmission   */
+    uint16_t rx_any;        /* frames decoded off the air                  */
+    uint16_t rx_assign;     /* ADDR_ASSIGN frames decoded off the air       */
+    uint16_t adopt;         /* ADDR_ASSIGN frames that assigned us an addr  */
+    uint8_t  last_type;     /* wire type of the last decoded frame (0xFF none) */
+} mesh_counters_t;
+
+void mesh_get_counters(mesh_counters_t *out);
+
 /* Enqueue a WiRoc payload toward the root (non-root) or to the local host
  * (root). Returns false when there is no route / the frame is too large. */
 bool    mesh_send_uplink(const uint8_t *payload, uint8_t len);
@@ -137,12 +158,13 @@ bool    mesh_send_uplink(const uint8_t *payload, uint8_t len);
 /* --- M4 MAC / downlink -------------------------------------------------- */
 #define MESH_LINK_RETRIES        1      /* retransmits before giving up       */
 
-/* Channel access: every transmission is preceded by a CAD (listen before
- * talk), forced on regardless of the module's persisted CAD setting.  When the
- * channel is busy a *queued* (module-generated) frame is retried after a
+/* Channel access: every module-generated transmission is preceded by a CAD
+ * (listen before talk), forced on regardless of the module's persisted CAD
+ * setting.  When the channel is busy a *queued* frame is retried after a
  * randomised backoff window that doubles per consecutive busy attempt.  Host
- * messages are not queued: they are tried once and a busy channel is reported
- * back to the host, which owns the backoff/resend. */
+ * messages are not queued: they are tried once, without CAD -- the CAD blocks
+ * inside the AT command for longer than the host's reply window -- and the host
+ * owns the backoff/resend. */
 #define MESH_TX_BACKOFF_MIN_MS   40     /* smallest randomised window (ms)    */
 #define MESH_TX_BACKOFF_MAX_MS   1280   /* ceiling of the doubling backoff    */
 

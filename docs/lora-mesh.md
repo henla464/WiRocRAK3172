@@ -134,7 +134,11 @@ A node that knows no rows returns the empty reply `ATC+MESHTOPO=`. Every
 node serves its **own** row (live from its neighbour table) plus a row for each
 **descendant** whose report it has passed rootward, so the root node -- being the
 root -- covers the whole network while any other node sees only the part of the
-tree it is on the path for. See *Topology map* below.
+tree it is on the path for. On the root node an address it has **allocated but
+that has not reported in yet** also gets a row -- `<parent addr>` `0` and no
+neighbours -- so a node that holds an address without being attached to the tree
+is visible by name rather than only in the `alloc` count. See *Topology map*
+below.
 
 ## Host interface changes
 
@@ -147,7 +151,10 @@ Addresses travel in the AT interface, so the host is updated in lock-step:
   to the root node anyway. The legacy single-parameter form `ATC+SEND=<hexpayload>`
   stays valid (`dest=0`).
   In **both** modes a busy channel (CAD) is reported back as `AT_BUSY_ERROR`; the
-  host backs off and resends (see "Channel access").
+  host backs off and resends (see "Channel access"). In mesh mode a node that
+  cannot hand a payload to the mesh at all -- no address, or an address but no
+  parent to route through -- answers `AT_NO_NETWORK_JOINED` instead, so an
+  unattached node is not mistaken for a busy channel.
 * **`ATC+REC`** appends a **source address** and the origin's **6-byte Bluetooth
   address** to both response forms:
 
@@ -245,7 +252,7 @@ header is **not** repeated in the payload (header-field reuse).
 | 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the root node. Each relay node dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
 | 5 | `DATA_DOWNLINK` | 3 + N | steered hop-by-hop down the tree (`dst` = target) | WiRoc payload (N bytes) | A WiRoc payload from the root node to one specific node. The target delivers it to its host; any other node re-broadcasts it one hop further **only when one of its children's subtree bitmaps covers the target**, so the frame follows the single branch that leads to the target (`depth(target)` transmissions) instead of flooding the tree. Each hop of that path is retried on its own (`MESH_LINK_RETRIES` times): a relay node clears its pending by overhearing the next hop carry the frame on, and the target -- which has no next hop -- answers with a `LINK_ACK` of its own (see *MAC / link reliability*). |
 | 6 | `LINK_ACK` | 4 | single hop, never relayed (`dst` = the acked origin, used as the match key) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, emitted by whichever node the frame **terminates** at, since that node has no next hop whose forward it could overhear: the root node for a `DATA_UPLINK`, the target for a `DATA_DOWNLINK`. It names the origin of the frame it acks in the header `dst` -- which is what the origin's pending is keyed to, so one matcher serves both directions even though the named origin may be many hops away and never receives the frame itself. It is skipped for a frame that crossed no relay (**a direct child of the root node**, the only frame that arrives at the full TTL): that single hop is confirmed by the application-layer ACK instead. Relay nodes use the implicit ACK. |
-| 7 | `ADDR_CLAIM` | 10 | rootward unicast (flood fallback) | `devid[6]\|parent[1]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted root node can rebuild its RAM-only table; the trailing byte reports its **current parent** (`0`=none), so a claim doubles as a parent report for the topology map. **Event-driven** -- sent on a new boot epoch, on boot, on re-attach, on a parent change, and when the depth >= 2 liveness watchdog sees our parent stop covering us; never on a plain timer. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead. |
+| 7 | `ADDR_CLAIM` | 10 | rootward unicast (flood fallback) | `devid[6]\|parent[1]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted root node can rebuild its RAM-only table; the trailing byte reports its **current parent** (`0`=none), so a claim doubles as a parent report for the topology map. **Event-driven** -- sent on a new boot epoch, on boot, on re-attach, on a parent change, and when the depth >= 2 liveness watchdog sees our parent stop covering us; never on a plain timer *while it has a parent*. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead, and repeats that flood every `MESH_JOIN_INTERVAL_MAX_MS` until a parent is back. |
 | 8 | `ADDR_ALIVE` | 5 | single hop to the parent (absorbed, never forwarded) | `subtree_bitmap[2]` (16-bit; bit `a` = "address `a` is alive in my subtree") | Periodic liveness **aggregate**, so the root node does not evict a deep idle node (whose beacon is link-local and never reaches it). Each node sets its own bit and ORs in the bitmap reported by each of its children, so **one frame covers a whole subtree**; the parent absorbs it and does not forward it, so the union of the root node's direct children's bitmaps covers every non-root node each round. **Only a relay node sends one** (a leaf is covered by its parent from its beacon); the root node refreshes last-heard for **every** set bit. Sent while the node holds a parent. |
 | 9 | `TOPOLOGY` | 4 + 2K | rootward unicast (`dst` = parent) | `parent[1]\|{addr[1]\|cost[1]}*` (K neighbours) | The reporting node's view of the graph: its current parent and the neighbours it hears, each with its link cost. **Event-driven** (attach / re-parent) plus a slow backstop; **best-effort** (the backstop recovers a loss). Every node on its rootward path absorbs it, so the root node sees the whole network and a relay node sees its own subtree; a relay node also forwards it one hop rootward. Read the local view with `ATC+MESHTOPO?`. |
 | 10 | `ROOT_QUERY` | 9 | broadcast (single hop, not relayed) | `devid[6]`; `src` = 1 | A (re)booting root asks "is another root already here?" -- see **Root conflict** below. |
@@ -344,10 +351,17 @@ target spends a frame on it (see *MAC / link reliability*).
 
 ## Channel access (listen before talk)
 
-Every transmission is preceded by a **CAD** (channel activity detection) that is
-**forced on in firmware** -- `api.lora.psend(len, frame, true)` -- so it does not
-depend on the module's persisted `AT+CAD` setting. When CAD detects activity the
-frame is **not** put on the air (`psend` returns false).
+Every **module-generated** transmission is preceded by a **CAD** (channel activity
+detection) that is **forced on in firmware** -- `api.lora.psend(len, frame, true)` --
+so it does not depend on the module's persisted `AT+CAD` setting. When CAD detects
+activity the frame is **not** put on the air (`psend` returns false).
+
+A **host-originated** frame (`ATC+SEND`) is the exception: it goes out **without**
+CAD. `psend()` runs the CAD synchronously inside the AT command, and at the mesh
+datarate a CAD blocks for longer than the WiRoc host's ~100 ms reply window -- the
+frame reaches the air, but the host has already timed the command out and reports
+it unsent. The host tries such a frame once and owns the resend, so it carries the
+collision risk; the legacy (mesh-disabled) path has the same behaviour.
 
 How a busy channel is handled depends on who wants the transmission:
 
@@ -433,7 +447,12 @@ has no neighbour at all it keeps listening until beacons return.
   it travels hop-by-hop toward the parent (like an uplink), so the network-wide
   cost is `O(hops)` per claim rather than the `O(N)` of a flood. Only a node with
   no route yet (just booted / parent lost), or a relay node that has lost its own
-  parent, falls back to flooding it.
+  parent, falls back to flooding it.  While a node holds an address but has **no
+  route**, that flood repeats every `MESH_JOIN_INTERVAL_MAX_MS` until a parent is
+  back.  It has to: with no parent it emits no beacon, no aggregate and no
+  topology report, and a radio that has just refused a frame on CAD is left in
+  standby with receive disarmed -- so a node that simply waited would be silent
+  and deaf for good.
 * **Liveness is a separate, cheaper message, and it is aggregated.** A deep idle
   node's beacon is link-local, so it would otherwise go unheard at the root node;
   the node instead sends an `ADDR_ALIVE` **subtree aggregate** to its parent every
@@ -694,9 +713,12 @@ flood at all: it is **steered** down the tree, re-broadcast only by the node who
 child's subtree bitmap contains the target (see the message table and "Downlink").
 Floods that must
 reach an **unattached** node -- `JOIN_REQ`, `ADDR_ASSIGN` and the flooded
-`ADDR_CLAIM` fallback -- are still relayed by
-**every node**, because the target may
-not yet have a parent whose forward it could rely on.
+`ADDR_CLAIM` fallback -- are relayed by **every attached node**, because the target may
+not yet have a parent whose forward it could rely on. **Unattached nodes relay
+nothing**, and the root node terminates a `JOIN_REQ` instead of extending it: a
+joiner's re-broadcast of the echo of its own request adds no coverage it does not
+already have, and it puts that node on the air exactly while the root node is
+answering -- which costs the joiner the `ADDR_ASSIGN` it is waiting for.
 
 ## Narrowband (31.25 kHz) operation
 
@@ -1039,10 +1061,11 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
   by the branch whose subtree bitmap contains the target (a relay node off that branch
   stays silent).
 * **Channel access (CAD / backoff)**: hold the channel busy with a second
-  transmitter and confirm a host `ATC+SEND` returns `AT_BUSY_ERROR` with no
-  module-side resend, while module-generated traffic (beacons, joins) keeps
-  retrying after the randomised backoff once the channel clears. Confirm CAD is
-  applied even with `AT+CAD=0` persisted (i.e. listen before talk is always on).
+  transmitter and confirm module-generated traffic (beacons, joins) keeps
+  retrying after the randomised backoff once the channel clears, and that CAD is
+  applied even with `AT+CAD=0` persisted. A host `ATC+SEND` is sent without CAD
+  (see *Channel access*), so confirm instead that it replies inside the host's
+  reply window and never leaves the command unanswered.
 * **Regression**: with mesh disabled the P2P punch / double-punch ACK+hash path is
   unchanged (and no `srcaddr` byte is added).
 
