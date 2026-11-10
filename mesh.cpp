@@ -91,13 +91,25 @@ static uint8_t s_txq_tail;
 static uint8_t s_txq_count;
 
 /* ======================================================================= */
-/*  (src,seq) duplicate cache                                             */
+/*  (type,src,seq) duplicate cache                                        */
 /* ======================================================================= */
 
+/* The type is part of the key: control frames and data frames cycle their
+ * own 5-bit sequence counters (s_bcast_seq / s_data_seq) independently, so
+ * keying on (src,seq) alone makes a claim and an uplink of the same seq
+ * collide and silently drops the uplink.
+ *
+ * The age bound is what keeps a rebooted sender working: its counters restart
+ * at 0, and without expiry the receiver's ring would still hold the previous
+ * boot's (type,src,seq) triples and discard the new frames as duplicates. */
+#define MESH_DEDUP_MS  30000
+
 typedef struct {
-    uint8_t src;
-    uint8_t seq;
-    bool    valid;
+    uint8_t  type;
+    uint8_t  src;
+    uint8_t  seq;
+    uint32_t at;
+    bool     valid;
 } mesh_dedup_entry_t;
 
 static mesh_dedup_entry_t s_dedup[MESH_DEDUP_SIZE];
@@ -396,16 +408,22 @@ static void mesh_state_clear(void)
     mesh_update_state();
 }
 
-/* Returns true when (src,seq) was already seen (i.e. drop as duplicate). */
-static bool mesh_dedup_check(uint8_t src, uint8_t seq)
+/* Returns true when (type,src,seq) was already seen (i.e. drop as duplicate). */
+static bool mesh_dedup_check(uint8_t type, uint8_t src, uint8_t seq)
 {
+    uint32_t now = millis();
+
     for (uint8_t i = 0; i < MESH_DEDUP_SIZE; i++) {
-        if (s_dedup[i].valid && s_dedup[i].src == src && s_dedup[i].seq == seq) {
+        if (s_dedup[i].valid && s_dedup[i].type == type &&
+            s_dedup[i].src == src && s_dedup[i].seq == seq &&
+            (uint32_t)(now - s_dedup[i].at) < MESH_DEDUP_MS) {
             return true;
         }
     }
+    s_dedup[s_dedup_idx].type  = type;
     s_dedup[s_dedup_idx].src   = src;
     s_dedup[s_dedup_idx].seq   = seq;
+    s_dedup[s_dedup_idx].at    = now;
     s_dedup[s_dedup_idx].valid = true;
     s_dedup_idx = (uint8_t)((s_dedup_idx + 1) % MESH_DEDUP_SIZE);
     return false;
@@ -1195,10 +1213,10 @@ static void mesh_mark_seen(uint8_t type, uint8_t src, uint8_t seq, const uint8_t
 {
     if (type == MESH_TYPE_JOIN_REQ) {
         if (payload != NULL) {
-            (void)mesh_dedup_check(mesh_node_device_id_hash8(payload), seq);
+            (void)mesh_dedup_check(type, mesh_node_device_id_hash8(payload), seq);
         }
     } else if (type != MESH_TYPE_BEACON) {
-        (void)mesh_dedup_check(src, seq);
+        (void)mesh_dedup_check(type, src, seq);
     }
 }
 
@@ -2589,11 +2607,11 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
      * so it is keyed on a hash of its node device id instead; beacons are link-local
      * and never deduped. */
     if (h.type == MESH_TYPE_JOIN_REQ) {
-        if (plen < MESH_NODE_DEVICE_ID_LEN || mesh_dedup_check(mesh_node_device_id_hash8(payload), h.seq)) {
+        if (plen < MESH_NODE_DEVICE_ID_LEN || mesh_dedup_check(h.type, mesh_node_device_id_hash8(payload), h.seq)) {
             return;                     /* too short or duplicate */
         }
     } else if (h.type != MESH_TYPE_BEACON) {
-        if (mesh_dedup_check(h.src, h.seq)) {
+        if (mesh_dedup_check(h.type, h.src, h.seq)) {
             return;                     /* duplicate */
         }
     }

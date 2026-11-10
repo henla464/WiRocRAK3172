@@ -188,7 +188,7 @@ as the sanity gate). The header is **3 bytes** (24 bits, no waste), MSB-first:
 | 4 | src | source address (0-15) |
 | 4 | dst | destination (0-15; also carries the assigned address / acked origin) |
 | 3 | hops | beacon: hop-count to the root node; data: TTL (max 4) |
-| 5 | seq | dedup key `(src,seq)`, 32-value window |
+| 5 | seq | dedup key `(type,src,seq)`, 32-value window |
 
 ```
 byte0 = type<<4 | version
@@ -215,16 +215,22 @@ boot -- so nodes spot a restart when it changes.
 
 A flooded or multi-hop frame can reach the same node more than once -- a relay
 loop, two paths through the mesh, or a retransmit -- so every receiver drops a
-frame it has already seen. The key is the `(src, seq)` pair: the origin's address
-plus a 5-bit sequence number the origin allocates per frame. Relays copy both
-fields unchanged, so every copy of a frame carries the same key.
+frame it has already seen. The key is the `(type, src, seq)` triple: the wire
+type, the origin's address, and a 5-bit sequence number the origin allocates per
+frame. Relays copy all three fields unchanged, so every copy of a frame carries
+the same key. The type is part of the key because the origin runs **separate
+sequence counters** for control frames and for data frames; keying on
+`(src, seq)` alone made a claim and an uplink with the same seq collide, and the
+uplink was dropped as a duplicate.
 
-The cache is a fixed **32-entry ring** (`MESH_DEDUP_SIZE`). On receive the node
-scans it; if the pair is present the frame is dropped, otherwise the pair is
-recorded (evicting the oldest entry) and the frame is accepted. A key is
-therefore only remembered for the next 32 *received* frames, and `seq` itself
-wraps at 32 (`2^5`); the TTL / hop cap is what keeps a stale duplicate from
-surviving long enough to be re-accepted.
+The cache is a fixed **32-entry ring** (`MESH_DEDUP_SIZE`) with a
+**30 s** age bound (`MESH_DEDUP_MS`). On receive the node scans it; if the key is
+present and younger than that it drops the frame, otherwise it records the key
+(evicting the oldest entry) and accepts the frame. `seq` itself wraps at 32
+(`2^5`) and the ring holds 32 entries, so a key is remembered for at least a
+full wrap; the age bound is what lets a **rebooted** origin -- whose counters
+restart at 0 -- be heard again instead of being deduped against its previous
+boot's frames.
 
 Two frames key differently:
 
@@ -250,7 +256,7 @@ header is **not** repeated in the payload (header-field reuse).
 | 1 | `JOIN_REQ` | 9 | flooded | `devid[6]`; `src` = 0 | An unassigned node asks the root node for an address, retrying with backoff until assigned. Because `src` is 0, it is deduped on its node device id instead of `(src,seq)`. |
 | 2 | `ADDR_ASSIGN` | 9 | flooded | `devid[6]`; **assigned address in header `dst`** | The root node's answer to a `JOIN_REQ` (and its re-assertion after an `ADDR_CLAIM`). The node whose node device id matches adopts and persists the address. A node that sees its own address given to a *different* node device id relinquishes it. |
 | 3 | `ADDR_TABLE` | 5 | flooded (relayed by relay nodes only) | `occupied_bitmap[2]` (16-bit; the root-node bit is always set) | The root node floods its occupied-address bitmap whenever the table **changes** (debounced) and as a slow periodic backstop, so nodes can reconcile. A node that sees its own bit clear for `MESH_TABLE_MISS_LIMIT` intervals relinquishes its address and re-joins. A leaf node does not relay it (see "Flood relay"). |
-| 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the root node. Each relay node dedups `(src,seq)`, decrements the TTL and forwards to its parent. |
+| 4 | `DATA_UPLINK` | 3 + N | unicast hop-by-hop (`src` = origin, `dst` = parent) | WiRoc payload (N bytes) | A WiRoc payload travelling toward the root node. Each relay node dedups `(type,src,seq)`, decrements the TTL and forwards to its parent. |
 | 5 | `DATA_DOWNLINK` | 3 + N | steered hop-by-hop down the tree (`dst` = target) | WiRoc payload (N bytes) | A WiRoc payload from the root node to one specific node. The target delivers it to its host; any other node re-broadcasts it one hop further **only when one of its children's subtree bitmaps covers the target**, so the frame follows the single branch that leads to the target (`depth(target)` transmissions) instead of flooding the tree. Each hop of that path is retried on its own (`MESH_LINK_RETRIES` times): a relay node clears its pending by overhearing the next hop carry the frame on, and the target -- which has no next hop -- answers with a `LINK_ACK` of its own (see *MAC / link reliability*). |
 | 6 | `LINK_ACK` | 4 | single hop, never relayed (`dst` = the acked origin, used as the match key) | `acked_seq[1]`; **acked origin in header `dst`** | Explicit per-hop ACK, emitted by whichever node the frame **terminates** at, since that node has no next hop whose forward it could overhear: the root node for a `DATA_UPLINK`, the target for a `DATA_DOWNLINK`. It names the origin of the frame it acks in the header `dst` -- which is what the origin's pending is keyed to, so one matcher serves both directions even though the named origin may be many hops away and never receives the frame itself. It is skipped for a frame that crossed no relay (**a direct child of the root node**, the only frame that arrives at the full TTL): that single hop is confirmed by the application-layer ACK instead. Relay nodes use the implicit ACK. |
 | 7 | `ADDR_CLAIM` | 10 | rootward unicast (flood fallback) | `devid[6]\|parent[1]`; **own address already in header `src`** | A node (re)announces its flash-stored address and binds it to its node device id, so a restarted root node can rebuild its RAM-only table; the trailing byte reports its **current parent** (`0`=none), so a claim doubles as a parent report for the topology map. **Event-driven** -- sent on a new boot epoch, on boot, on re-attach, on a parent change, and when the depth >= 2 liveness watchdog sees our parent stop covering us; never on a plain timer *while it has a parent*. Rootward hop-by-hop toward the parent; a node with no route yet -- or a relay node that has lost its own parent -- floods it instead, and repeats that flood every `MESH_JOIN_INTERVAL_MAX_MS` until a parent is back. |
@@ -324,7 +330,7 @@ has become ineligible by reaching the hop limit, which the margin does not prote
 ### Uplink
 
 The origin builds `DATA_UPLINK{ src, dst=parent, ttl, payload }` and unicasts it
-to its parent; each relay node dedups `(src,seq)` and forwards to its own parent
+to its parent; each relay node dedups `(type,src,seq)` and forwards to its own parent
 (TTL - 1). The root node queues the payload to its host with `srcaddr` = the origin.
 An uplink from a **direct child** (the only one that arrives at the full TTL) is
 acknowledged by the application-layer ACK rather than a `LINK_ACK`, so a direct child
@@ -583,7 +589,7 @@ does **not** count, because a direct child of the root is never sent one (its
 single hop is confirmed by the app ACK instead). Requiring the app ACK also means a
 root whose radio still beacons but whose **host has hung** is caught.
 
-For each uplink it overhears (deduplicated to one per `(src,seq)`):
+For each uplink it overhears (deduplicated to one per `(type,src,seq)`):
 
 * only uplinks heard at an SNR of at least `MESH_STANDBY_MIN_SNR` are probed, so a
   marginal reception does not read as a missed ACK;

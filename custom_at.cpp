@@ -1362,33 +1362,31 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
     uint8_t destAddr = MESH_ADDR_NONE;
     char *hexParam;
-    char *colon;
     uint32_t datalen;
     uint8_t lora_data[256];
     bool sentOK;
 
     start_send = millis();
 
-    if (param->argc != 1 || !strcmp(param->argv[0], "?"))
+    /* The AT layer splits parameters on ':', so the mesh form
+     * ATC+SEND=<dest>:<hexpayload> arrives as two argv entries.  One entry is
+     * the legacy form: the whole parameter is the payload, dest defaults to 0
+     * (and every non-root mesh node sends toward the root anyway). */
+    if (param->argc > 2 || !strcmp(param->argv[0], "?"))
     {
         return AT_PARAM_ERROR;
     }
 
-    /* Optional leading destination address: ATC+SEND=<dest>:<hexpayload>.
-     * Without a ':' the whole parameter is the payload and dest defaults to 0
-     * (legacy P2P form, and every non-root mesh node sends toward the root). */
     hexParam = param->argv[0];
-    colon = strchr(param->argv[0], ':');
-    if (colon != NULL)
+    if (param->argc == 2)
     {
         uint32_t d;
-        *colon = '\0';
         if (0 != at_check_digital_uint32_t(param->argv[0], &d) || d > MESH_ADDR_MAX)
         {
             return AT_PARAM_ERROR;
         }
         destAddr = (uint8_t)d;
-        hexParam = colon + 1;
+        hexParam = param->argv[1];
     }
 
     digitalWrite(LED_RED_TRANSMIT, LOW);
