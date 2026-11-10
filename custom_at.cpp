@@ -1328,6 +1328,18 @@ void turn_off_both_led(void *)
     digitalWrite(LED_RED_TRANSMIT, HIGH);
 }
 
+/* (Re)arm a one-shot timer.  The stop is not optional: UTIL_TIMER_Create()
+ * blanks the timer object's fields -- Next included -- instead of unlinking it,
+ * so creating a timer that is still armed truncates the timer list and silently
+ * takes every timer behind it with it, permanently.  Re-arming a LED timer
+ * while it was still running is enough to kill the mesh tick that way. */
+static void arm_one_shot(RAK_TIMER_ID id, RAK_TIMER_HANDLER handler, uint32_t ms)
+{
+    api.system.timer.stop(id);
+    api.system.timer.create(id, handler, RAK_TIMER_ONESHOT);
+    api.system.timer.start(id, ms, NULL);
+}
+
 void cad_cb(bool detect) {
 	if(detect)
     {
@@ -1338,9 +1350,7 @@ void cad_cb(bool detect) {
 
         digitalWrite(LED_BLUE_RECEIVE, LOW);
 		digitalWrite(LED_RED_TRANSMIT, LOW);
-        api.system.timer.create(RAK_TIMER_1, turn_off_both_led, RAK_TIMER_ONESHOT);
-	    // Trigger to turn of receive led 
-	    api.system.timer.start(RAK_TIMER_1, 200, NULL);
+        arm_one_shot(RAK_TIMER_1, turn_off_both_led, 200);
     }
 	else
     {
@@ -1518,8 +1528,7 @@ static bool queue_ack(bool drf1268dsCompatMode, uint8_t channelNumber, uint8_t c
     pendingAck.channelNumber = channelNumber;
     pendingAck.hash[0] = calculatedHash[0];
     pendingAck.hash[1] = calculatedHash[1];
-    api.system.timer.create(RAK_TIMER_4, send_pending_ack, RAK_TIMER_ONESHOT);
-    api.system.timer.start(RAK_TIMER_4, 1, NULL);
+    arm_one_shot(RAK_TIMER_4, send_pending_ack, 1);
     return true;
 }
 
@@ -1576,30 +1585,23 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
     {
         mesh_handle_rx(recv_data_pkg.Buffer, recv_data_pkg.BufferSize,
                        recv_data_pkg.Rssi, recv_data_pkg.Snr);
-        api.system.timer.create(RAK_TIMER_0, turn_off_receive_led, RAK_TIMER_ONESHOT);
-        api.system.timer.start(RAK_TIMER_0, 150, NULL);
+        arm_one_shot(RAK_TIMER_0, turn_off_receive_led, 150);
         return;
     }
 
     // Drop message when queue is full
     if (MessageQueue_isFull(&incomingMessageQueue))
     {
-        api.system.timer.create(RAK_TIMER_0, turn_off_receive_led, RAK_TIMER_ONESHOT);
-	    // Trigger to turn of receive led 
-	    api.system.timer.start(RAK_TIMER_0, 150, NULL);
+        arm_one_shot(RAK_TIMER_0, turn_off_receive_led, 150);
         return;
     }
     // Drop messages that are too large or too small
     if (recv_data_pkg.BufferSize > sizeof(LoraMeessage_t::Buffer)) {
-        api.system.timer.create(RAK_TIMER_0, turn_off_receive_led, RAK_TIMER_ONESHOT);
-	    // Trigger to turn of receive led 
-	    api.system.timer.start(RAK_TIMER_0, 150, NULL);
+        arm_one_shot(RAK_TIMER_0, turn_off_receive_led, 150);
         return;
     }
     if (recv_data_pkg.BufferSize < 2) {
-        api.system.timer.create(RAK_TIMER_0, turn_off_receive_led, RAK_TIMER_ONESHOT);
-	    // Trigger to turn of receive led 
-	    api.system.timer.start(RAK_TIMER_0, 150, NULL);
+        arm_one_shot(RAK_TIMER_0, turn_off_receive_led, 150);
         return;
     }
     time_received = millis();
@@ -1633,9 +1635,7 @@ void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
     }
     MessageQueue_enQueue(&incomingMessageQueue, &theMessage);
         
-    api.system.timer.create(RAK_TIMER_0, turn_off_receive_led, RAK_TIMER_ONESHOT);
-	// Trigger to turn of receive led 
-	api.system.timer.start(RAK_TIMER_0, 150, NULL);
+    arm_one_shot(RAK_TIMER_0, turn_off_receive_led, 150);
 }
 
 static void p2p_printf_hex(uint8_t *pdata, uint16_t len)

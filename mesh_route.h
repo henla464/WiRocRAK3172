@@ -28,6 +28,7 @@ typedef struct {
     uint8_t  hops;          /* neighbour's advertised hop-count to the root */
     uint8_t  link_cost;     /* cost of our link to this neighbour             */
     uint32_t last_ms;       /* time of the last beacon from this neighbour    */
+    uint32_t ivl_ms;        /* cadence it beacons at, measured (0 = unknown)  */
 } mesh_route_neighbor_t;
 
 /* Our route to the root. */

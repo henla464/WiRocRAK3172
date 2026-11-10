@@ -537,6 +537,10 @@ static void mesh_tx_schedule(void)
     } else {
         delay = MESH_TX_FAST_MS + (mesh_rand() % MESH_TX_FAST_JITTER_MS);
     }
+    /* Stop first: creating a timer that is still armed truncates the timer
+     * list (UTIL_TIMER_Create() blanks the object's Next instead of unlinking
+     * it) and silently kills every timer behind it. */
+    api.system.timer.stop(RAK_TIMER_3);
     if (api.system.timer.create(RAK_TIMER_3, mesh_tx_fast_cb, RAK_TIMER_ONESHOT) &&
         api.system.timer.start(RAK_TIMER_3, delay, NULL)) {
         s_tx_fast_armed = true;
@@ -679,25 +683,32 @@ static void mesh_timer_cb(void *)
             }
         } else if (s_state == MESH_STATE_JOINED &&
                    mesh_get_address() != MESH_ADDR_NONE) {
-            /* Event-driven claim: (re)bind our address to our device id so a
-             * restarted root can rebuild its RAM-only table.  Set by an epoch
-             * change, a boot, or a re-attach -- never on a timer. */
+            /* Claim: (re)bind our address to our device id so a restarted root
+             * can rebuild its RAM-only table.  An event (epoch change, boot,
+             * re-attach) makes it immediate; the slow backstop catches a claim
+             * that was lost -- the root was still booting when it went out, and
+             * a lost claim never comes back, because nothing else tells the
+             * root we exist.  It would then hand our address to the next node
+             * that joins.  Claims are hop-by-hop unicast, so the backstop is a
+             * couple of frames per node every MESH_ALIVE_INTERVAL_MS. */
+            uint32_t next_claim = (s_route.parent_addr == MESH_ADDR_NONE)
+                                  ? MESH_JOIN_INTERVAL_MAX_MS
+                                  : MESH_ALIVE_INTERVAL_MS;
             if (s_claim_due) {
                 mesh_send_claim();
                 s_claim_due       = false;
-                s_reclaim_next_ms = now + MESH_JOIN_INTERVAL_MAX_MS;
-            } else if (s_route.parent_addr == MESH_ADDR_NONE &&
-                       (int32_t)(now - s_reclaim_next_ms) >= 0) {
-                /* We hold an address but have no route -- we lost our parent,
-                 * or booted on the address in flash.  Every other transmit path
-                 * is gated on a parent and emitting a beacon needs one, so
-                 * without this the node goes silent for good: the root never
-                 * sees it, and a radio that has just refused a frame on CAD
-                 * stays in standby with receive disarmed until its next
-                 * transmit.  Claiming re-binds us at the root and re-arms the
-                 * receiver, so the next beacon gives us a parent. */
+                s_reclaim_next_ms = now + next_claim;
+            } else if ((int32_t)(now - s_reclaim_next_ms) >= 0) {
+                /* No route: we lost our parent, or booted on the address in
+                 * flash.  Every other transmit path is gated on a parent and
+                 * emitting a beacon needs one, so without this the node goes
+                 * silent for good: the root never sees it, and a radio that has
+                 * just refused a frame on CAD stays in standby with receive
+                 * disarmed until its next transmit.  Claiming re-binds us at the
+                 * root and re-arms the receiver, so the next beacon gives us a
+                 * parent.  That is why the interval shortens without a route. */
                 mesh_send_claim();
-                s_reclaim_next_ms = now + MESH_JOIN_INTERVAL_MAX_MS;
+                s_reclaim_next_ms = now + next_claim;
             }
             /* Periodic liveness: a subtree aggregate a deep idle node would
              * otherwise never get to the root (its beacon is link-local).
@@ -718,6 +729,7 @@ static void mesh_timer_cb(void *)
 
 static void mesh_timer_start(void)
 {
+    api.system.timer.stop(RAK_TIMER_2);
     api.system.timer.create(RAK_TIMER_2, mesh_timer_cb, RAK_TIMER_PERIODIC);
     api.system.timer.start(RAK_TIMER_2, MESH_TIMER_PERIOD_MS, NULL);
 }
@@ -865,6 +877,10 @@ static void mesh_apply_role(void)
             mesh_set_address(MESH_ROOT_ADDR);
             mesh_config_save();
         }
+        /* A node promoted to root keeps whatever route it had as a node; drop
+         * it, so the root reports cost 0 / no parent from the first frame. */
+        memset(&s_route, 0, sizeof(s_route));
+        s_route.parent_addr = MESH_ADDR_NONE;
         /* Give this root run a fresh epoch so nodes detect the restart and
          * re-announce their flash-stored addresses. */
         if (s_boot_epoch == 0) {
@@ -1477,6 +1493,13 @@ static void mesh_select_parent(void)
 {
     mesh_route_t out;
 
+    /* The root node is the root of the tree: it is at cost 0 by definition and
+     * has no parent, whatever the beacons around it advertise.  Without this it
+     * adopts a neighbour as its parent and reports that node's cost and hop
+     * count for itself. */
+    if (mesh_is_root()) {
+        return;
+    }
     mesh_route_select(s_neigh, MESH_NEIGHBOR_MAX, &s_route, mesh_get_address(),
                       MESH_PARENT_HYSTERESIS, &out);
     s_route = out;
@@ -1485,13 +1508,22 @@ static void mesh_select_parent(void)
 static void mesh_check_parent_staleness(uint32_t now)
 {
     uint8_t i;
-    uint32_t stale = 3u * s_beacon_interval_ms;     /* 3x the current interval */
 
-    /* Drop neighbours that have gone quiet. */
+    /* Drop neighbours that have gone quiet.  The bound follows the pace each
+     * neighbour actually beacons at, never our own: our own interval restarts
+     * at MESH_BEACON_FAST_MS every time we re-attach, while a root we attached
+     * to may have backed off to MESH_BEACON_MAX_MS -- judging it by our fresh
+     * pace drops a perfectly healthy parent within seconds. */
     for (i = 0; i < MESH_NEIGHBOR_MAX; i++) {
-        if (s_neigh[i].addr != MESH_ADDR_NONE &&
-            (uint32_t)(now - s_neigh[i].last_ms) > stale) {
-            memset(&s_neigh[i], 0, sizeof(s_neigh[i]));
+        mesh_route_neighbor_t *n = &s_neigh[i];
+        uint32_t stale;
+
+        if (n->addr == MESH_ADDR_NONE) {
+            continue;
+        }
+        stale = 3u * (n->ivl_ms != 0 ? n->ivl_ms : MESH_BEACON_MAX_MS);
+        if ((uint32_t)(now - n->last_ms) > stale) {
+            memset(n, 0, sizeof(*n));
         }
     }
     if (s_route.parent_addr != MESH_ADDR_NONE &&
@@ -1576,6 +1608,16 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
     n->cost      = (uint8_t)(payload[0] & 0x1F);
     n->hops      = h->hops;
     n->link_cost = mesh_link_cost(n->snr_x10);
+    if (n->last_ms != 0) {
+        uint32_t delta = now - n->last_ms;
+
+        if (delta > MESH_BEACON_MAX_MS) {
+            delta = MESH_BEACON_MAX_MS;
+        }
+        /* Jump straight to a slower spacing, decay slowly: a burst right after
+         * a topology change must not shrink the silence we allow this peer. */
+        n->ivl_ms = (delta > n->ivl_ms) ? delta : (n->ivl_ms * 15 + delta) / 16;
+    }
     n->last_ms   = now;
 
     /* A beacon from a child we already know proves it is still alive and still
