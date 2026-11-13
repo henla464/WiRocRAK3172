@@ -83,6 +83,7 @@ bool mesh_config_save(void)
 typedef struct {
     uint8_t len;
     uint8_t buf[MESH_MAX_FRAME];
+    bool ack;                           /* a mesh ACK: no jitter */
 } mesh_frame_t;
 
 static mesh_frame_t s_txq[MESH_TX_QUEUE_SIZE];
@@ -158,7 +159,7 @@ static uint32_t s_air_data;
  * three ways a frame can silently fail to arrive: never transmitted (tx_busy),
  * never heard (rx_assign), or heard and then not adopted (rx_assign - adopt). */
 static uint16_t s_tx_ok;                        /* psend accepted              */
-static uint16_t s_tx_busy;                      /* psend refused (busy / CAD)  */
+static uint16_t s_tx_busy;                      /* psend refused (busy)        */
 static uint16_t s_tx_assign;                    /* ADDR_ASSIGN queued for TX   */
 static uint16_t s_rx_any;                        /* frames decoded off the air  */
 static uint16_t s_rx_assign;                    /* ADDR_ASSIGN decoded         */
@@ -452,17 +453,12 @@ static uint32_t mesh_tx_backoff_draw(void)
     return half + (mesh_rand() % (half + 1));
 }
 
-/* Transmit one frame *now*.  `cad` forces a listen-before-talk CAD whatever the
- * module's persisted CAD setting is.  Returns false when the radio is busy or
- * CAD found the channel busy; the caller decides whether to back off (queued
- * mesh traffic) or report busy to the host (host-originated traffic).
- *
- * Host-originated frames pass cad = false: psend() runs the CAD synchronously
- * inside the AT command, and at the mesh datarate a CAD blocks for longer than
- * the WiRoc host's 100 ms reply window, so the frame would go out but the host
- * would time the command out and report it unsent.  Those frames are tried once
- * and the host owns the retry, so it carries the collision risk itself. */
-static bool mesh_tx_radio_send(const uint8_t *frame, uint8_t len, bool cad)
+/* Transmit one frame *now*.  No CAD (listen before talk) anywhere: the WiRoc
+ * host does its own timing, and at the mesh datarate a blocking CAD blows its
+ * ~100 ms reply window.  Returns false when the radio is busy; the caller
+ * decides whether to back off (queued mesh traffic) or report busy to the host
+ * (host-originated traffic, which owns the retry). */
+static bool mesh_tx_radio_send(const uint8_t *frame, uint8_t len)
 {
     mesh_header_t h;
     uint32_t air;
@@ -474,7 +470,7 @@ static bool mesh_tx_radio_send(const uint8_t *frame, uint8_t len, bool cad)
     if (mesh_is_standby()) {
         return false;
     }
-    if (!api.lora.psend(len, (uint8_t *)frame, cad)) {
+    if (!api.lora.psend(len, (uint8_t *)frame, false)) {
         s_tx_busy++;
         return false;
     }
@@ -501,14 +497,15 @@ static void mesh_tx_drain(void)
     if ((int32_t)(now - s_tx_next_ms) < 0) {
         return;                             /* still in the post-busy backoff */
     }
-    if (mesh_tx_radio_send(s_txq[s_txq_head].buf, s_txq[s_txq_head].len, true)) {
+    /* A queued frame is tried as soon as the backoff has elapsed. */
+    if (mesh_tx_radio_send(s_txq[s_txq_head].buf, s_txq[s_txq_head].len)) {
         s_txq_head = (uint8_t)((s_txq_head + 1) % MESH_TX_QUEUE_SIZE);
         s_txq_count--;
         s_tx_backoff_ms = MESH_TX_BACKOFF_MIN_MS;   /* reset after a clean send */
         return;
     }
-    /* Channel busy: wait a randomised window (doubling per consecutive busy
-     * attempt) before trying the same frame again. */
+    /* Radio refused (busy): wait a randomised window (doubling per consecutive
+     * busy attempt) before trying the same frame again. */
     s_tx_next_ms = now + mesh_tx_backoff_draw();
     if (s_tx_backoff_ms < MESH_TX_BACKOFF_MAX_MS) {
         s_tx_backoff_ms *= 2;
@@ -535,7 +532,10 @@ static void mesh_tx_schedule(void)
     if ((int32_t)(now - s_tx_next_ms) < 0) {
         delay = (uint32_t)(s_tx_next_ms - now);   /* hold off: channel was busy */
     } else {
-        delay = MESH_TX_FAST_MS + (mesh_rand() % MESH_TX_FAST_JITTER_MS);
+        delay = MESH_TX_FAST_MS;
+        if (!s_txq[s_txq_head].ack) {
+            delay += mesh_rand() % MESH_TX_FAST_JITTER_MS;
+        }
     }
     /* Stop first: creating a timer that is still armed truncates the timer
      * list (UTIL_TIMER_Create() blanks the object's Next instead of unlinking
@@ -703,7 +703,7 @@ static void mesh_timer_cb(void *)
                  * flash.  Every other transmit path is gated on a parent and
                  * emitting a beacon needs one, so without this the node goes
                  * silent for good: the root never sees it, and a radio that has
-                 * just refused a frame on CAD stays in standby with receive
+                 * just refused a frame (busy) stays in standby with receive
                  * disarmed until its next transmit.  Claiming re-binds us at the
                  * root and re-arms the receiver, so the next beacon gives us a
                  * parent.  That is why the interval shortens without a route. */
@@ -1064,7 +1064,7 @@ bool mesh_lookup_device_id(uint8_t addr, uint8_t out[MESH_NODE_DEVICE_ID_LEN])
 /*  RX / TX plumbing                                                      */
 /* ======================================================================= */
 
-bool mesh_send_frame(const uint8_t *frame, uint8_t len)
+static bool mesh_tx_enqueue(const uint8_t *frame, uint8_t len, bool ack)
 {
     mesh_header_t h;
 
@@ -1078,6 +1078,7 @@ bool mesh_send_frame(const uint8_t *frame, uint8_t len)
         return false;
     }
     s_txq[s_txq_tail].len = len;
+    s_txq[s_txq_tail].ack = ack;
     memcpy(s_txq[s_txq_tail].buf, frame, len);
     s_txq_tail = (uint8_t)((s_txq_tail + 1) % MESH_TX_QUEUE_SIZE);
     s_txq_count++;
@@ -1092,6 +1093,11 @@ bool mesh_send_frame(const uint8_t *frame, uint8_t len)
         mesh_tx_schedule();
     }
     return true;
+}
+
+bool mesh_send_frame(const uint8_t *frame, uint8_t len)
+{
+    return mesh_tx_enqueue(frame, len, false);
 }
 
 uint8_t mesh_tx_queue_count(void)
@@ -1713,7 +1719,7 @@ bool mesh_send_uplink(const uint8_t *payload, uint8_t len)
     /* Host message: one immediate attempt.  If the channel is busy we return
      * false so the host backs off and resends -- the module does not queue or
      * retry it. */
-    if (!mesh_tx_radio_send(frame, flen, false)) {
+    if (!mesh_tx_radio_send(frame, flen)) {
         return false;
     }
     /* Arm the pending entry so a lost hop is still retried by the mesh MAC
@@ -1757,7 +1763,7 @@ static void mesh_send_link_ack(uint8_t acked_src, uint8_t acked_seq)
     payload[0] = acked_seq;
     flen = mesh_build_frame(frame, MESH_TYPE_LINK_ACK, mesh_get_address(),
                             acked_src, 0, 0, payload, 1);
-    mesh_send_frame(frame, flen);
+    mesh_tx_enqueue(frame, flen, true);
 }
 
 static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
@@ -1893,7 +1899,7 @@ bool mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len)
 
     /* Host-originated: one immediate attempt; a busy channel goes back to the
      * host as a busy status (it owns the backoff / resend). */
-    if (!mesh_tx_radio_send(frame, flen, false)) {
+    if (!mesh_tx_radio_send(frame, flen)) {
         return false;
     }
     /* Arm the hop ACK so a lost hop is retried by the mesh MAC (implicit link

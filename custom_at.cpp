@@ -32,7 +32,6 @@ int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param);
 void send_cb(void);
-void cad_cb(bool detect);
 void receive_cb(rui_lora_p2p_recv_t recv_data_pkg);
 static void p2p_printf_hex(uint8_t *pdata, uint16_t len);
 
@@ -88,7 +87,6 @@ bool init_send_at(void)
 {
 
 	api.lora.registerPSendCallback(send_cb);
-	api.lora.registerPSendCADCallback(cad_cb);
 	return api.system.atMode.add((char *)"SEND",
 								 (char *)"Send data in P2P mode. Usage: ATC+SEND=<payload>",
 								 (char *)"SEND", send_handler,
@@ -678,6 +676,10 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         if( udrv_code != UDRV_RETURN_OK)
             goto STEP_ATP2P_CHECK_ERROR_CODE;
 
+        // CAD stays off: the WiRoc host does its own timing and a blocking CAD
+        // blows its reply window.
+        api.lora.cad.set(false);
+
         if (haveMeshParams)
         {
             mesh_set_enabled(mesh_enabled != 0);
@@ -891,6 +893,9 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
 
         set_runtimeConfigP2P(&runtimeConfigP2P);
         set_useRuntimeConfigP2P(true);
+        // CAD stays off: the WiRoc host does its own timing and a blocking CAD
+        // blows its reply window.
+        api.lora.cad.set(false);
         service_lora_p2p_config();
         api.lora.precv(65533);
         release_tx_indicator();
@@ -1106,6 +1111,10 @@ int config_handler_legacy(SERIAL_PORT port, char *cmd, stParam *param)
         if( udrv_code != UDRV_RETURN_OK)
             goto STEP_ATP2P_CHECK_ERROR_CODE;
 
+        // CAD stays off: the WiRoc host does its own timing and a blocking CAD
+        // blows its reply window.
+        api.lora.cad.set(false);
+
         set_useRuntimeConfigP2P(false);
         // A host that speaks the legacy ATC+P2P command is not mesh-aware, so
         // force mesh off.  Otherwise ATC+SEND/ATC+REC would keep taking the
@@ -1274,6 +1283,9 @@ int config_handler_legacy(SERIAL_PORT port, char *cmd, stParam *param)
 
         set_runtimeConfigP2P(&runtimeConfigP2P);
         set_useRuntimeConfigP2P(true);
+        // CAD stays off: the WiRoc host does its own timing and a blocking CAD
+        // blows its reply window.
+        api.lora.cad.set(false);
         service_lora_p2p_config();
         // A host that speaks the legacy ATC+P2P command is not mesh-aware, so
         // force mesh off (see config_handler_legacy stored-config branch).
@@ -1338,24 +1350,6 @@ static void arm_one_shot(RAK_TIMER_ID id, RAK_TIMER_HANDLER handler, uint32_t ms
     api.system.timer.stop(id);
     api.system.timer.create(id, handler, RAK_TIMER_ONESHOT);
     api.system.timer.start(id, ms, NULL);
-}
-
-void cad_cb(bool detect) {
-	if(detect)
-    {
-        unsigned long elapsed = millis() - start_send;
-        Serial.printf("Send to cad done: %d\r\n", elapsed);
-        // indicate radio is not sending
-        digitalWrite(LORA_AUX, HIGH);
-
-        digitalWrite(LED_BLUE_RECEIVE, LOW);
-		digitalWrite(LED_RED_TRANSMIT, LOW);
-        arm_one_shot(RAK_TIMER_1, turn_off_both_led, 200);
-    }
-	else
-    {
-		digitalWrite(LED_RED_TRANSMIT, LOW);
-    }
 }
 
 /**
@@ -1435,9 +1429,8 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
         return AT_OK;
     }
 
-    /* Legacy P2P: the persisted CAD setting applies, and a busy channel comes
-     * back as AT_BUSY_ERROR.  CAD is *not* forced here: it runs synchronously
-     * inside the AT command, and the host waits only ~100 ms for the reply. */
+    /* Legacy P2P: sent without CAD (ATC+P2P persists AT+CAD=0); a radio that
+     * refuses the frame comes back as AT_BUSY_ERROR. */
     sentOK = api.lora.psend(datalen / 2, lora_data);
     if (sentOK) {
         return AT_OK;
@@ -1490,8 +1483,8 @@ bool send_ack(bool drf1268dsCompatMode, uint8_t channelNumber, uint8_t calculate
     digitalWrite(LED_RED_TRANSMIT, LOW);
     // indicate radio is sending
     digitalWrite(LORA_AUX, LOW);
-    /* CAD forced on (listen before talk) for the auto-ACK too. */
-    bool ackSentOK = api.lora.psend(drf1268dsCompatMode ? 8:7, ackMsg, true);
+    /* No CAD on the auto-ACK: it must follow the frame immediately. */
+    bool ackSentOK = api.lora.psend(drf1268dsCompatMode ? 8:7, ackMsg, false);
     if (!ackSentOK)
     {
         digitalWrite(LED_RED_TRANSMIT, HIGH);
@@ -1501,9 +1494,8 @@ bool send_ack(bool drf1268dsCompatMode, uint8_t channelNumber, uint8_t calculate
 }
 
 /* The auto-ACK must not run inside the radio interrupt.  receive_cb runs in the
- * SUBGHZ ISR (RxDone -> receive_cb), and with CAD forced on psend waits for the
- * CAD-done IRQ -- which cannot preempt that same ISR, so it would spin forever.
- * Park the ACK here and let the RUI timer context send it. */
+ * SUBGHZ ISR (RxDone -> receive_cb), and psend() would block there.  Park the
+ * ACK here and let the RUI timer context send it. */
 static struct {
     bool pending;
     bool drf1268dsCompatMode;

@@ -141,7 +141,7 @@ uint16_t mesh_get_overhead_pct(void);
  * (rx_assign - adopt). */
 typedef struct {
     uint16_t tx_ok;         /* frames handed to the radio                  */
-    uint16_t tx_busy;       /* radio refused (busy / CAD found the channel) */
+    uint16_t tx_busy;       /* radio refused (busy)                        */
     uint16_t tx_assign;     /* ADDR_ASSIGN frames queued for transmission   */
     uint16_t rx_any;        /* frames decoded off the air                  */
     uint16_t rx_assign;     /* ADDR_ASSIGN frames decoded off the air       */
@@ -158,13 +158,12 @@ bool    mesh_send_uplink(const uint8_t *payload, uint8_t len);
 /* --- M4 MAC / downlink -------------------------------------------------- */
 #define MESH_LINK_RETRIES        1      /* retransmits before giving up       */
 
-/* Channel access: every module-generated transmission is preceded by a CAD
- * (listen before talk), forced on regardless of the module's persisted CAD
- * setting.  When the channel is busy a *queued* frame is retried after a
+/* Channel access: every transmission goes out without CAD (listen before
+ * talk) -- a blocking CAD inside psend would blow the host's reply window.
+ * When the radio reports the channel busy a *queued* frame is retried after a
  * randomised backoff window that doubles per consecutive busy attempt.  Host
- * messages are not queued: they are tried once, without CAD -- the CAD blocks
- * inside the AT command for longer than the host's reply window -- and the host
- * owns the backoff/resend. */
+ * messages are not queued: they are tried once and the host owns the
+ * backoff/resend. */
 #define MESH_TX_BACKOFF_MIN_MS   40     /* smallest randomised window (ms)    */
 #define MESH_TX_BACKOFF_MAX_MS   1280   /* ceiling of the doubling backoff    */
 
@@ -177,7 +176,7 @@ bool    mesh_send_uplink(const uint8_t *payload, uint8_t len);
  * stay on the periodic tick, whose distinct per-node phase spreads their
  * forwarders -- that decorrelation is worth more than the latency there. */
 #define MESH_TX_FAST_MS          10     /* base delay before an immediate drain */
-#define MESH_TX_FAST_JITTER_MS   30     /* random extra, decorrelates forwarders */
+#define MESH_TX_FAST_JITTER_MS   30     /* random extra, decorrelates forwarders; ACKs skip it */
 
 /* Root only: flood a payload down to a specific node (0 on failure). */
 bool    mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len);

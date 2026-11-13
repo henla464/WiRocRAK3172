@@ -150,12 +150,12 @@ Addresses travel in the AT interface, so the host is updated in lock-step:
   as a downlink to that node; on a non-root it is ignored and the payload goes
   to the root node anyway. The legacy single-parameter form `ATC+SEND=<hexpayload>`
   stays valid (`dest=0`).
-  In **both** modes a busy channel (CAD) is reported back as `AT_BUSY_ERROR`; the
-  host backs off and resends (see "Channel access"). In mesh mode a node that
-  cannot hand a payload to the mesh at all -- no address, or an address but no
-  parent to route through -- answers `NN` (the `AT_NO_NETWORK_JOINED` code,
-  shortened in the AT layer like `BU`) instead, so an unattached node is not
-  mistaken for a busy channel.
+  In **both** modes a send the radio refuses (busy) is reported back as
+  `AT_BUSY_ERROR`; the host backs off and resends (see "Channel access"). In mesh
+  mode a node that cannot hand a payload to the mesh at all -- no address, or an
+  address but no parent to route through -- answers `NN` (the
+  `AT_NO_NETWORK_JOINED` code, shortened in the AT layer like `BU`) instead, so an
+  unattached node is not mistaken for a busy radio.
 * **`ATC+REC`** appends a **source address** and the origin's **6-byte Bluetooth
   address** to both response forms:
 
@@ -356,31 +356,32 @@ a **direct child** of the root node is the exception: that path is a single hop 
 relay in it, so retrying it end to end costs the same, and neither the root nor the
 target spends a frame on it (see *MAC / link reliability*).
 
-## Channel access (listen before talk)
+## Channel access (no listen before talk)
 
-Every **module-generated** transmission is preceded by a **CAD** (channel activity
-detection) that is **forced on in firmware** -- `api.lora.psend(len, frame, true)` --
-so it does not depend on the module's persisted `AT+CAD` setting. When CAD detects
-activity the frame is **not** put on the air (`psend` returns false).
+No path runs a **CAD** (channel activity detection): every `api.lora.psend` call
+passes `cad = false`, and `ATC+P2P` / `ATC+P2PM` persist `AT+CAD=0`. A CAD runs
+synchronously inside `psend()`, and at the mesh datarate it blocks for longer
+than the WiRoc host's ~100 ms reply window -- the frame would reach the air but
+the host would time the command out and report it unsent. A **link ACK** has a
+second reason: it must follow the frame it acknowledges immediately, or the
+sender's whole pending timeout expires and it retransmits.
 
-A **host-originated** frame (`ATC+SEND`) is the exception: it goes out **without**
-CAD. `psend()` runs the CAD synchronously inside the AT command, and at the mesh
-datarate a CAD blocks for longer than the WiRoc host's ~100 ms reply window -- the
-frame reaches the air, but the host has already timed the command out and reports
-it unsent. The host tries such a frame once and owns the resend, so it carries the
-collision risk; the legacy (mesh-disabled) path has the same behaviour.
+Collision avoidance is therefore the per-node jitter and busy backoff below plus
+the implicit link ACK / MAC retries, not listen-before-talk. A send can still be
+refused: the radio is busy with a transmission, or a frame is mid-reception.
 
-How a busy channel is handled depends on who wants the transmission:
+How a refused send is handled depends on who wants the transmission:
 
 * **Module-generated traffic** (beacons, joins, claims, table floods, relay forwards,
   link ACKs and link retransmits) is queued and drained by the mesh TX queue. A
   **point-to-point** frame (data, link-ack, claim, topology) is drained by a **fast
   one-shot timer** -- `MESH_TX_FAST_MS` (10 ms) + up to `MESH_TX_FAST_JITTER_MS`
-  (30 ms) after it is queued -- so a hop forwards almost immediately instead of
+  (30 ms) after it is queued, link ACKs skipping the jitter -- so a hop forwards
+  almost immediately instead of
   waiting for the housekeeping tick; a **broadcast/flood** frame (dst = NONE) waits
   for the next `MESH_TIMER_PERIOD_MS` (200 ms) tick, whose distinct per-node phase
   spreads competing relay forwarders (that decorrelation is worth more than the
-  latency there). After a busy verdict the drain holds off for a **randomised backoff**:
+  latency there). After a refused send the drain holds off for a **randomised backoff**:
   the backoff *window* starts at `MESH_TX_BACKOFF_MIN_MS` and **doubles per consecutive
   busy attempt** up to `MESH_TX_BACKOFF_MAX_MS`, resetting after a clean send, and the
   delay actually waited is drawn from the window's **upper half** -- 20-40 ms on the
@@ -389,14 +390,14 @@ How a busy channel is handled depends on who wants the transmission:
   **xorshift PRNG** -- a *pseudo-random number generator*, a tiny deterministic
   shift-and-XOR routine seeded per node from its boot time.
 * **Host-originated traffic** (`ATC+SEND`, i.e. an uplink or a root-node downlink) is
-  **not queued**. The frame is tried **once, immediately**: if the channel is busy
+  **not queued**. The frame is tried **once, immediately**: if the radio refuses it
   the AT handler returns `AT_BUSY_ERROR` and the **host owns the backoff and
   resend**, exactly like legacy P2P mode. If the frame does go out, it is still
   armed in the pending slot, so a lost *hop* is retried by the mesh MAC (below)
   independently of the host.
 
-The legacy P2P `ATC+SEND` and the built-in punch auto-ACK also pass `true`, so CAD
-is checked first there too.
+The legacy P2P `ATC+SEND` and the built-in punch auto-ACK run without CAD too
+(see above); `ATC+P2P` / `ATC+P2PM` persist `AT+CAD=0` on every config.
 
 ## MAC / link reliability
 
@@ -461,7 +462,7 @@ has no neighbour at all it keeps listening until beacons return.
   parent, falls back to flooding it.  While a node holds an address but has **no
   route**, that flood repeats every `MESH_JOIN_INTERVAL_MAX_MS` until a parent is
   back.  It has to: with no parent it emits no beacon, no aggregate and no
-  topology report, and a radio that has just refused a frame on CAD is left in
+  topology report, and a radio that has just refused a frame (busy) is left in
   standby with receive disarmed -- so a node that simply waited would be silent
   and deaf for good.
 * **Liveness is a separate, cheaper message, and it is aggregated.** A deep idle
@@ -674,8 +675,8 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_MONITOR_TIMEOUT_MS` | 450000 | depth >= 2 node: no parent aggregate for this long -> re-claim (1.5x `MESH_ALIVE_INTERVAL_MS`; must stay under `MESH_EVICT_MS`) |
 | `MESH_RECOVER_MS` | 10000 | root-node post-boot recovery window |
 | `MESH_LINK_RETRIES` | 1 | link retransmits (timeout is derived, see MAC) |
-| `MESH_TX_BACKOFF_MIN_MS` / `MESH_TX_BACKOFF_MAX_MS` | 40 / 1280 | queued-frame backoff after a busy CAD (window bounds, doubles per attempt; the delay waited is drawn from the window's upper half, so 20-40 ms at first) |
-| `MESH_TX_FAST_MS` / `MESH_TX_FAST_JITTER_MS` | 10 / 30 | fast drain delay for a point-to-point frame (base + random jitter) before it is sent, instead of waiting for the 200 ms housekeeping tick |
+| `MESH_TX_BACKOFF_MIN_MS` / `MESH_TX_BACKOFF_MAX_MS` | 40 / 1280 | queued-frame backoff after a refused send (window bounds, doubles per attempt; the delay waited is drawn from the window's upper half, so 20-40 ms at first) |
+| `MESH_TX_FAST_MS` / `MESH_TX_FAST_JITTER_MS` | 10 / 30 | fast drain delay for a point-to-point frame (base + random jitter, which link ACKs skip) before it is sent, instead of waiting for the 200 ms housekeeping tick |
 | `MESH_DEFAULT_TTL` | 4 | max hops: frame TTL, and the tree depth a node will attach at |
 | `MESH_NEIGHBOR_MAX` | 8 | tracked neighbours per node |
 | `MESH_PARENT_HYSTERESIS` | 1 | cost margin required to switch parent |
@@ -964,7 +965,8 @@ forwarding it is dead air. That wait is set by whichever drains the queue first:
 
 * the **fast forward path** -- a point-to-point frame (data, link-ack, claim,
   topology) arms a one-shot timer that drains it `MESH_TX_FAST_MS` (10 ms) plus a
-  random jitter of up to `MESH_TX_FAST_JITTER_MS` (30 ms) later; and
+  random jitter of up to `MESH_TX_FAST_JITTER_MS` (30 ms) later (a link ACK skips
+  the jitter); and
 * the **housekeeping tick** -- a broadcast/flood frame (dst = NONE) waits for the
   next `MESH_TIMER_PERIOD_MS` (200 ms) tick, whose per-node phase is what spreads
   competing flood relays.
@@ -1001,9 +1003,9 @@ The result is a **practical upper bound**:
 Like the tables above these are **punches per minute** for a single closed-loop flow
 (the host sends the next punch only after the previous ACK). The per-hop term is a
 **mean**: a hop that is retried (implicit-ACK timeout `2*airtime + 200 ms`, up to
-`MESH_LINK_RETRIES` times) adds more, and a busy channel (CAD busy -> randomised
-backoff drawn from a doubling window, 20-40 ms at first) adds more again. A CAD listen before each send is not
-counted. The channel is also shared: CAD plus per-node backoff serialize competitors,
+`MESH_LINK_RETRIES` times) adds more, and a refused send (randomised
+backoff drawn from a doubling window, 20-40 ms at first) adds more again. The
+channel is also shared: per-node backoff serializes competitors,
 so a busy network lands below these figures. In short, a half-duplex store-and-forward
 mesh can **never fill the air** -- a relay must finish receiving before it can transmit
 -- so treat these as the practical ceiling, not a guarantee.
@@ -1071,12 +1073,11 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
   `ADDR_TABLE` while a relay node does, and that a `DATA_DOWNLINK` is re-broadcast only
   by the branch whose subtree bitmap contains the target (a relay node off that branch
   stays silent).
-* **Channel access (CAD / backoff)**: hold the channel busy with a second
-  transmitter and confirm module-generated traffic (beacons, joins) keeps
-  retrying after the randomised backoff once the channel clears, and that CAD is
-  applied even with `AT+CAD=0` persisted. A host `ATC+SEND` is sent without CAD
-  (see *Channel access*), so confirm instead that it replies inside the host's
-  reply window and never leaves the command unanswered.
+* **Channel access (backoff)**: confirm no path runs a CAD (nothing blocks the
+  host's reply window, the ACK follows its frame promptly), and that a queued
+  module frame refused by a busy radio keeps retrying after the randomised
+  backoff once the radio frees up. Hold the channel busy with a second
+  transmitter and confirm the mesh still converges without listen-before-talk.
 * **Regression**: with mesh disabled the P2P punch / double-punch ACK+hash path is
   unchanged (and no `srcaddr` byte is added).
 
