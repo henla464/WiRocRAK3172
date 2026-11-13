@@ -29,6 +29,9 @@ void setup() {
     // Initialize the mesh subsystem (loads persisted config; disabled by default)
     mesh_init();
 
+    // Load the persisted listen-before-talk RSSI limit
+    lbt_init();
+
     //o_drf1268dscompatmode = service_lora_p2p_get_drf1268dscompatmode();
     //o_sendack = service_lora_p2p_get_sendack();
 

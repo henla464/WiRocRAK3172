@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "mesh.h"
+#include "lbt.h"
 
 #define LED_RED_TRANSMIT PIN_LED1
 #define LED_BLUE_RECEIVE PIN_LED2

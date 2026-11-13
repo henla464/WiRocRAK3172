@@ -39,6 +39,7 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
 | `ATC+ACTIVEROOT=<0\|1>` | Designate this node as the active root node / gateway (persisted). `ATC+ACTIVEROOT?` reads it. |
 | `ATC+STANDBYROOT=<0\|1>` | Designate this node as a passive standby root (persisted). `ATC+STANDBYROOT?` reads it. |
 | `ATC+MESHNODEDEVICEID=<12 hex>` | Set the 6-byte node device id (persisted). `ATC+MESHNODEDEVICEID?` reads it back. |
+| `ATC+LBT=<dBm\|0>` | Listen-before-talk RSSI limit (persisted). The channel is busy when the instantaneous RSSI reads above this (negative) value; `0` disables the check. `ATC+P2P`/`ATC+P2PM` set it automatically from the bandwidth (`-115` at 31.25 kHz, `-120` at 10.42 kHz, `0` otherwise). `ATC+LBT?` returns `<limit>:<instantaneous RSSI>` -- the RSSI half is what you calibrate the limit from. |
 | `ATC+MESHSTATE=?` | Diagnostics (see below). |
 | `ATC+MESHTOPO=?` | Dump the topology map this node knows, one line with rows separated by `|` (see below). |
 | `ATC+P2PM=<runcfg>:...,[:<mesh>:<root>:<standby>:<deviceid>]` | Mesh-aware P2P config: mesh flags and node device id as trailing params. |
@@ -356,21 +357,39 @@ a **direct child** of the root node is the exception: that path is a single hop 
 relay in it, so retrying it end to end costs the same, and neither the root nor the
 target spends a frame on it (see *MAC / link reliability*).
 
-## Channel access (no listen before talk)
+## Channel access (RSSI listen before talk)
 
 No path runs a **CAD** (channel activity detection): every `api.lora.psend` call
 passes `cad = false`, and `ATC+P2P` / `ATC+P2PM` persist `AT+CAD=0`. A CAD runs
 synchronously inside `psend()`, and at the mesh datarate it blocks for longer
 than the WiRoc host's ~100 ms reply window -- the frame would reach the air but
-the host would time the command out and report it unsent. A **link ACK** has a
-second reason: it must follow the frame it acknowledges immediately, or the
-sender's whole pending timeout expires and it retransmits.
+the host would time the command out and report it unsent.
 
-Collision avoidance is therefore the per-node jitter and busy backoff below plus
-the implicit link ACK / MAC retries, not listen-before-talk. A send can still be
-refused: the radio is busy with a transmission, or a frame is mid-reception.
+Listen before talk is instead a **single instantaneous RSSI sample**: before any
+transmission -- a queued mesh frame, the punch auto-ACK, or a legacy P2P
+`ATC+SEND` -- the channel counts as busy when `SUBGRF_GetRssiInst()` reads
+*above* the limit set with `ATC+LBT=<dBm>` (a negative dBm value, kept in its
+own flash record and loaded at boot whatever the mesh mode; `0`, the default,
+disables the check). `ATC+P2P` and `ATC+P2PM` set the limit from the bandwidth
+they are given -- **-115 dBm** at 31.25 kHz (index `7`), **-120 dBm** at
+10.42 kHz (index `4`), and `0` (off) at every other bandwidth, since no
+threshold is calibrated for them. `ATC+LBT` still overrides afterwards, for
+that session and across reboots, but the next `ATC+P2P`/`ATC+P2PM` resets it
+from the bandwidth again. `ATC+LBT?` reports the live instantaneous RSSI next
+to the limit.
 
-How a refused send is handled depends on who wants the transmission:
+A busy channel is treated exactly like a refused send (below): a queued frame
+is retried after the backoff, a host send or the auto-ACK reports
+busy/unanswered and the sender retries. With no `ATC+P2P`/`ATC+P2PM` yet run
+and no `ATC+LBT` set, the check is off: the right threshold depends on the
+site's noise floor.
+
+A send can also be refused outright: the radio is busy with a transmission, or
+a frame is mid-reception.
+
+Collision avoidance beyond that is the per-node jitter and busy backoff below
+plus the implicit link ACK / MAC retries. How a refused send is handled depends
+on who wants the transmission:
 
 * **Module-generated traffic** (beacons, joins, claims, table floods, relay forwards,
   link ACKs and link retransmits) is queued and drained by the mesh TX queue. A
@@ -397,7 +416,14 @@ How a refused send is handled depends on who wants the transmission:
   independently of the host.
 
 The legacy P2P `ATC+SEND` and the built-in punch auto-ACK run without CAD too
-(see above); `ATC+P2P` / `ATC+P2PM` persist `AT+CAD=0` on every config.
+(see above); `ATC+P2P` / `ATC+P2PM` persist `AT+CAD=0` on every config. Both take
+the same RSSI check: `ATC+SEND` answers `AT_BUSY_ERROR` and the auto-ACK is
+skipped (the punch sender retries), so neither ever transmits into a channel the
+limit calls busy.
+
+A **link ACK** goes through the check as well. Being queued it is retried rather
+than lost, but a retry costs the sender's pending slot -- keep the limit clear of
+the level your own frames arrive at on a quiet channel.
 
 ## MAC / link reliability
 
@@ -1073,11 +1099,20 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
   `ADDR_TABLE` while a relay node does, and that a `DATA_DOWNLINK` is re-broadcast only
   by the branch whose subtree bitmap contains the target (a relay node off that branch
   stays silent).
-* **Channel access (backoff)**: confirm no path runs a CAD (nothing blocks the
-  host's reply window, the ACK follows its frame promptly), and that a queued
+* **Channel access (backoff, LBT)**: confirm no path runs a CAD (nothing blocks
+  the host's reply window, the ACK follows its frame promptly), and that a queued
   module frame refused by a busy radio keeps retrying after the randomised
   backoff once the radio frees up. Hold the channel busy with a second
-  transmitter and confirm the mesh still converges without listen-before-talk.
+  transmitter and confirm a mesh still converges without listen-before-talk.
+  Confirm a fresh `ATC+P2PM` at bandwidth `7` leaves `ATC+LBT?` reporting
+  `-115:...` (and `-120` at index `4`) with no `ATC+LBT` typed.
+  Read the idle channel level first (`ATC+LBT?` reports `<limit>:<RSSI>`) while
+  a peer transmits on a quiet site, then set the limit well above it but clear
+  of the level real traffic arrives at (`ATC+LBT=-100`, persisted across a
+  reboot -- read it back with `ATC+LBT?`), hold the channel busy at above-limit
+  power, and confirm `ATC+SEND` returns `AT_BUSY_ERROR`, the punch gets no ACK,
+  and the queued mesh traffic resumes once the interferer stops. With `ATC+LBT=0`
+  the check is off (the send goes out regardless).
 * **Regression**: with mesh disabled the P2P punch / double-punch ACK+hash path is
   unchanged (and no `srcaddr` byte is added).
 

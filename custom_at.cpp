@@ -31,6 +31,7 @@ int standbyroot_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param);
 int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param);
+int lbt_handler(SERIAL_PORT port, char *cmd, stParam *param);
 void send_cb(void);
 void receive_cb(rui_lora_p2p_recv_t recv_data_pkg);
 static void p2p_printf_hex(uint8_t *pdata, uint16_t len);
@@ -129,6 +130,10 @@ bool init_mesh_at(void)
 	ok &= api.system.atMode.add((char *)"MESHNODEDEVICEID",
 								(char *)"Set the 6-byte mesh node device id (12 hex chars). Usage: ATC+MESHNODEDEVICEID=<12 hex> / ATC+MESHNODEDEVICEID=?",
 								(char *)"MESHNODEDEVICEID", meshnodedeviceid_handler,
+								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
+	ok &= api.system.atMode.add((char *)"LBT",
+								(char *)"Listen-before-talk RSSI limit in dBm (negative); the channel is busy when the instantaneous RSSI is above it, 0 disables the check. Usage: ATC+LBT=<dBm|0> / ATC+LBT=? reports <limit>:<instantaneous RSSI>",
+								(char *)"LBT", lbt_handler,
 								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
 	return ok;
 }
@@ -234,6 +239,29 @@ int mesh_handler(SERIAL_PORT port, char *cmd, stParam *param)
 			return AT_PARAM_ERROR;
 		mesh_set_enabled(enabled != 0);
 		mesh_config_save();
+		return AT_OK;
+	}
+	return AT_PARAM_ERROR;
+}
+
+/**
+ * @brief Listen-before-talk RSSI limit. Usage: ATC+LBT=<dBm|0> / ATC+LBT=?
+ */
+int lbt_handler(SERIAL_PORT port, char *cmd, stParam *param)
+{
+	if (param->argc == 1 && !strcmp(param->argv[0], "?"))
+	{
+		/* <limit>:<instantaneous RSSI> -- the RSSI half is the calibration. */
+		atcmd_printf("%s=%d:%d", cmd, lbt_get_rssi_limit(), lbt_get_rssi());
+		return AT_NO_STATUS;
+	}
+	else if (param->argc == 1)
+	{
+		char *end;
+		long limit = strtol(param->argv[0], &end, 10);
+		if (end == param->argv[0] || *end != '\0' || limit < -128 || limit > 0)
+			return AT_PARAM_ERROR;
+		lbt_set_rssi_limit((int16_t)limit);   /* persists */
 		return AT_OK;
 	}
 	return AT_PARAM_ERROR;
@@ -680,6 +708,10 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         // blows its reply window.
         api.lora.cad.set(false);
 
+        // Listen-before-talk threshold follows the bandwidth (a value tuned for
+        // 31.25 kHz reads the wide 125 kHz channel as busy non-stop).
+        lbt_set_default_for_bandwidth(bandwidth);
+
         if (haveMeshParams)
         {
             mesh_set_enabled(mesh_enabled != 0);
@@ -896,6 +928,10 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         // CAD stays off: the WiRoc host does its own timing and a blocking CAD
         // blows its reply window.
         api.lora.cad.set(false);
+
+        // Listen-before-talk threshold follows the bandwidth (a value tuned for
+        // 31.25 kHz reads the wide 125 kHz channel as busy non-stop).
+        lbt_set_default_for_bandwidth(bandwidth);
         service_lora_p2p_config();
         api.lora.precv(65533);
         release_tx_indicator();
@@ -1115,6 +1151,10 @@ int config_handler_legacy(SERIAL_PORT port, char *cmd, stParam *param)
         // blows its reply window.
         api.lora.cad.set(false);
 
+        // Listen-before-talk threshold follows the bandwidth (a value tuned for
+        // 31.25 kHz reads the wide 125 kHz channel as busy non-stop).
+        lbt_set_default_for_bandwidth(bandwidth);
+
         set_useRuntimeConfigP2P(false);
         // A host that speaks the legacy ATC+P2P command is not mesh-aware, so
         // force mesh off.  Otherwise ATC+SEND/ATC+REC would keep taking the
@@ -1286,6 +1326,10 @@ int config_handler_legacy(SERIAL_PORT port, char *cmd, stParam *param)
         // CAD stays off: the WiRoc host does its own timing and a blocking CAD
         // blows its reply window.
         api.lora.cad.set(false);
+
+        // Listen-before-talk threshold follows the bandwidth (a value tuned for
+        // 31.25 kHz reads the wide 125 kHz channel as busy non-stop).
+        lbt_set_default_for_bandwidth(bandwidth);
         service_lora_p2p_config();
         // A host that speaks the legacy ATC+P2P command is not mesh-aware, so
         // force mesh off (see config_handler_legacy stored-config branch).
@@ -1429,8 +1473,13 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
         return AT_OK;
     }
 
-    /* Legacy P2P: sent without CAD (ATC+P2P persists AT+CAD=0); a radio that
-     * refuses the frame comes back as AT_BUSY_ERROR. */
+    /* Legacy P2P: sent without CAD (ATC+P2P persists AT+CAD=0); a channel that
+     * LBT hears busy, or a radio that refuses the frame, comes back as
+     * AT_BUSY_ERROR. */
+    if (lbt_channel_busy()) {
+        release_tx_indicator();
+        return AT_BUSY_ERROR;
+    }
     sentOK = api.lora.psend(datalen / 2, lora_data);
     if (sentOK) {
         return AT_OK;
@@ -1462,6 +1511,11 @@ bool send_ack(bool drf1268dsCompatMode, uint8_t channelNumber, uint8_t calculate
 {
     uint8_t ackMsg[8];
     uint8_t *startAck;
+
+    /* Listen before talk: an ACK into a busy channel only collides -- the
+     * punch that asked for it is retried by the sender. */
+    if (lbt_channel_busy())
+        return false;
     if (drf1268dsCompatMode) {
         ackMsg[0] = channelNumber;
         startAck = ackMsg+1;

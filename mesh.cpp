@@ -15,6 +15,7 @@
 #include <Arduino.h>
 #include <string.h>
 #include "service_lora_p2p.h"   /* service_lora_p2p_get_sf()/..._get_bandwidth() */
+#include "lbt.h"                /* listen before talk */
 #include "mesh.h"
 #include "app.h"
 #include "mesh_alloc.h"
@@ -159,7 +160,7 @@ static uint32_t s_air_data;
  * three ways a frame can silently fail to arrive: never transmitted (tx_busy),
  * never heard (rx_assign), or heard and then not adopted (rx_assign - adopt). */
 static uint16_t s_tx_ok;                        /* psend accepted              */
-static uint16_t s_tx_busy;                      /* psend refused (busy)        */
+static uint16_t s_tx_busy;                      /* refused: radio busy or LBT  */
 static uint16_t s_tx_assign;                    /* ADDR_ASSIGN queued for TX   */
 static uint16_t s_rx_any;                        /* frames decoded off the air  */
 static uint16_t s_rx_assign;                    /* ADDR_ASSIGN decoded         */
@@ -453,11 +454,11 @@ static uint32_t mesh_tx_backoff_draw(void)
     return half + (mesh_rand() % (half + 1));
 }
 
-/* Transmit one frame *now*.  No CAD (listen before talk) anywhere: the WiRoc
- * host does its own timing, and at the mesh datarate a blocking CAD blows its
- * ~100 ms reply window.  Returns false when the radio is busy; the caller
- * decides whether to back off (queued mesh traffic) or report busy to the host
- * (host-originated traffic, which owns the retry). */
+/* Transmit one frame *now*.  Listen before talk is an RSSI check here, not a
+ * blocking CAD inside psend (which would blow the WiRoc host's ~100 ms reply
+ * window).  Returns false when the radio is busy; the caller decides whether
+ * to back off (queued mesh traffic) or report busy to the host (host-originated
+ * traffic, which owns the retry). */
 static bool mesh_tx_radio_send(const uint8_t *frame, uint8_t len)
 {
     mesh_header_t h;
@@ -468,6 +469,10 @@ static bool mesh_tx_radio_send(const uint8_t *frame, uint8_t len)
      * so this single gate is what makes the observer silent -- regardless of
      * which RX handlers or housekeeping it runs. */
     if (mesh_is_standby()) {
+        return false;
+    }
+    if (lbt_channel_busy()) {
+        s_tx_busy++;
         return false;
     }
     if (!api.lora.psend(len, (uint8_t *)frame, false)) {
