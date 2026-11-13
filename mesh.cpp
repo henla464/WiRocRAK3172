@@ -2629,6 +2629,17 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
      * mesh_rx_alive additionally refreshes every bit of a child's aggregate. */
     if (mesh_is_root() && h.src >= MESH_FIRST_NONROOT_ADDR && h.src <= MESH_ADDR_MAX) {
         s_heard_ms[h.src] = millis();
+        /* A rootward unicast addressed to us that arrives at the full TTL never
+         * touched a relay, so its source is a direct child -- learn it the way a
+         * relay does in mesh_note_relay(), instead of waiting up to
+         * MESH_ALIVE_INTERVAL_MS for the next aggregate.  Otherwise the root's
+         * child table is empty after a restart, mesh_send_downlink arms a hop
+         * ACK no direct child ever sends, and every downlink goes out twice. */
+        if (h.dst == mesh_get_address() && h.hops == MESH_DEFAULT_TTL &&
+            (h.type == MESH_TYPE_DATA_UPLINK || h.type == MESH_TYPE_ADDR_CLAIM ||
+             h.type == MESH_TYPE_TOPOLOGY)) {
+            s_child_heard_ms[h.src] = millis();
+        }
     }
     /* Standby root (M7): any frame from the root (beacon, downlink, ACK,
      * table) refreshes the backstop heartbeat. */
