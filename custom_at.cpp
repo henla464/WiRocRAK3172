@@ -132,7 +132,7 @@ bool init_mesh_at(void)
 								(char *)"MESHNODEDEVICEID", meshnodedeviceid_handler,
 								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
 	ok &= api.system.atMode.add((char *)"LBT",
-								(char *)"Listen-before-talk RSSI limit in dBm (negative); the channel is busy when the instantaneous RSSI is above it, 0 disables the check. Usage: ATC+LBT=<dBm|0> / ATC+LBT=? reports <limit>:<instantaneous RSSI>",
+								(char *)"Listen-before-talk RSSI threshold in dBm (negative); the channel is busy when the sampled RSSI is above it. 0 selects the adaptive threshold, which starts from the measured noise floor. The optional second value sets how close it may come to that floor. Usage: ATC+LBT=<dBm|0>[:<delta_min dB>] / ATC+LBT=? reports <threshold>:<instantaneous RSSI>:<noise floor>:<min delta>",
 								(char *)"LBT", lbt_handler,
 								RAK_ATCMD_PERM_READ | RAK_ATCMD_PERM_WRITE);
 	return ok;
@@ -245,23 +245,36 @@ int mesh_handler(SERIAL_PORT port, char *cmd, stParam *param)
 }
 
 /**
- * @brief Listen-before-talk RSSI limit. Usage: ATC+LBT=<dBm|0> / ATC+LBT=?
+ * @brief Listen-before-talk RSSI threshold and its minimum margin over the
+ *        noise floor.  Usage: ATC+LBT=<dBm|0>[:<delta_min dB>] / ATC+LBT=?
  */
 int lbt_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if (param->argc == 1 && !strcmp(param->argv[0], "?"))
 	{
-		/* <limit>:<instantaneous RSSI> -- the RSSI half is the calibration. */
-		atcmd_printf("%s=%d:%d", cmd, lbt_get_rssi_limit(), lbt_get_rssi());
+		/* <threshold>:<instantaneous RSSI>:<noise floor>:<min delta> */
+		atcmd_printf("%s=%d:%d:%d:%d", cmd, lbt_get_threshold(), lbt_get_rssi(),
+					 lbt_get_noise_floor(), lbt_get_delta_min());
 		return AT_NO_STATUS;
 	}
-	else if (param->argc == 1)
+	else if (param->argc == 1 || param->argc == 2)
 	{
 		char *end;
 		long limit = strtol(param->argv[0], &end, 10);
+		long delta = lbt_get_delta_min();
 		if (end == param->argv[0] || *end != '\0' || limit < -128 || limit > 0)
 			return AT_PARAM_ERROR;
-		lbt_set_rssi_limit((int16_t)limit);   /* persists */
+		if (param->argc == 2)
+		{
+			delta = strtol(param->argv[1], &end, 10);
+			if (end == param->argv[1] || *end != '\0' ||
+				delta < 1 || delta > LBT_DELTA_MAX_DB)
+				return AT_PARAM_ERROR;
+		}
+		/* Both parsed before either applies: a bad delta must not leave a
+		 * half-applied threshold behind. */
+		lbt_set_rssi_limit((int16_t)limit);       /* persists */
+		lbt_set_delta_min((int16_t)delta);        /* persists */
 		return AT_OK;
 	}
 	return AT_PARAM_ERROR;
@@ -707,10 +720,9 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         // CAD stays off: the WiRoc host does its own timing and a blocking CAD
         // blows its reply window.
         api.lora.cad.set(false);
-
-        // Listen-before-talk threshold follows the bandwidth (a value tuned for
-        // 31.25 kHz reads the wide 125 kHz channel as busy non-stop).
-        lbt_set_default_for_bandwidth(bandwidth);
+        // A pinned LBT threshold is a calibration for one site; a fresh
+        // P2P/P2PM means the node may be somewhere else, so go adaptive.
+        lbt_set_rssi_limit(0);
 
         if (haveMeshParams)
         {
@@ -928,10 +940,9 @@ int config_handler(SERIAL_PORT port, char *cmd, stParam *param)
         // CAD stays off: the WiRoc host does its own timing and a blocking CAD
         // blows its reply window.
         api.lora.cad.set(false);
-
-        // Listen-before-talk threshold follows the bandwidth (a value tuned for
-        // 31.25 kHz reads the wide 125 kHz channel as busy non-stop).
-        lbt_set_default_for_bandwidth(bandwidth);
+        // A pinned LBT threshold is a calibration for one site; a fresh
+        // P2P/P2PM means the node may be somewhere else, so go adaptive.
+        lbt_set_rssi_limit(0);
         service_lora_p2p_config();
         api.lora.precv(65533);
         release_tx_indicator();
@@ -1150,10 +1161,9 @@ int config_handler_legacy(SERIAL_PORT port, char *cmd, stParam *param)
         // CAD stays off: the WiRoc host does its own timing and a blocking CAD
         // blows its reply window.
         api.lora.cad.set(false);
-
-        // Listen-before-talk threshold follows the bandwidth (a value tuned for
-        // 31.25 kHz reads the wide 125 kHz channel as busy non-stop).
-        lbt_set_default_for_bandwidth(bandwidth);
+        // A pinned LBT threshold is a calibration for one site; a fresh
+        // P2P/P2PM means the node may be somewhere else, so go adaptive.
+        lbt_set_rssi_limit(0);
 
         set_useRuntimeConfigP2P(false);
         // A host that speaks the legacy ATC+P2P command is not mesh-aware, so
@@ -1326,10 +1336,9 @@ int config_handler_legacy(SERIAL_PORT port, char *cmd, stParam *param)
         // CAD stays off: the WiRoc host does its own timing and a blocking CAD
         // blows its reply window.
         api.lora.cad.set(false);
-
-        // Listen-before-talk threshold follows the bandwidth (a value tuned for
-        // 31.25 kHz reads the wide 125 kHz channel as busy non-stop).
-        lbt_set_default_for_bandwidth(bandwidth);
+        // A pinned LBT threshold is a calibration for one site; a fresh
+        // P2P/P2PM means the node may be somewhere else, so go adaptive.
+        lbt_set_rssi_limit(0);
         service_lora_p2p_config();
         // A host that speaks the legacy ATC+P2P command is not mesh-aware, so
         // force mesh off (see config_handler_legacy stored-config branch).
@@ -1624,6 +1633,10 @@ bool wiroc_ack_requested(const uint8_t *buf, uint16_t len, uint16_t off, uint8_t
 void receive_cb(rui_lora_p2p_recv_t recv_data_pkg) {
 
     digitalWrite(LED_BLUE_RECEIVE, LOW);
+
+    // Feeds the LBT link-quality gate: only a frame that actually decoded
+    // tells us the downlink margin is good.
+    lbt_note_rx(recv_data_pkg.Rssi, recv_data_pkg.Snr);
 
     // In mesh mode every on-air frame is a mesh frame: hand it to the mesh
     // layer (validate, dedup, route, and deliver uplink payloads to the host).

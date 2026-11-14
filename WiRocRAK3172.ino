@@ -29,9 +29,6 @@ void setup() {
     // Initialize the mesh subsystem (loads persisted config; disabled by default)
     mesh_init();
 
-    // Load the persisted listen-before-talk RSSI limit
-    lbt_init();
-
     //o_drf1268dscompatmode = service_lora_p2p_get_drf1268dscompatmode();
     //o_sendack = service_lora_p2p_get_sendack();
 
@@ -83,6 +80,10 @@ void setup() {
 
     // Enable RX permanent with TX possible
 	api.lora.precv(65533);
+
+    // Listen before talk: loads the pin and estimates the noise floor, so it
+    // needs the radio already listening.  Blocks for about 360 ms.
+    lbt_init();
 
     pinMode(LED_RED_TRANSMIT, OUTPUT);
 	digitalWrite(LED_RED_TRANSMIT, LOW);

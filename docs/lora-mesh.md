@@ -39,7 +39,7 @@ exactly as before (legacy P2P), so existing deployments are unaffected.
 | `ATC+ACTIVEROOT=<0\|1>` | Designate this node as the active root node / gateway (persisted). `ATC+ACTIVEROOT?` reads it. |
 | `ATC+STANDBYROOT=<0\|1>` | Designate this node as a passive standby root (persisted). `ATC+STANDBYROOT?` reads it. |
 | `ATC+MESHNODEDEVICEID=<12 hex>` | Set the 6-byte node device id (persisted). `ATC+MESHNODEDEVICEID?` reads it back. |
-| `ATC+LBT=<dBm\|0>` | Listen-before-talk RSSI limit (persisted). The channel is busy when the instantaneous RSSI reads above this (negative) value; `0` disables the check. `ATC+P2P`/`ATC+P2PM` set it automatically from the bandwidth (`-115` at 31.25 kHz, `-120` at 10.42 kHz, `0` otherwise). `ATC+LBT?` returns `<limit>:<instantaneous RSSI>` -- the RSSI half is what you calibrate the limit from. |
+| `ATC+LBT=<dBm\|0>[:<delta_min>]` | Listen-before-talk RSSI threshold (persisted). The channel is busy when the sampled RSSI reads above this (negative) value; `0` selects the adaptive threshold, which starts from the noise floor measured at boot and then steps inside `[noise + delta_min, -70 dBm]`. `delta_min` (1..40 dB, default 3, persisted) is how close it may come to the floor. `ATC+LBT?` returns `<threshold>:<instantaneous RSSI>:<noise floor>:<delta_min>`. |
 | `ATC+MESHSTATE=?` | Diagnostics (see below). |
 | `ATC+MESHTOPO=?` | Dump the topology map this node knows, one line with rows separated by `|` (see below). |
 | `ATC+P2PM=<runcfg>:...,[:<mesh>:<root>:<standby>:<deviceid>]` | Mesh-aware P2P config: mesh flags and node device id as trailing params. |
@@ -365,24 +365,59 @@ synchronously inside `psend()`, and at the mesh datarate it blocks for longer
 than the WiRoc host's ~100 ms reply window -- the frame would reach the air but
 the host would time the command out and report it unsent.
 
-Listen before talk is instead a **single instantaneous RSSI sample**: before any
-transmission -- a queued mesh frame, the punch auto-ACK, or a legacy P2P
-`ATC+SEND` -- the channel counts as busy when `SUBGRF_GetRssiInst()` reads
-*above* the limit set with `ATC+LBT=<dBm>` (a negative dBm value, kept in its
-own flash record and loaded at boot whatever the mesh mode; `0`, the default,
-disables the check). `ATC+P2P` and `ATC+P2PM` set the limit from the bandwidth
-they are given -- **-115 dBm** at 31.25 kHz (index `7`), **-120 dBm** at
-10.42 kHz (index `4`), and `0` (off) at every other bandwidth, since no
-threshold is calibrated for them. `ATC+LBT` still overrides afterwards, for
-that session and across reboots, but the next `ATC+P2P`/`ATC+P2PM` resets it
-from the bandwidth again. `ATC+LBT?` reports the live instantaneous RSSI next
-to the limit.
+Listen before talk is instead an **RSSI threshold, measured on the spot**: the
+device is deployed in unknown and moving locations, so there is no per-site
+constant to configure and no host involvement.
+
+* **Noise floor at boot.** After the radio is put in permanent RX, `lbt_init()`
+  waits 200 ms so the receiver settles, then takes 32 RSSI samples 5 ms apart
+  (about 360 ms in total), sorts them and averages the quietest 75 % -- dropping
+  the loudest quarter rejects a transient interferer or an actual packet. Reads
+  of `-128` ("no measurement") are discarded; if nothing usable is left the floor
+  falls back to -100 dBm. The sample count, trim fraction, spacing and settle
+  time are the `LBT_NOISE_*` macros in `lbt.h`.
+* **Starting threshold.** `noise + 8 dB`, clamped to
+  `[noise + delta_min, -70 dBm]` (`LBT_DELTA_START_DB`, `LBT_THRESHOLD_MAX_DBM`).
+  `delta_min` is how close the threshold may ever come to the measured floor --
+  3 dB by default, settable at runtime with `ATC+LBT=<dBm|0>:<dB>` and persisted
+  (1..40 dB). If the site is louder than -70 dBm the noise-relative lower bound
+  wins and the threshold sits at `noise + delta_min`.
+* **Before every transmission** -- a queued mesh frame, the punch auto-ACK, or a
+  legacy P2P `ATC+SEND` -- three back-to-back `SUBGRF_GetRssiInst()` reads are
+  averaged and the channel counts as busy when that average is *above* the
+  threshold.
+* **Slow adaptation**, one step of 1 dB after each window of 32 LBT decisions
+  (`LBT_ADAPT_WINDOW`, `LBT_ADAPT_STEP_DB`):
+  * deferred in ≥ 50 % of the window and retried in < 25 % -> **raise** (too many
+    false-positive deferrals);
+  * deferred in < 50 % and retried in ≥ 25 % and the last received frame's
+    link is good (RSSI ≥ -105 dBm, SNR ≥ -6 dB) -> **lower** (LBT is deferring to
+    interference it should be catching);
+  * retried in ≥ 25 % but the downlink looks bad -> **freeze**: that is link
+    margin, not LBT, and moving the threshold either way makes it worse.
+
+  Every step is clamped to `[noise + delta_min, -70 dBm]`. The inputs are the LBT
+  decision itself, each MAC retransmission / ACK timeout (`lbt_note_retx()` from
+  `mesh_pending_tick`) and the RSSI/SNR of each received frame (`lbt_note_rx()` in
+  `receive_cb`).
+
+`ATC+LBT=<dBm>[:<delta_min>]` **pins** the threshold (negative dBm, persisted in
+its own flash record): a pinned value is a calibration, so adaptation and its
+inputs are left alone. The optional second value sets `delta_min` in dB without
+pinning (`ATC+LBT=0:6`). `ATC+LBT=0`, the default, selects the **adaptive**
+threshold -- note this is the reverse of the old meaning of `0`, which used to
+disable the check. The adaptive threshold itself is *not* persisted: it starts
+again from the measured noise floor at every boot, which is what makes the device
+relocatable. `ATC+P2P` and `ATC+P2PM` also return to adaptive: a fresh config
+means the node may be somewhere else, so a pin does not outlive it.
+`ATC+LBT?` reports `<threshold>:<instantaneous RSSI>:<noise floor>:<delta_min>`.
+A device that ran the earlier firmware and still has the bandwidth-derived
+`-115` / `-120` in flash keeps it as a **pin** until the next
+`ATC+P2P`/`ATC+P2PM` (or a typed `ATC+LBT=0`).
 
 A busy channel is treated exactly like a refused send (below): a queued frame
 is retried after the backoff, a host send or the auto-ACK reports
-busy/unanswered and the sender retries. With no `ATC+P2P`/`ATC+P2PM` yet run
-and no `ATC+LBT` set, the check is off: the right threshold depends on the
-site's noise floor.
+busy/unanswered and the sender retries.
 
 A send can also be refused outright: the radio is busy with a transmission, or
 a frame is mid-reception.
@@ -1104,15 +1139,17 @@ mesh can **never fill the air** -- a relay must finish receiving before it can t
   module frame refused by a busy radio keeps retrying after the randomised
   backoff once the radio frees up. Hold the channel busy with a second
   transmitter and confirm a mesh still converges without listen-before-talk.
-  Confirm a fresh `ATC+P2PM` at bandwidth `7` leaves `ATC+LBT?` reporting
-  `-115:...` (and `-120` at index `4`) with no `ATC+LBT` typed.
-  Read the idle channel level first (`ATC+LBT?` reports `<limit>:<RSSI>`) while
-  a peer transmits on a quiet site, then set the limit well above it but clear
-  of the level real traffic arrives at (`ATC+LBT=-100`, persisted across a
-  reboot -- read it back with `ATC+LBT?`), hold the channel busy at above-limit
-  power, and confirm `ATC+SEND` returns `AT_BUSY_ERROR`, the punch gets no ACK,
-  and the queued mesh traffic resumes once the interferer stops. With `ATC+LBT=0`
-  the check is off (the send goes out regardless).
+  On a quiet site `ATC+LBT?` with no `ATC+LBT` typed must report an adaptive
+  threshold about 8 dB above the reported noise floor (`<threshold>:<RSSI>:<noise>`,
+  e.g. `-92:-101:-100:3`), and it must differ between a quiet and a noisy room --
+  the same firmware, no configuration. Set `ATC+LBT=0:10` and confirm the reported
+  threshold moves to about `noise + 10` and the last field reads `10`, also
+  after a reboot. Then pin it (`ATC+LBT=-100`, persisted
+  across a reboot -- read it back with `ATC+LBT?`), hold the channel busy at
+  above-threshold power, and confirm `ATC+SEND` returns `AT_BUSY_ERROR`, the punch
+  gets no ACK, and the queued mesh traffic resumes once the interferer stops.
+  Then send a fresh `ATC+P2P`/`ATC+P2PM` and confirm `ATC+LBT?` is adaptive
+  again (a typed `ATC+LBT=0` does the same).
 * **Regression**: with mesh disabled the P2P punch / double-punch ACK+hash path is
   unchanged (and no `srcaddr` byte is added).
 

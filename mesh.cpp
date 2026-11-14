@@ -1690,10 +1690,12 @@ static void mesh_pending_tick(uint32_t now)
         }
         if (p->retries >= MESH_LINK_RETRIES) {
             p->active = false;          /* give up; the app-layer ACK covers it */
+            lbt_note_retx();
             continue;
         }
         mesh_send_frame(p->frame, p->len);
         p->retries++;
+        lbt_note_retx();                /* a MAC retry is an ACK timeout */
         p->next_ms = now + mesh_link_ack_timeout_for(p->len);
     }
 }
