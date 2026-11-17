@@ -103,12 +103,23 @@ static uint8_t s_txq_count;
  *
  * The age bound is what keeps a rebooted sender working: its counters restart
  * at 0, and without expiry the receiver's ring would still hold the previous
- * boot's (type,src,seq) triples and discard the new frames as duplicates. */
-#define MESH_DEDUP_MS  30000
+ * boot's (type,src,seq) triples and discard the new frames as duplicates.
+ *
+ * Data and link-ack frames use a much shorter bound.  Their duplicates are all
+ * immediate -- a MAC retransmit a fraction of a second later, or a flood echo
+ * a few hops away -- never 30 s late.  A 5-bit seq wraps every 32 frames, so
+ * the 30 s window made a steady 1 frame/s stream (32 frames per 32 s) collide
+ * with its own previous wrap as soon as one retry pushed it past ~1.07
+ * frames/s: the receiver dropped a new frame as a duplicate of the one sent 32
+ * frames earlier, and the host's retries kept the rate over the line.  5 s
+ * leaves room for ~6 frames/s on one key. */
+#define MESH_DEDUP_MS       30000
+#define MESH_DEDUP_DATA_MS  5000
 
 typedef struct {
     uint8_t  type;
     uint8_t  src;
+    uint8_t  dst;
     uint8_t  seq;
     uint32_t at;
     bool     valid;
@@ -410,20 +421,31 @@ static void mesh_state_clear(void)
     mesh_update_state();
 }
 
-/* Returns true when (type,src,seq) was already seen (i.e. drop as duplicate). */
-static bool mesh_dedup_check(uint8_t type, uint8_t src, uint8_t seq)
+/* Returns true when (type,src,dst,seq) was already seen (drop as duplicate).
+ * `dst` separates the streams one node multiplexes onto one seq counter -- the
+ * root's downlinks to different children, a relay's link acks to different
+ * parents -- which otherwise suppress each other. */
+static bool mesh_dedup_check(uint8_t type, uint8_t src, uint8_t dst, uint8_t seq)
 {
     uint32_t now = millis();
+    uint32_t window = MESH_DEDUP_MS;
+
+    if (type == MESH_TYPE_DATA_UPLINK || type == MESH_TYPE_DATA_DOWNLINK ||
+        type == MESH_TYPE_LINK_ACK) {
+        window = MESH_DEDUP_DATA_MS;
+    }
 
     for (uint8_t i = 0; i < MESH_DEDUP_SIZE; i++) {
         if (s_dedup[i].valid && s_dedup[i].type == type &&
-            s_dedup[i].src == src && s_dedup[i].seq == seq &&
-            (uint32_t)(now - s_dedup[i].at) < MESH_DEDUP_MS) {
+            s_dedup[i].src == src && s_dedup[i].dst == dst &&
+            s_dedup[i].seq == seq &&
+            (uint32_t)(now - s_dedup[i].at) < window) {
             return true;
         }
     }
     s_dedup[s_dedup_idx].type  = type;
     s_dedup[s_dedup_idx].src   = src;
+    s_dedup[s_dedup_idx].dst   = dst;
     s_dedup[s_dedup_idx].seq   = seq;
     s_dedup[s_dedup_idx].at    = now;
     s_dedup[s_dedup_idx].valid = true;
@@ -1161,7 +1183,8 @@ static uint8_t mesh_build_frame(uint8_t *out, uint8_t type,
 /* Broadcast a control frame (dst = NONE) with an auto-incremented seq.
  * `hops` is the beacon hop-count, or the TTL for flooded control frames. */
 static uint8_t mesh_node_device_id_hash8(const uint8_t device_id[MESH_NODE_DEVICE_ID_LEN]);
-static void mesh_mark_seen(uint8_t type, uint8_t src, uint8_t seq, const uint8_t *payload);
+static void mesh_mark_seen(uint8_t type, uint8_t src, uint8_t dst, uint8_t seq,
+                           const uint8_t *payload);
 
 /* Flood a control frame with an explicit dst (ADDR_ASSIGN carries the assigned
  * address in the header dst; everything else uses MESH_ADDR_NONE). */
@@ -1175,7 +1198,7 @@ static bool mesh_send_flood(uint8_t type, uint8_t dst, uint8_t hops,
     s_bcast_seq = (uint8_t)((s_bcast_seq + 1) & 0x1F);
     len = mesh_build_frame(frame, type, mesh_get_address(), dst, hops, seq,
                            payload, plen);
-    mesh_mark_seen(type, mesh_get_address(), seq, payload);
+    mesh_mark_seen(type, mesh_get_address(), dst, seq, payload);
     return mesh_send_frame(frame, len);
 }
 
@@ -1207,7 +1230,7 @@ static void mesh_relay_flood(const mesh_header_t *h, const uint8_t *payload, uin
     if (!mesh_relay_frame(h, payload, plen, frame, &flen)) {
         return;                         /* TTL exhausted */
     }
-    mesh_mark_seen(h->type, h->src, h->seq, payload);
+    mesh_mark_seen(h->type, h->src, h->dst, h->seq, payload);
     mesh_send_frame(frame, flen);
 }
 
@@ -1240,14 +1263,15 @@ static uint8_t mesh_node_device_id_hash8(const uint8_t device_id[MESH_NODE_DEVIC
 
 /* Record a frame we are about to transmit as "seen", so copies relayed back
  * to us (floods echo) are ignored and cannot loop. */
-static void mesh_mark_seen(uint8_t type, uint8_t src, uint8_t seq, const uint8_t *payload)
+static void mesh_mark_seen(uint8_t type, uint8_t src, uint8_t dst, uint8_t seq,
+                           const uint8_t *payload)
 {
     if (type == MESH_TYPE_JOIN_REQ) {
         if (payload != NULL) {
-            (void)mesh_dedup_check(type, mesh_node_device_id_hash8(payload), seq);
+            (void)mesh_dedup_check(type, mesh_node_device_id_hash8(payload), dst, seq);
         }
     } else if (type != MESH_TYPE_BEACON) {
-        (void)mesh_dedup_check(type, src, seq);
+        (void)mesh_dedup_check(type, src, dst, seq);
     }
 }
 
@@ -1906,7 +1930,7 @@ bool mesh_send_downlink(uint8_t dst, const uint8_t *payload, uint8_t len)
     s_data_seq = (uint8_t)((s_data_seq + 1) & 0x1F);
     flen = mesh_build_frame(frame, MESH_TYPE_DATA_DOWNLINK, mesh_get_address(),
                             dst, MESH_DEFAULT_TTL, seq, payload, len);
-    mesh_mark_seen(MESH_TYPE_DATA_DOWNLINK, mesh_get_address(), seq, payload);
+    mesh_mark_seen(MESH_TYPE_DATA_DOWNLINK, mesh_get_address(), dst, seq, payload);
 
     /* Host-originated: one immediate attempt; a busy channel goes back to the
      * host as a busy status (it owns the backoff / resend). */
@@ -1967,7 +1991,7 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
     }
     if (mesh_child_for(h->dst) != MESH_ADDR_NONE &&
         mesh_relay_frame(h, payload, plen, frame, &flen)) {
-        mesh_mark_seen(h->type, h->src, h->seq, payload);
+        mesh_mark_seen(h->type, h->src, h->dst, h->seq, payload);
         if (mesh_send_frame(frame, flen)) {
             /* Wait for the next hop to carry it on (implicit ACK) -- or, when
              * the next hop *is* the target, for the target's LINK_ACK. */
@@ -2677,11 +2701,11 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
      * so it is keyed on a hash of its node device id instead; beacons are link-local
      * and never deduped. */
     if (h.type == MESH_TYPE_JOIN_REQ) {
-        if (plen < MESH_NODE_DEVICE_ID_LEN || mesh_dedup_check(h.type, mesh_node_device_id_hash8(payload), h.seq)) {
+        if (plen < MESH_NODE_DEVICE_ID_LEN || mesh_dedup_check(h.type, mesh_node_device_id_hash8(payload), h.dst, h.seq)) {
             return;                     /* too short or duplicate */
         }
     } else if (h.type != MESH_TYPE_BEACON) {
-        if (mesh_dedup_check(h.type, h.src, h.seq)) {
+        if (mesh_dedup_check(h.type, h.src, h.dst, h.seq)) {
             return;                     /* duplicate */
         }
     }
