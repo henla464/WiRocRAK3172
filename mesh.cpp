@@ -605,7 +605,11 @@ static void mesh_timer_cb(void *)
         }
 
         mesh_emit_beacon();
-        s_beacon_next_ms = now + interval;
+        /* Jitter the next beacon so nodes that started (or reset) together do
+         * not key up in lockstep -- their only other decorrelation is the
+         * housekeeping tick phase. */
+        s_beacon_next_ms = now + interval +
+                           mesh_rand() % (interval * MESH_BEACON_JITTER_PCT / 100 + 1);
 
         if (!recovering && s_beacon_interval_ms < MESH_BEACON_MAX_MS) {
             s_beacon_interval_ms *= 2;
