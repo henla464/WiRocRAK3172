@@ -208,6 +208,8 @@ static bool     s_epoch_valid;      /* node: s_root_epoch is meaningful      */
 static bool     s_claim_due;        /* node: an ADDR_CLAIM is pending (event)  */
 static uint32_t s_alive_next_ms;    /* node: next periodic liveness aggregate  */
 static uint32_t s_reclaim_next_ms;  /* node: next claim while we have no route */
+static uint32_t s_claim_repeat_ms;  /* node: deferred duplicate of an event claim
+                                     * (0 = none); claims are unacked end to end */
 static bool     s_had_parent;       /* node: had a parent on the previous tick*/
 static uint32_t s_boot_ms;          /* root: uptime reference for RECOVER   */
 static uint32_t s_heard_ms[MESH_ADDR_MAX + 1]; /* root: last frame per addr  */
@@ -379,6 +381,7 @@ static void mesh_state_clear(void)
     s_claim_due      = false;
     s_alive_next_ms  = 0;
     s_reclaim_next_ms = 0;
+    s_claim_repeat_ms = 0;
     s_had_parent     = false;
     s_boot_ms        = millis();
     memset(s_heard_ms, 0, sizeof(s_heard_ms));
@@ -729,6 +732,11 @@ static void mesh_timer_cb(void *)
                 mesh_send_claim();
                 s_claim_due       = false;
                 s_reclaim_next_ms = now + next_claim;
+                /* Nothing acks a claim end to end, so repeat the event-driven
+                 * one once (the periodic backstop covers the rest).  A flood
+                 * needs no repeat: it already repeats every next_claim. */
+                s_claim_repeat_ms = (s_route.parent_addr != MESH_ADDR_NONE)
+                                    ? now + MESH_CLAIM_REPEAT_MS : 0;
             } else if ((int32_t)(now - s_reclaim_next_ms) >= 0) {
                 /* No route: we lost our parent, or booted on the address in
                  * flash.  Every other transmit path is gated on a parent and
@@ -740,6 +748,11 @@ static void mesh_timer_cb(void *)
                  * parent.  That is why the interval shortens without a route. */
                 mesh_send_claim();
                 s_reclaim_next_ms = now + next_claim;
+            }
+            /* Deferred duplicate of an event-driven claim (see above). */
+            if (s_claim_repeat_ms != 0 && (int32_t)(now - s_claim_repeat_ms) >= 0) {
+                s_claim_repeat_ms = 0;
+                mesh_send_claim();
             }
             /* Periodic liveness: a subtree aggregate a deep idle node would
              * otherwise never get to the root (its beacon is link-local).
@@ -2074,7 +2087,8 @@ static void mesh_root_apply_claim(const mesh_header_t *h, const uint8_t *payload
  * we have no route yet (just booted, or just lost our parent) we fall back to a
  * flood so a route-less node is still discoverable.  Best-effort either way.
  *
- * Claims are event-driven (boot, epoch change, re-attach); the recurring
+ * Claims are event-driven (boot, epoch change, re-attach) and repeated once
+ * MESH_CLAIM_REPEAT_MS later (nothing acks a claim end to end); the recurring
  * rootward traffic is the far cheaper single-hop ADDR_ALIVE aggregate
  * (mesh_send_alive). */
 static void mesh_send_claim(void)

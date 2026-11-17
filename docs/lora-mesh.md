@@ -524,7 +524,11 @@ has no neighbour at all it keeps listening until beacons return.
   on switching to a better parent).
   Claims are **event-driven, with a slow backstop**. The claim is a **rootward
   unicast**: it travels hop-by-hop toward the parent (like an uplink), so the
-  network-wide cost is `O(hops)` per claim rather than the `O(N)` of a flood. A
+  network-wide cost is `O(hops)` per claim rather than the `O(N)` of a flood.
+  Nothing acks a claim end to end -- the root has no next hop to forward to, so
+  there is no implicit ACK either, and it sends no `LINK_ACK` for a claim -- so
+  each event-driven claim is **repeated once** after `MESH_CLAIM_REPEAT_MS`
+  (10 s), which covers a drop at any hop without waiting for the backstop. A
   claim re-sent every `MESH_ALIVE_INTERVAL_MS` while the node has a parent covers
   the one that cannot be recovered any other way: a claim sent while the root was
   still booting is lost, and nothing else tells the root that address is taken --
@@ -745,6 +749,7 @@ All intervals live in `mesh.h` and can be adjusted without touching logic:
 | `MESH_JOIN_INTERVAL_MS` / `MESH_JOIN_INTERVAL_MAX_MS` | 3000 / 15000 | join backoff |
 | `MESH_TABLE_INTERVAL_MS` | 300000 | ADDR_TABLE flood backstop period (a table change also triggers an immediate flood) |
 | `MESH_TABLE_DEBOUNCE_MS` | 500 | window that coalesces table changes into one ADDR_TABLE flood |
+| `MESH_CLAIM_REPEAT_MS` | 10000 | an event-driven ADDR_CLAIM is repeated once after this delay (claims are unacked end to end) |
 | `MESH_ALIVE_INTERVAL_MS` | 300000 | **relay** liveness **aggregate** period (must stay well under `MESH_EVICT_MS`) |
 | `MESH_ALIVE_CHILD_HOLD_MS` | 610000 | a relay node drops a child from its aggregate after this long without hearing it |
 | `MESH_EVICT_MS` | 610000 | root-node eviction grace |

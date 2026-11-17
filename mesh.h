@@ -98,6 +98,11 @@ bool    mesh_config_save(void);
 #define MESH_TABLE_INTERVAL_MS  300000  /* root ADDR_TABLE backstop period   */
 #define MESH_TABLE_DEBOUNCE_MS  500     /* coalesce table changes into a flood */
 #define MESH_TABLE_MISS_LIMIT   3       /* misses before a node re-joins      */
+/* A claim is unacked end to end (the root has no next hop to forward to and
+ * sends no LINK_ACK for it), so an event-driven claim is repeated once after
+ * this delay -- a drop at any hop is then covered without waiting for the
+ * MESH_ALIVE_INTERVAL_MS backstop. */
+#define MESH_CLAIM_REPEAT_MS    10000
 
 /* --- M3 tree / uplink --------------------------------------------------- */
 #define MESH_BEACON_MAX_MS      90000   /* adaptive beacon back-off ceiling    */
