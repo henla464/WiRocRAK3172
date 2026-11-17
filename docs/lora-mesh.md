@@ -583,7 +583,12 @@ its whole covered subtree at once** -- one coherent event per branch -- with a
 per-address timer as the backstop for a leaf sitting directly under the root node.
 A relay's bitmap is trusted only while it keeps being refreshed (`s_child_bm_ms`), so a
 child that has stopped aggregating -- because it *became* a leaf -- is reported as just
-itself instead of a stale subtree.
+itself instead of a stale subtree. A child that **re-parents** is dropped from the old
+parent immediately: its beacon carries its hop-count to the root node, and a node below
+us is exactly one hop deeper, so any other depth proves it left (its next claim or
+aggregate re-adds it if that was wrong). Without that check the old parent would keep
+relaying a duplicate hop for every downlink addressed to the node, and the topology map
+would keep the stale edge for `MESH_TOPO_HOLD_MS`.
 
 **Relay-only liveness, and its watchdog.** Because a leaf sends no liveness of its own,
 its place in the tree rests on its event-driven `ADDR_CLAIM` plus the parent's

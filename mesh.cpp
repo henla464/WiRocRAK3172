@@ -1662,10 +1662,22 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
     /* A beacon from a child we already know proves it is still alive and still
      * routing through us, so refresh its liveness/relay timestamps.  Set
      * s_relay_last_ms directly (not via mesh_note_relay) so a periodic child
-     * beacon never resets our own beacon back-off. */
+     * beacon never resets our own beacon back-off.  A node below us is exactly
+     * one hop deeper, so any other depth proves it re-parented: drop the stale
+     * child edge and map row, or we keep relaying a duplicate hop for every
+     * downlink addressed to it.  (Its claim/aggregate re-adds it if we are
+     * wrong.) */
     if (h->src >= MESH_FIRST_NONROOT_ADDR && s_child_heard_ms[h->src] != 0) {
-        s_child_heard_ms[h->src] = now;
-        s_relay_last_ms          = now;
+        if (h->hops == (uint8_t)(mesh_get_hops() + 1)) {
+            s_child_heard_ms[h->src] = now;
+            s_relay_last_ms          = now;
+        } else {
+            s_child_heard_ms[h->src] = 0;
+            s_child_bm[h->src]       = 0;
+            s_child_bm_ms[h->src]    = 0;
+            s_topo_parent[h->src]    = MESH_ADDR_NONE;
+            s_topo_age_ms[h->src]    = 0;
+        }
     }
 
     mesh_check_parent_staleness(now);
