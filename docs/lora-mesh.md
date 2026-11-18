@@ -109,8 +109,10 @@ with fields:
 * `<neighbour-count>` -- live neighbour count.
 * `<epoch>` -- root node's **boot number** (a counter the root node increments on
   every boot; only its low 3 bits are advertised, see *Recovery*) as last seen by this node.
-* `<overhead%>` -- measured control-plane airtime as a percentage of the data-frame
-  airtime transmitted.
+* `<overhead%>` -- control-plane share of the airtime this node has transmitted,
+  `0`-`100` (beacons, liveness, table floods, claims and link ACKs vs. data
+  frames). `100` means it has sent no data frames at all, which is the normal
+  reading on an idle node.
 * `<ackms>` -- derived per-hop ACK timeout for the current datarate.
 * `<standby>` -- `1` when this node is a passive standby root (see *Standby root* below).
 
@@ -318,19 +320,38 @@ this node past the limit, where its uplinks could no longer reach the root.
 **SNR is preferred to RSSI** (RSSI saturates and is dominated by the noise floor;
 SNR reflects the demodulation margin). Per-neighbour SNR is smoothed with an
 **EWMA** -- an *exponentially weighted moving average*, `new = 0.75*old + 0.25*sample`
-(here the integer form `(old*3 + sample)/4`). Each fresh beacon counts a quarter and
-older ones fade out, so it damps single-reading noise over a ~4-beacon window while
-still following a genuine change within a few beacons.
+(here the integer form `(old*3 + sample)/4`). Each fresh sample counts a quarter and
+older ones fade out, so it damps single-reading noise over a ~4-sample window while
+still following a genuine change within a few samples. A sample is **any decoded
+frame from that peer, not only its beacons**: beacons back off to 90 s (270 s for a
+leaf), which is far too slow for the metric to follow a link that is moved while
+traffic flows, and a data frame measures the same link. Only an already-tracked
+neighbour is refreshed -- a data frame never creates a parent candidate -- and a
+child's traffic measures the reverse direction, which the coarse cost bands absorb.
+One exception keeps the window from becoming a lag: if a sample arrives more than 4x
+later than the peer's own beacon pace (it moved, or was off the air), the history
+describes a different link and the sample **reseeds** the average instead of
+blending into it.
 The link cost is a **margin over the current spreading factor's LoRa demodulation
 floor** (which depends on SF, not bandwidth), so the metric stays meaningful when
 the datarate is retuned:
 
 | SF | demod floor | cost 1 (good) | cost 2 (fair) | cost 3 (poor) | cost 6 (avoid) |
 |----|-------------|---------------|---------------|---------------|----------------|
-| 5  | -2.5 dB | margin >= 12.5 dB | >= 7.5 dB | >= 2.5 dB | below |
+| 5  | -2.5 dB | margin >= 12.5 dB, or SNR >= +7 dB * | >= 7.5 dB | >= 2.5 dB | below |
 | 6  | -5.0 dB | margin >= 12.5 dB | >= 7.5 dB | >= 2.5 dB | below |
 | 7  | -7.5 dB | margin >= 12.5 dB | >= 7.5 dB | >= 2.5 dB | below |
 | 8  | -10.0 dB | margin >= 12.5 dB | >= 7.5 dB | >= 2.5 dB | below |
+
+\* The SX1262's SNR report saturates near +8 dB, so at SF5 the 12.5 dB margin is
+unmeasurable and the meter's ceiling itself has to count as the top band.
+
+Since SNR cannot rank two links once both sit at the meter's ceiling, the
+per-neighbour **RSSI** is smoothed the same way and used as the **final
+tie-break**: at equal cost, hop count and SNR the stronger RSSI wins. That only
+decides an initial pick (join, parent loss) -- hysteresis already keeps an exact
+tie from moving an established parent -- and RSSI never enters the cost itself:
+above the saturation point it ranks distance, not reliability.
 
 Because the metric is a summed cost, a **2-hop all-good path (cost 2) beats a weak
 direct link (cost 6)**: the node deliberately chooses the extra reliable hop.
@@ -856,10 +877,10 @@ the root node hop-by-hop (flooding only when a node is route-less) instead of th
 `O(N)` of a flood, and the **aggregated `ADDR_ALIVE`** collapses per-node liveness into
 one single-hop subtree bitmap per **relay** node (a leaf sends nothing), so the liveness
 plane is `O(F)` transmissions per round independent of tree depth. The host can
-**measure** the resulting ratio live via `ATC+MESHSTATE?` (`overhead%`). The header and
-the per-hop ACKs are proportional terms (one per data frame that crosses a relay -- up to
-two per exchange, one per leg), so they set a floor on
-this ratio.
+**measure** the resulting ratio live via `ATC+MESHSTATE?` (`overhead%`, reported as
+the control share of the airtime this node transmitted, `0`-`100`). The per-hop
+ACKs are a proportional control term (up to two per exchange, one per leg), so
+they keep that share above zero however much data flows.
 
 ### Control-plane occupancy
 

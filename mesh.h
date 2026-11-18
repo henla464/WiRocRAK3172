@@ -135,9 +135,8 @@ uint8_t mesh_get_hops(void);            /* hop-count to the root            */
 uint8_t mesh_get_path_cost(void);       /* cost to the root                 */
 uint8_t mesh_get_neighbor_count(void);  /* live neighbours                    */
 
-/* Running control-plane overhead since enable, in percent of the data-frame
- * airtime transmitted (100 == as much control airtime as data airtime).
- * Diagnostic for the narrowband (31.25 kHz) 10% budget. */
+/* Running control-plane share of the transmitted airtime since enable, in
+ * percent (0..100).  Diagnostic for the narrowband (31.25 kHz) 10% budget. */
 uint16_t mesh_get_overhead_pct(void);
 
 /* Transmit/receive counters since enable (diagnostics, reported by

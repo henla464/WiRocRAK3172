@@ -24,7 +24,10 @@ uint8_t mesh_route_link_cost(int16_t snr_x10, uint8_t sf)
 {
     int32_t margin = (int32_t)snr_x10 - (int32_t)mesh_route_snr_floor_x10(sf);
 
-    if (margin >= 125) return 1;        /* >= 12.5 dB margin : good  */
+    /* The SX126x SNR report saturates near +8 dB.  At SF5 (floor -2.5 dB) the
+     * 12.5 dB margin of the top band is therefore unmeasurable, so the meter's
+     * ceiling itself has to count as the top band. */
+    if (margin >= 125 || snr_x10 >= 70) return 1;
     if (margin >= 75)  return 2;        /* >=  7.5 dB margin : fair  */
     if (margin >= 25)  return 3;        /* >=  2.5 dB margin : poor  */
     return 6;                           /* below floor       : avoid */
@@ -67,7 +70,11 @@ void mesh_route_select(const mesh_route_neighbor_t *n, uint8_t count,
         if (best == NULL ||
             total < best_total ||
             (total == best_total && c->hops < best->hops) ||
-            (total == best_total && c->hops == best->hops && c->snr_x10 > best->snr_x10)) {
+            (total == best_total && c->hops == best->hops &&
+             (c->snr_x10 > best->snr_x10 ||
+              /* At the SNR meter's ceiling the top links all report the same
+               * value; there RSSI is the only thing left to rank them by. */
+              (c->snr_x10 == best->snr_x10 && c->rssi > best->rssi)))) {
             best = c;
             best_total = total;
         }

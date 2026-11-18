@@ -28,6 +28,7 @@ static void put(mesh_route_neighbor_t n[NEIGH_MAX], int i, uint8_t addr,
 {
     n[i].addr      = addr;
     n[i].snr_x10   = snr_x10;
+    n[i].rssi      = -100;
     n[i].cost      = cost;
     n[i].hops      = hops;
     n[i].link_cost = mesh_route_link_cost(snr_x10, 7);
@@ -50,9 +51,13 @@ int main(void)
     CHECK(mesh_route_link_cost(-200, 7)== 6);
 
     /* --- thresholds shift with the SF's demodulation floor -------------- */
-    /* SF5 floor -2.5 dB:  cost1 >= +10.0, cost2 >= +5.0, cost3 >= +0.0 */
+    /* SF5 floor -2.5 dB:  cost1 >= +10.0, cost2 >= +5.0, cost3 >= +0.0 --
+     * except that the radio's SNR report saturates near +8 dB, so the meter's
+     * ceiling counts as the top band (a 12.5 dB margin is unmeasurable). */
     CHECK(mesh_route_link_cost(100, 5) == 1);
-    CHECK(mesh_route_link_cost(99, 5)  == 2);
+    CHECK(mesh_route_link_cost(99, 5)  == 1);
+    CHECK(mesh_route_link_cost(70, 5)  == 1);
+    CHECK(mesh_route_link_cost(69, 5)  == 2);
     CHECK(mesh_route_link_cost(50, 5)  == 2);
     CHECK(mesh_route_link_cost(49, 5)  == 3);
     CHECK(mesh_route_link_cost(0, 5)   == 3);
@@ -135,6 +140,26 @@ int main(void)
     cur.parent_addr = MESH_ADDR_NONE;
     mesh_route_select(n, NEIGH_MAX, &cur, 9, MESH_PARENT_HYSTERESIS, &out);
     CHECK(out.parent_addr == 4);
+
+    /* --- tie-break: SNR saturated (equal) -> higher RSSI wins ----------- */
+    std::memset(n, 0, sizeof(n));
+    put(n, 0, 3, 70, 1, 1);
+    n[0].rssi = -80;
+    put(n, 1, 4, 70, 1, 1);
+    n[1].rssi = -40;
+    cur.parent_addr = MESH_ADDR_NONE;
+    mesh_route_select(n, NEIGH_MAX, &cur, 9, MESH_PARENT_HYSTERESIS, &out);
+    CHECK(out.parent_addr == 4);
+
+    /* --- SNR stays primary: worse RSSI does not overrule a better SNR -- */
+    std::memset(n, 0, sizeof(n));
+    put(n, 0, 3, 80, 1, 1);
+    n[0].rssi = -90;
+    put(n, 1, 4, 70, 1, 1);
+    n[1].rssi = -40;
+    cur.parent_addr = MESH_ADDR_NONE;
+    mesh_route_select(n, NEIGH_MAX, &cur, 9, MESH_PARENT_HYSTERESIS, &out);
+    CHECK(out.parent_addr == 3);
 
     /* --- a neighbour already at the hop limit is not a usable parent ----- */
     std::memset(n, 0, sizeof(n));

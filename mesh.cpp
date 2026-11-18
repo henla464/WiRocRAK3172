@@ -857,12 +857,12 @@ void mesh_get_counters(mesh_counters_t *out)
 
 uint16_t mesh_get_overhead_pct(void)
 {
-    uint64_t pct;
-    if (s_air_data == 0) {
+    uint64_t total = (uint64_t)s_air_ctrl + s_air_data;
+
+    if (total == 0) {
         return 0;
     }
-    pct = (uint64_t)s_air_ctrl * 100u / s_air_data;
-    return (pct > 65535u) ? 65535u : (uint16_t)pct;
+    return (uint16_t)((uint64_t)s_air_ctrl * 100u / total);
 }
 
 /* Reset the adaptive beacon to the fast interval (emit on the next tick). */
@@ -1411,6 +1411,34 @@ static uint8_t mesh_link_cost(int16_t snr_x10)
     return mesh_route_link_cost(snr_x10, s_sf);
 }
 
+/* Blend one SNR/RSSI sample (dB / dBm) into a neighbour's link averages.  Fed
+ * by the peer's beacons and by any other frame it sends: a beacon-only average
+ * samples too slowly to follow a link that changed while traffic flows (a
+ * leaf beacons every ~270 s at the backoff ceiling).  Only the beacon path
+ * updates `last_ms` / `ivl_ms` -- that is the peer's beacon pace, which the
+ * staleness rule and this reseed test are defined against. */
+static void mesh_note_link_quality(mesh_route_neighbor_t *n, int8_t snr,
+                                   int16_t rssi, uint32_t now)
+{
+    int16_t sample = (int16_t)snr * 10;
+
+    if (n->last_ms == 0) {
+        n->snr_x10 = sample;                    /* first sample */
+        n->rssi    = rssi;
+    } else if (n->ivl_ms != 0 &&
+               (uint32_t)(now - n->last_ms) > 4u * n->ivl_ms) {
+        /* Far later than this peer's own pace (it moved or was off the air):
+         * a different link than the history describes.  Reseed, so a good
+         * link re-judges in one frame instead of four. */
+        n->snr_x10 = sample;
+        n->rssi    = rssi;
+    } else {
+        n->snr_x10 = (int16_t)((n->snr_x10 * 3 + sample) / 4);  /* EWMA */
+        n->rssi    = (int16_t)((n->rssi * 3 + rssi) / 4);
+    }
+    n->link_cost = mesh_link_cost(n->snr_x10);
+}
+
 static mesh_route_neighbor_t *mesh_neighbor_find(uint8_t addr)
 {
     for (uint8_t i = 0; i < MESH_NEIGHBOR_MAX; i++) {
@@ -1637,7 +1665,6 @@ static void mesh_note_epoch(uint16_t epoch)
 static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8_t plen)
 {
     mesh_route_neighbor_t *n;
-    int16_t sample;
     uint32_t now = millis();
     uint8_t  old_parent = s_route.parent_addr;
     uint8_t  epoch;
@@ -1652,14 +1679,10 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
     }
     if (n->addr == MESH_ADDR_NONE) {
         n->addr = h->src;
-        n->snr_x10 = s_rx_snr;          /* first sample */
-    } else {
-        sample = (int16_t)s_rx_snr * 10;
-        n->snr_x10 = (int16_t)((n->snr_x10 * 3 + sample) / 4);  /* EWMA */
     }
+    mesh_note_link_quality(n, s_rx_snr, s_rx_rssi, now);
     n->cost      = (uint8_t)(payload[0] & 0x1F);
     n->hops      = h->hops;
-    n->link_cost = mesh_link_cost(n->snr_x10);
     if (n->last_ms != 0) {
         uint32_t delta = now - n->last_ms;
 
@@ -2678,6 +2701,19 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
     s_last_type = h.type;
     if (h.type == MESH_TYPE_ADDR_ASSIGN) {
         s_rx_assign++;                  /* decoded off the air; dedup below */
+    }
+
+    /* Every decoded frame from a tracked neighbour is a link sample, so the
+     * cost follows the link while it carries traffic; a beacon-only average
+     * would take minutes to react.  Beacons feed it in their handler (which
+     * also owns the entries and their pacing), and only existing entries are
+     * refreshed here -- a data frame must not create a parent candidate. */
+    if (h.type != MESH_TYPE_BEACON) {
+        mesh_route_neighbor_t *n = mesh_neighbor_find(h.src);
+
+        if (n != NULL) {
+            mesh_note_link_quality(n, snr, rssi, millis());
+        }
     }
 
     /* Root liveness bookkeeping: refresh the last-heard time for a node as

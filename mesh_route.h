@@ -24,6 +24,7 @@
 typedef struct {
     uint8_t  addr;          /* neighbour address (0 == free slot)             */
     int16_t  snr_x10;       /* smoothed SNR in 0.1 dB units                   */
+    int16_t  rssi;          /* smoothed RSSI, dBm; tie-break only (see .cpp)  */
     uint8_t  cost;          /* neighbour's advertised path cost               */
     uint8_t  hops;          /* neighbour's advertised hop-count to the root */
     uint8_t  link_cost;     /* cost of our link to this neighbour             */

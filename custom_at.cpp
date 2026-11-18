@@ -386,8 +386,8 @@ int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param)
  *          - <neighbour-count>  live neighbour count
  *          - <epoch>            root's boot number (incremented on every boot; only
  *                               its low 3 bits ride the beacon) as last seen by this node
- *          - <overhead%>        measured control-plane airtime as a percentage of the
- *                               data-frame airtime transmitted
+ *          - <overhead%>        control-plane share of the airtime transmitted,
+ *                               0..100 (100 == no data frames at all)
  *          - <ackms>            derived per-hop ACK timeout (datarate dependent)
  *          - <standby>          1 when this node is a passive standby root (M7)
  */
