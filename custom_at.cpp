@@ -1474,10 +1474,15 @@ int send_handler(SERIAL_PORT port, char *cmd, stParam *param)
         {
             digitalWrite(LORA_AUX, HIGH);
             digitalWrite(LED_RED_TRANSMIT, HIGH);
-            /* Distinguish "the mesh cannot carry this at all" (no address /
-             * no parent) from "the radio refused the frame" (channel busy):
-             * only the latter is worth a host resend. */
-            return mesh_is_attached() ? AT_BUSY_ERROR : AT_NO_NETWORK_JOINED;
+            /* Distinguish three reasons a punch did not go out: the radio
+             * refused the frame (channel busy, worth a host resend), the
+             * node has no address at all (not joined), or it has an address
+             * but no parent right now (joined, mid-reattach). */
+            if (mesh_is_attached()) {
+                return AT_BUSY_ERROR;
+            }
+            return (mesh_get_state() == MESH_STATE_JOINED) ?
+                   AT_MESH_NOT_ATTACHED : AT_NO_NETWORK_JOINED;
         }
         return AT_OK;
     }
