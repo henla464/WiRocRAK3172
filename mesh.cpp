@@ -1588,34 +1588,78 @@ static void mesh_select_parent(void)
 static void mesh_check_parent_staleness(uint32_t now)
 {
     uint8_t i;
+    bool    parent_evicted = false;
 
     /* Drop neighbours that have gone quiet.  The bound follows the pace each
      * neighbour actually beacons at, never our own: our own interval restarts
      * at MESH_BEACON_FAST_MS every time we re-attach, while a root we attached
      * to may have backed off to MESH_BEACON_MAX_MS -- judging it by our fresh
-     * pace drops a perfectly healthy parent within seconds. */
+     * pace drops a perfectly healthy parent within seconds.
+     *
+     * The bound is sized to tolerate two missed beacons -- but predicted
+     * forward from the neighbour's last observed gap, not multiplied off it:
+     * while a neighbour is still backing off (each gap double the last), a
+     * bound built from the *last* gap already under-counts a single loss, so
+     * it could trip before the very next beacon was even due. Projecting the
+     * next two gaps (capped at the backoff ceiling, same as the sender's own
+     * cap) tracks what two actual misses look like at any point in that
+     * ramp, not just once it is fully backed off. */
     for (i = 0; i < MESH_NEIGHBOR_MAX; i++) {
         mesh_route_neighbor_t *n = &s_neigh[i];
-        uint32_t stale;
+        uint32_t next1, next2, stale;
 
         if (n->addr == MESH_ADDR_NONE) {
             continue;
         }
-        stale = 3u * (n->ivl_ms != 0 ? n->ivl_ms : MESH_BEACON_MAX_MS);
+        next1 = (n->ivl_ms != 0) ? n->ivl_ms * 2 : MESH_BEACON_MAX_MS;
+        if (next1 > MESH_BEACON_MAX_MS) {
+            next1 = MESH_BEACON_MAX_MS;
+        }
+        next2 = next1 * 2;
+        if (next2 > MESH_BEACON_MAX_MS) {
+            next2 = MESH_BEACON_MAX_MS;
+        }
+        /* Each gap is itself jittered up to MESH_BEACON_JITTER_PCT by the
+         * sender (mesh_emit_beacon's scheduling), so a beacon that is not
+         * lost at all can still legitimately land that much later than the
+         * bare prediction above.  Padding by exactly that percentage still
+         * sizes the budget to the precise worst case of just the one known
+         * source -- our own 200ms housekeeping tick, radio/SPI scheduling,
+         * etc. all eat into it too, unquantified.  50% leaves real headroom
+         * above the 25% jitter instead of sitting flush against it; revisit
+         * if field logs show it still trips on a live link. */
+        stale = (next1 + next2) * 150u / 100u;
         if ((uint32_t)(now - n->last_ms) > stale) {
+            if (n->addr == s_route.parent_addr) {
+                parent_evicted = true;
+            }
             memset(n, 0, sizeof(*n));
         }
     }
-    if (s_route.parent_addr != MESH_ADDR_NONE &&
-        mesh_neighbor_find(s_route.parent_addr) == NULL) {
-        memset(&s_route, 0, sizeof(s_route));   /* parent lost: re-attach */
-        s_route.parent_addr = MESH_ADDR_NONE;
-        s_had_parent = false;                   /* claim again when we re-attach */
-        s_reclaim_next_ms = 0;                  /* and claim right away */
-        mesh_select_parent();
-        if (s_route.parent_addr != MESH_ADDR_NONE) {
-            mesh_beacon_fast();
+
+    if (!parent_evicted) {
+        return;
+    }
+
+    /* Our parent just missed its second beacon in a row.  Try a same-tick
+     * hand-off to another known neighbour before giving up the route --
+     * mesh_select_parent() already excludes it (its slot is gone from
+     * s_neigh[] above) and picks the next best candidate, or clears the
+     * route itself if none is eligible. */
+    mesh_select_parent();
+    if (s_route.parent_addr != MESH_ADDR_NONE) {
+        /* Smooth hand-off: we were never without a route, so announce the
+         * new edge the same way a beacon-driven switch would, without the
+         * re-attach bookkeeping below. */
+        if (!mesh_is_root() && mesh_get_address() != MESH_ADDR_NONE) {
+            s_claim_due = true;
+            s_topo_due  = true;
         }
+        mesh_beacon_fast();
+    } else {
+        /* No replacement known: this is a real detach. */
+        s_had_parent      = false;  /* claim again when we re-attach */
+        s_reclaim_next_ms = 0;      /* and claim right away */
     }
 }
 
@@ -2756,6 +2800,17 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
             mesh_wire_ack_key(&h, payload, plen, mesh_get_address(), &ack_src, &ack_seq) &&
             ack_src == pend->src && ack_seq == pend->seq) {
             pend->active = false;
+            /* An uplink ack proves our parent itself just forwarded for us --
+             * stronger liveness evidence than a beacon, and one beacons alone
+             * can miss (they are unacknowledged, unlike this retried hop).
+             * Refresh its staleness clock so a run of lost beacons on an
+             * otherwise-working link does not drop a live parent. */
+            if (slot == MESH_PEND_UP && s_route.parent_addr != MESH_ADDR_NONE) {
+                mesh_route_neighbor_t *pn = mesh_neighbor_find(s_route.parent_addr);
+                if (pn != NULL) {
+                    pn->last_ms = millis();
+                }
+            }
         }
     }
 
