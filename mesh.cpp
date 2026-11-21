@@ -840,7 +840,8 @@ static uint32_t mesh_frame_airtime_ms(uint8_t len)
     uint32_t den = 4 * (sf - 2 * de);
     int32_t  pl = (num > 0 && den > 0) ? (num + (int32_t)den - 1) / (int32_t)den : 0;
     uint32_t n_payload = 8 + (uint32_t)pl * (cr + 4);
-    uint32_t n_total   = (s_ppl >= 5 ? s_ppl : 8) + 4;  /* preamble + ~4.25 hdr */
+    /* preamble + hdr: 6.25 symbols for SF5/SF6, 4.25 for the rest (SX126x 6.1.4) */
+    uint32_t n_total   = (s_ppl >= 5 ? s_ppl : 8) + (sf <= 6 ? 6u : 4u);
 
     return (uint32_t)(((uint64_t)(n_total + n_payload) * tsym_ns) / 1000000ull + 1u);
 }
