@@ -94,7 +94,10 @@ bool    mesh_config_save(void);
 
 /* --- M2 join / address assignment --------------------------------------- */
 #define MESH_JOIN_INTERVAL_MS   3000    /* initial JOIN_REQ period            */
-#define MESH_JOIN_INTERVAL_MAX_MS 15000 /* JOIN_REQ backoff ceiling           */
+/* First plateau of the JOIN_REQ ramp (and the floor a routeless ADDR_CLAIM
+ * backoff restarts from) -- both back off further, up to MESH_RECLAIM_MAX_MS,
+ * rather than repeating forever at this rate. */
+#define MESH_JOIN_INTERVAL_MAX_MS 15000
 #define MESH_TABLE_INTERVAL_MS  300000  /* root ADDR_TABLE backstop period   */
 #define MESH_TABLE_DEBOUNCE_MS  500     /* coalesce table changes into a flood */
 #define MESH_TABLE_MISS_LIMIT   3       /* misses before a node re-joins      */
@@ -103,6 +106,13 @@ bool    mesh_config_save(void);
  * this delay -- a drop at any hop is then covered without waiting for the
  * MESH_ALIVE_INTERVAL_MS backstop. */
 #define MESH_CLAIM_REPEAT_MS    10000
+/* Shared backoff ceiling for a node with nobody in range: both the JOIN_REQ
+ * ramp (no address yet) and the routeless ADDR_CLAIM backoff (has an
+ * address, no parent) climb past MESH_JOIN_INTERVAL_MAX_MS up to this cap
+ * instead of repeating forever at that flat rate -- which, for ADDR_CLAIM,
+ * would also keep re-triggering any in-range listener's beacon-acceleration
+ * probe reaction forever. */
+#define MESH_RECLAIM_MAX_MS     60000
 
 /* --- M3 tree / uplink --------------------------------------------------- */
 #define MESH_BEACON_MAX_MS      90000   /* adaptive beacon back-off ceiling    */

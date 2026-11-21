@@ -208,6 +208,9 @@ static bool     s_epoch_valid;      /* node: s_root_epoch is meaningful      */
 static bool     s_claim_due;        /* node: an ADDR_CLAIM is pending (event)  */
 static uint32_t s_alive_next_ms;    /* node: next periodic liveness aggregate  */
 static uint32_t s_reclaim_next_ms;  /* node: next claim while we have no route */
+static uint32_t s_reclaim_interval_ms; /* node: current routeless claim period,
+                                        * backs off MESH_JOIN_INTERVAL_MAX_MS ->
+                                        * MESH_RECLAIM_MAX_MS while unattached */
 static uint32_t s_claim_repeat_ms;  /* node: deferred duplicate of an event claim
                                      * (0 = none); claims are unacked end to end */
 static bool     s_had_parent;       /* node: had a parent on the previous tick*/
@@ -290,6 +293,7 @@ static bool mesh_send_broadcast(uint8_t type, uint8_t hops,
 
 /* Defined in the M5 section below; used by the timer. */
 static void mesh_send_claim(void);
+static void mesh_reclaim_backoff(void);
 static void mesh_send_alive(void);
 static void mesh_send_topology(void);
 static void mesh_monitor_tick(uint32_t now);
@@ -381,6 +385,7 @@ static void mesh_state_clear(void)
     s_claim_due      = false;
     s_alive_next_ms  = 0;
     s_reclaim_next_ms = 0;
+    s_reclaim_interval_ms = MESH_JOIN_INTERVAL_MAX_MS;
     s_claim_repeat_ms = 0;
     s_had_parent     = false;
     s_boot_ms        = millis();
@@ -707,10 +712,10 @@ static void mesh_timer_cb(void *)
             if ((int32_t)(now - s_join_next_ms) >= 0) {
                 mesh_send_broadcast(MESH_TYPE_JOIN_REQ, MESH_DEFAULT_TTL,
                                     s_cfg.device_id, MESH_NODE_DEVICE_ID_LEN);
-                if (s_join_interval_ms < MESH_JOIN_INTERVAL_MAX_MS) {
+                if (s_join_interval_ms < MESH_RECLAIM_MAX_MS) {
                     s_join_interval_ms += MESH_JOIN_INTERVAL_MS;
-                    if (s_join_interval_ms > MESH_JOIN_INTERVAL_MAX_MS) {
-                        s_join_interval_ms = MESH_JOIN_INTERVAL_MAX_MS;
+                    if (s_join_interval_ms > MESH_RECLAIM_MAX_MS) {
+                        s_join_interval_ms = MESH_RECLAIM_MAX_MS;
                     }
                 }
                 s_join_next_ms = now + s_join_interval_ms;
@@ -725,9 +730,9 @@ static void mesh_timer_cb(void *)
              * root we exist.  It would then hand our address to the next node
              * that joins.  Claims are hop-by-hop unicast, so the backstop is a
              * couple of frames per node every MESH_ALIVE_INTERVAL_MS. */
-            uint32_t next_claim = (s_route.parent_addr == MESH_ADDR_NONE)
-                                  ? MESH_JOIN_INTERVAL_MAX_MS
-                                  : MESH_ALIVE_INTERVAL_MS;
+            bool     routeless  = (s_route.parent_addr == MESH_ADDR_NONE);
+            uint32_t next_claim = routeless ? s_reclaim_interval_ms
+                                            : MESH_ALIVE_INTERVAL_MS;
             if (s_claim_due) {
                 mesh_send_claim();
                 s_claim_due       = false;
@@ -735,8 +740,10 @@ static void mesh_timer_cb(void *)
                 /* Nothing acks a claim end to end, so repeat the event-driven
                  * one once (the periodic backstop covers the rest).  A flood
                  * needs no repeat: it already repeats every next_claim. */
-                s_claim_repeat_ms = (s_route.parent_addr != MESH_ADDR_NONE)
-                                    ? now + MESH_CLAIM_REPEAT_MS : 0;
+                s_claim_repeat_ms = routeless ? 0 : now + MESH_CLAIM_REPEAT_MS;
+                if (routeless) {
+                    mesh_reclaim_backoff();
+                }
             } else if ((int32_t)(now - s_reclaim_next_ms) >= 0) {
                 /* No route: we lost our parent, or booted on the address in
                  * flash.  Every other transmit path is gated on a parent and
@@ -745,9 +752,16 @@ static void mesh_timer_cb(void *)
                  * just refused a frame (busy) stays in standby with receive
                  * disarmed until its next transmit.  Claiming re-binds us at the
                  * root and re-arms the receiver, so the next beacon gives us a
-                 * parent.  That is why the interval shortens without a route. */
+                 * parent.  That is why the interval starts shorter than
+                 * MESH_ALIVE_INTERVAL_MS without a route -- and why it still
+                 * backs off (MESH_JOIN_INTERVAL_MAX_MS -> MESH_RECLAIM_MAX_MS)
+                 * rather than flooding at that short rate forever when nobody
+                 * is in range to answer it. */
                 mesh_send_claim();
                 s_reclaim_next_ms = now + next_claim;
+                if (routeless) {
+                    mesh_reclaim_backoff();
+                }
             }
             /* Deferred duplicate of an event-driven claim (see above). */
             if (s_claim_repeat_ms != 0 && (int32_t)(now - s_claim_repeat_ms) >= 0) {
@@ -1658,8 +1672,9 @@ static void mesh_check_parent_staleness(uint32_t now)
         mesh_beacon_fast();
     } else {
         /* No replacement known: this is a real detach. */
-        s_had_parent      = false;  /* claim again when we re-attach */
-        s_reclaim_next_ms = 0;      /* and claim right away */
+        s_had_parent          = false;  /* claim again when we re-attach */
+        s_reclaim_next_ms     = 0;      /* and claim right away */
+        s_reclaim_interval_ms = MESH_JOIN_INTERVAL_MAX_MS; /* fresh backoff ramp */
     }
 }
 
@@ -2191,6 +2206,19 @@ static void mesh_send_claim(void)
     s_alive_next_ms = millis() + MESH_ALIVE_INTERVAL_MS;
 }
 
+/* Double the routeless reclaim period, capped at MESH_RECLAIM_MAX_MS.  Called
+ * once per routeless claim actually sent, so a node with nobody in range
+ * tapers off instead of flooding at the same flat rate forever. */
+static void mesh_reclaim_backoff(void)
+{
+    if (s_reclaim_interval_ms < MESH_RECLAIM_MAX_MS) {
+        s_reclaim_interval_ms *= 2;
+        if (s_reclaim_interval_ms > MESH_RECLAIM_MAX_MS) {
+            s_reclaim_interval_ms = MESH_RECLAIM_MAX_MS;
+        }
+    }
+}
+
 /* Node: topology report.  Rootward (to the root) it carries our current
  * parent and every neighbour we hear, with its link cost, so the root can
  * assemble the whole node/link graph.  The header `src` is our address, so the
@@ -2343,6 +2371,16 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
     if (h->dst == MESH_ADDR_NONE) {
         if (mesh_is_root()) {
             mesh_root_apply_claim(h, payload, plen);
+        }
+        /* Probe reaction: the sender is routeless and otherwise relies purely
+         * on overhearing a candidate's own beacon -- which, for a quiet leaf,
+         * may be backed off to its slowest pace.  Any routable listener in
+         * range can shorten that wait by fast-forwarding its own next
+         * beacon.  Debounced (skip once already at the fast floor) so a
+         * lone node with nobody in range, retrying forever, cannot keep a
+         * listener pinned there indefinitely. */
+        if (mesh_is_attached() && s_beacon_interval_ms > MESH_BEACON_FAST_MS) {
+            mesh_beacon_fast();
         }
         mesh_relay_flood(h, payload, plen);
         return;
