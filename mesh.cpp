@@ -828,7 +828,8 @@ static void mesh_refresh_radio_params(void)
 }
 
 /* LoRa frame airtime in ms (CR 4/(4+cr), CRC on), from the active radio params.
- * Tsym = 2^SF / BW; n = 8 + max(ceil((8L - 4SF + 28 + 16)/(4(SF - 2DE))),0)*(4+CR). */
+ * Tsym = 2^SF / BW; n = 8 + max(ceil((8L - 4SF + 28 + 16)/(4(SF - 2DE))),0)*(4+CR),
+ * where 28 = 8 + 20 header bits for SF7+ but 20 for SF5/SF6 (SX126x 6.1.4). */
 static uint32_t mesh_frame_airtime_ms(uint8_t len)
 {
     uint32_t bw = mesh_bw_hz(s_bw);
@@ -836,7 +837,8 @@ static uint32_t mesh_frame_airtime_ms(uint8_t len)
     uint32_t cr = (s_cr >= 1 && s_cr <= 4) ? s_cr : 1;
     uint64_t tsym_ns = ((uint64_t)1 << sf) * 1000000000ull / bw;
     uint8_t  de = (s_lde || tsym_ns > 16000000ull) ? 1u : 0u;
-    int32_t  num = 8 * (int32_t)len - 4 * (int32_t)sf + 28 + 16; /* CRC on */
+    /* SF7+: +8 term and 20 header bits; SF5/SF6 drop the +8 (SX126x 6.1.4) */
+    int32_t  num = 8 * (int32_t)len - 4 * (int32_t)sf + 20 + 16 + (sf <= 6 ? 0 : 8); /* CRC on */
     uint32_t den = 4 * (sf - 2 * de);
     int32_t  pl = (num > 0 && den > 0) ? (num + (int32_t)den - 1) / (int32_t)den : 0;
     uint32_t n_payload = 8 + (uint32_t)pl * (cr + 4);
