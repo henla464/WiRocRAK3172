@@ -899,21 +899,43 @@ static bool mesh_is_relay(void)
     return (uint32_t)(millis() - s_relay_last_ms) < MESH_RELAY_HOLD_MS;
 }
 
+/* A bit just confirmed under `owner` cannot still be valid under any other
+ * child's bitmap -- clear it everywhere else immediately, rather than
+ * waiting for that other child's own next (rebuilt-from-scratch) report to
+ * quietly drop it.  Keeps at most one child claiming any given address at
+ * a time. */
+static void mesh_child_bm_claim(uint8_t owner, uint16_t bits)
+{
+    for (uint8_t c = MESH_FIRST_NONROOT_ADDR; c <= MESH_ADDR_MAX; c++) {
+        if (c != owner) {
+            s_child_bm[c] = (uint16_t)(s_child_bm[c] & ~bits);
+        }
+    }
+}
+
 /* Record that a child just routed through us: refresh its liveness entry and
- * our relay status.  `child` is the child's address (the header `src` of the
- * rootward unicast or liveness aggregate it sent us).  On the leaf->relay
- * transition, reset the beacon to the normal rate so the new child can track us
- * promptly, and fire a liveness aggregate at once (we now have a subtree to
- * publish). */
-static void mesh_note_relay(uint8_t child)
+ * our relay status.  `child` is the header `src` of the rootward unicast or
+ * liveness aggregate it sent us -- trustworthy as "my direct child" only
+ * when `direct` is true.  A liveness aggregate is single-hop by design, so
+ * it is always direct; a forwarded uplink/claim preserves the *original*
+ * sender's address through every hop, so for those `direct` must reflect
+ * whether this copy has actually traveled zero hops yet (h->hops ==
+ * MESH_DEFAULT_TTL) -- otherwise `child` may be a deeper descendant reached
+ * through some other child of ours, not a one-hop neighbour.
+ *
+ * On the leaf->relay transition, reset the beacon to the normal rate so the
+ * new child can track us promptly, and fire a liveness aggregate at once (we
+ * now have a subtree to publish). */
+static void mesh_note_relay(uint8_t child, bool direct)
 {
     bool was = mesh_is_relay();
 
     s_relay_last_ms = millis();
-    if (child >= MESH_FIRST_NONROOT_ADDR && child <= MESH_ADDR_MAX) {
+    if (direct && child >= MESH_FIRST_NONROOT_ADDR && child <= MESH_ADDR_MAX) {
         if (s_child_heard_ms[child] == 0) {
             s_child_bm[child]    = (uint16_t)(1u << child); /* at least itself */
             s_child_bm_ms[child] = 0;                       /* no subtree yet  */
+            mesh_child_bm_claim(child, (uint16_t)(1u << child));
             if (was) {
                 /* A new child under an existing relay: publish the updated
                  * subtree promptly, so the root (liveness) and our parent
@@ -1769,12 +1791,29 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
         if (h->hops == (uint8_t)(mesh_get_hops() + 1)) {
             s_child_heard_ms[h->src] = now;
             s_relay_last_ms          = now;
+            /* It is confirmed as OUR direct child right now, so that is who
+             * covers it -- overwrite any stale s_cover[] left over from a
+             * time it routed through a sibling.  A leaf never publishes its
+             * own ADDR_ALIVE to correct that itself (mesh.cpp:1992-2004's
+             * mesh_child_bitmap would never be asked about a leaf), so
+             * without this a long-settled direct child can still be swept
+             * away if that old sibling eventually goes silent. */
+            if (mesh_at_root()) {
+                s_cover[h->src] = h->src;
+            }
         } else {
             s_child_heard_ms[h->src] = 0;
             s_child_bm[h->src]       = 0;
             s_child_bm_ms[h->src]    = 0;
             s_topo_parent[h->src]    = MESH_ADDR_NONE;
             s_topo_age_ms[h->src]    = 0;
+            /* We just stopped covering it, but whoever sits above us still
+             * holds our last (stale, still-including-it) aggregate -- the
+             * mirror of mesh_note_relay's prompt publish on *gaining* a
+             * child. Without this, a downlink to the departed address can
+             * get steered down our now-wrong branch for up to a full
+             * MESH_ALIVE_INTERVAL_MS before our next aggregate corrects it. */
+            s_alive_next_ms = 0;
         }
     }
 
@@ -1962,7 +2001,10 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
     if (h->dst != mesh_get_address()) {
         return;                         /* not addressed to us */
     }
-    mesh_note_relay(h->src);            /* a child routed through us */
+    /* Direct only if this copy has traveled zero hops yet -- otherwise
+     * h->src is the frame's original sender, possibly a deeper descendant
+     * reached through one of our other children, not a one-hop neighbour. */
+    mesh_note_relay(h->src, h->hops == MESH_DEFAULT_TTL);
     if (h->hops <= 1 || s_route.parent_addr == MESH_ADDR_NONE) {
         return;                         /* TTL exhausted / no route */
     }
@@ -2325,7 +2367,9 @@ static void mesh_forward_rootward(const mesh_header_t *h,
     uint8_t frame[MESH_MAX_FRAME];
     uint8_t flen;
 
-    mesh_note_relay(h->src);            /* a child routed through us */
+    /* Direct only if this copy has traveled zero hops yet -- see the same
+     * guard in mesh_rx_data_uplink. */
+    mesh_note_relay(h->src, h->hops == MESH_DEFAULT_TTL);
     if (h->hops <= 1) {
         return;                         /* TTL exhausted */
     }
@@ -2593,9 +2637,13 @@ static void mesh_rx_alive(const mesh_header_t *h, const uint8_t *payload, uint8_
         return;
     }
     if (c >= MESH_FIRST_NONROOT_ADDR && c <= MESH_ADDR_MAX) {
-        mesh_note_relay(c);             /* refresh child + our relay status */
+        mesh_note_relay(c, true);       /* refresh child + our relay status;
+                                          * single-hop aggregate, always direct */
         s_child_bm[c]    = bm;          /* adopt the richer subtree bitmap  */
         s_child_bm_ms[c] = millis();
+        /* Every address c just vouched for is now exclusively covered by
+         * c -- drop it from any other child's bitmap immediately. */
+        mesh_child_bm_claim(c, bm);
     }
 }
 
