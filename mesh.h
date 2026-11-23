@@ -124,6 +124,15 @@ bool    mesh_config_save(void);
  * the only signal that another node has selected it as its parent. */
 #define MESH_BEACON_LEAF_MULT   3       /* leaf beacon interval multiplier     */
 #define MESH_RELAY_HOLD_MS      400000  /* "recently forwarded for a child"    */
+/* How long a directly-proven path (data traffic's own last_hop, or a
+ * child's own single-hop ADDR_ALIVE) outweighs that same aggregate's
+ * reported bits about someone else's subtree, which would otherwise
+ * reassign the same address.  Sized for a worst-case
+ * MESH_DEFAULT_TTL-hop round trip with the per-hop MESH_LINK_RETRIES retry
+ * -- generous headroom, not a derived bound; revisit if it ever proves too
+ * short (a real downlink ack still misses its path) or too long (it visibly
+ * delays a genuine re-parent settling in). */
+#define MESH_DIRECT_CLAIM_HOLD_MS 15000
 #define MESH_NEIGHBOR_MAX       8       /* tracked neighbours per node        */
 #define MESH_DEFAULT_TTL        4       /* uplink hop limit (max 4)           */
 #define MESH_PARENT_HYSTERESIS  1       /* cost margin required to switch     */

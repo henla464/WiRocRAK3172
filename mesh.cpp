@@ -227,6 +227,16 @@ static uint32_t s_heard_ms[MESH_ADDR_MAX + 1]; /* root: last frame per addr  */
 static uint16_t s_child_bm[MESH_ADDR_MAX + 1];       /* last subtree bitmap      */
 static uint32_t s_child_bm_ms[MESH_ADDR_MAX + 1];    /* when that bitmap arrived */
 static uint32_t s_child_heard_ms[MESH_ADDR_MAX + 1]; /* last heard as our child  */
+/* Per-address, set only by direct proof -- data traffic actually observed
+ * via last_hop, or a child's own single-hop ADDR_ALIVE, both via
+ * mesh_note_relay(direct=true) -- never by an ADDR_ALIVE aggregate's
+ * *reported* bits, which are only ever a periodic snapshot of a child's own
+ * possibly-stale belief.  Protects a just-proven path for
+ * MESH_DIRECT_CLAIM_HOLD_MS so a stale aggregate arriving moments later
+ * cannot reassign it before an in-flight ack has had a chance to retrace
+ * it back to the sender. */
+static uint8_t  s_direct_owner[MESH_ADDR_MAX + 1];
+static uint32_t s_direct_claim_ms[MESH_ADDR_MAX + 1];
 /* Root only (Step 3): the direct child whose liveness aggregate last covered
  * each address (0 = none).  A dead direct child takes its whole covered set with
  * it -- subtree-scoped eviction. */
@@ -393,6 +403,8 @@ static void mesh_state_clear(void)
     memset(s_child_bm, 0, sizeof(s_child_bm));
     memset(s_child_bm_ms, 0, sizeof(s_child_bm_ms));
     memset(s_child_heard_ms, 0, sizeof(s_child_heard_ms));
+    memset(s_direct_owner, 0, sizeof(s_direct_owner));
+    memset(s_direct_claim_ms, 0, sizeof(s_direct_claim_ms));
     memset(s_cover, 0, sizeof(s_cover));
     memset(s_topo_parent, 0, sizeof(s_topo_parent));
     memset(s_topo_age_ms, 0, sizeof(s_topo_age_ms));
@@ -668,8 +680,9 @@ static void mesh_timer_cb(void *)
             for (uint8_t a = MESH_FIRST_NONROOT_ADDR; a <= MESH_ADDR_MAX; a++) {
                 if (s_cover[a] == c) {
                     mesh_alloc_free(a);
-                    s_cover[a]    = MESH_ADDR_NONE;
-                    s_heard_ms[a] = now;    /* neutral until re-allocated */
+                    s_cover[a]        = MESH_ADDR_NONE;
+                    s_direct_owner[a] = MESH_ADDR_NONE; /* no claim to protect once freed */
+                    s_heard_ms[a]     = now;    /* neutral until re-allocated */
                 }
             }
             s_child_heard_ms[c] = 0;
@@ -682,8 +695,9 @@ static void mesh_timer_cb(void *)
             if (mesh_alloc_occupies(a) &&
                 (uint32_t)(now - s_heard_ms[a]) > MESH_EVICT_MS) {
                 mesh_alloc_free(a);
-                s_cover[a]    = MESH_ADDR_NONE;
-                s_heard_ms[a] = now;        /* neutral until re-allocated */
+                s_cover[a]        = MESH_ADDR_NONE;
+                s_direct_owner[a] = MESH_ADDR_NONE; /* no claim to protect once freed */
+                s_heard_ms[a]     = now;        /* neutral until re-allocated */
             }
         }
         /* Flood the occupied bitmap when the table actually changed (an address
@@ -899,18 +913,82 @@ static bool mesh_is_relay(void)
     return (uint32_t)(millis() - s_relay_last_ms) < MESH_RELAY_HOLD_MS;
 }
 
+/* Which of `bits` are currently protected under some owner other than
+ * `owner` -- proven directly via mesh_note_relay(direct=true) (data
+ * traffic's own last_hop, or a child's single-hop ADDR_ALIVE) within the
+ * last MESH_DIRECT_CLAIM_HOLD_MS, and therefore not up for grabs by a
+ * merely periodic ADDR_ALIVE snapshot's reported bits. */
+static uint16_t mesh_bm_protected_elsewhere(uint8_t owner, uint16_t bits)
+{
+    uint32_t now = millis();
+    uint16_t protected_mask = 0;
+
+    for (uint8_t a = MESH_FIRST_NONROOT_ADDR; a <= MESH_ADDR_MAX; a++) {
+        uint16_t bit = (uint16_t)(1u << a);
+
+        if ((bits & bit) && s_direct_owner[a] != MESH_ADDR_NONE &&
+            s_direct_owner[a] != owner &&
+            (uint32_t)(now - s_direct_claim_ms[a]) < MESH_DIRECT_CLAIM_HOLD_MS) {
+            protected_mask |= bit;
+        }
+    }
+    return protected_mask;
+}
+
 /* A bit just confirmed under `owner` cannot still be valid under any other
  * child's bitmap -- clear it everywhere else immediately, rather than
  * waiting for that other child's own next (rebuilt-from-scratch) report to
  * quietly drop it.  Keeps at most one child claiming any given address at
- * a time. */
-static void mesh_child_bm_claim(uint8_t owner, uint16_t bits)
+ * a time.
+ *
+ * `authoritative` distinguishes direct proof (data traffic's own last_hop,
+ * or a child's own single-hop ADDR_ALIVE) from that *same* ADDR_ALIVE's
+ * *reported* bits about its subtree, which are only a snapshot of a child's
+ * own possibly-stale belief.  A non-authoritative claim never overrides a still-fresh
+ * authoritative one for the same address -- otherwise a stale aggregate
+ * landing moments after we just proved the real path from live traffic
+ * could reassign it before an in-flight ack has a chance to retrace that
+ * same path back to the sender. An authoritative claim always wins and
+ * resets the protection window. */
+static void mesh_child_bm_claim(uint8_t owner, uint16_t bits, bool authoritative)
 {
+    uint16_t effective = authoritative ? bits
+                        : (uint16_t)(bits & ~mesh_bm_protected_elsewhere(owner, bits));
+
     for (uint8_t c = MESH_FIRST_NONROOT_ADDR; c <= MESH_ADDR_MAX; c++) {
         if (c != owner) {
-            s_child_bm[c] = (uint16_t)(s_child_bm[c] & ~bits);
+            s_child_bm[c] = (uint16_t)(s_child_bm[c] & ~effective);
         }
     }
+    if (authoritative) {
+        uint32_t now = millis();
+        for (uint8_t a = MESH_FIRST_NONROOT_ADDR; a <= MESH_ADDR_MAX; a++) {
+            if (bits & (uint16_t)(1u << a)) {
+                s_direct_owner[a]    = owner;
+                s_direct_claim_ms[a] = now;
+            }
+        }
+    }
+}
+
+/* Root: directly assert that `owner` covers `addr` -- used by every
+ * authoritative source (a beacon depth-match confirming a direct child, or
+ * an uplink/claim/topology report's last_hop).  Shares the same protection
+ * record as mesh_child_bm_claim, so a periodic ADDR_ALIVE snapshot cannot
+ * immediately override this with a staler belief about the same address;
+ * see mesh_rx_alive's use of mesh_bm_protected_elsewhere for the other
+ * side of that guard. A node is never both applying this and
+ * mesh_child_bm_claim's protection at once -- root and non-root branches
+ * are mutually exclusive -- so sharing s_direct_owner/s_direct_claim_ms
+ * between the two is safe. */
+static void mesh_cover_claim(uint8_t addr, uint8_t owner)
+{
+    if (addr < MESH_FIRST_NONROOT_ADDR || addr > MESH_ADDR_MAX) {
+        return;
+    }
+    s_cover[addr]        = owner;
+    s_direct_owner[addr] = owner;
+    s_direct_claim_ms[addr] = millis();
 }
 
 /* Record that a child just routed through us: refresh its liveness entry and
@@ -935,7 +1013,7 @@ static void mesh_note_relay(uint8_t child, bool direct)
         if (s_child_heard_ms[child] == 0) {
             s_child_bm[child]    = (uint16_t)(1u << child); /* at least itself */
             s_child_bm_ms[child] = 0;                       /* no subtree yet  */
-            mesh_child_bm_claim(child, (uint16_t)(1u << child));
+            mesh_child_bm_claim(child, (uint16_t)(1u << child), true);
             if (was) {
                 /* A new child under an existing relay: publish the updated
                  * subtree promptly, so the root (liveness) and our parent
@@ -1218,8 +1296,8 @@ static uint8_t mesh_build_frame(uint8_t *out, uint8_t type,
 {
     mesh_header_t h;
 
-    h.version = MESH_WIRE_VERSION;
-    h.type    = type;
+    h.last_hop = mesh_get_address();
+    h.type     = type;
     h.src     = src;
     h.dst     = dst;
     h.hops    = hops;
@@ -1799,7 +1877,7 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
              * without this a long-settled direct child can still be swept
              * away if that old sibling eventually goes silent. */
             if (mesh_at_root()) {
-                s_cover[h->src] = h->src;
+                mesh_cover_claim(h->src, h->src);
             }
         } else {
             s_child_heard_ms[h->src] = 0;
@@ -1970,6 +2048,13 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
         return;                         /* never forward / ack: an observer is silent */
     }
     if (mesh_is_root()) {
+        /* last_hop is whichever of our own direct children actually handed
+         * us this frame -- always trustworthy, regardless of how many hops
+         * h->src (the frame's logical origin) is really from us.  Learn it
+         * immediately from ordinary data traffic, rather than relying
+         * solely on that branch's own ADDR_ALIVE aggregate (periodic, or
+         * prompted only on that branch gaining a new child). */
+        mesh_cover_claim(h->src, h->last_hop);
         /* Module-sent application ACK, mirroring the plain-P2P auto-ACK: the
          * same 0x85 + hash x3 frame, so the host skips its own AckData when
          * bit 0x80 is set on the delivered message.  mesh_send_downlink only
@@ -2001,10 +2086,19 @@ static void mesh_rx_data_uplink(const mesh_header_t *h, const uint8_t *payload, 
     if (h->dst != mesh_get_address()) {
         return;                         /* not addressed to us */
     }
-    /* Direct only if this copy has traveled zero hops yet -- otherwise
-     * h->src is the frame's original sender, possibly a deeper descendant
-     * reached through one of our other children, not a one-hop neighbour. */
-    mesh_note_relay(h->src, h->hops == MESH_DEFAULT_TTL);
+    /* last_hop is always our true one-hop neighbour here (whoever actually
+     * transmitted this copy to us), unlike h->src which stays the frame's
+     * logical origin through every relay. */
+    mesh_note_relay(h->last_hop, true);
+    if (h->last_hop != h->src &&
+        h->src >= MESH_FIRST_NONROOT_ADDR && h->src <= MESH_ADDR_MAX) {
+        /* This frame also proves h->src is currently reachable via
+         * last_hop -- learn that immediately from ordinary data traffic,
+         * instead of waiting for last_hop's own next ADDR_ALIVE aggregate. */
+        s_child_bm[h->last_hop]   |= (uint16_t)(1u << h->src);
+        s_child_bm_ms[h->last_hop] = millis();
+        mesh_child_bm_claim(h->last_hop, (uint16_t)(1u << h->src), true);
+    }
     if (h->hops <= 1 || s_route.parent_addr == MESH_ADDR_NONE) {
         return;                         /* TTL exhausted / no route */
     }
@@ -2184,6 +2278,9 @@ static void mesh_root_apply_claim(const mesh_header_t *h, const uint8_t *payload
     if (want < MESH_FIRST_NONROOT_ADDR || want > MESH_ADDR_MAX) {
         return;
     }
+    /* last_hop is whichever of our own direct children actually handed us
+     * this claim -- same reasoning as mesh_rx_data_uplink's root branch. */
+    mesh_cover_claim(want, h->last_hop);
     /* A claim also reports the node's parent (the topology map's tree edge). */
     if (plen >= MESH_NODE_DEVICE_ID_LEN + 1) {
         mesh_topo_note_parent(want, payload[MESH_NODE_DEVICE_ID_LEN]);
@@ -2367,9 +2464,18 @@ static void mesh_forward_rootward(const mesh_header_t *h,
     uint8_t frame[MESH_MAX_FRAME];
     uint8_t flen;
 
-    /* Direct only if this copy has traveled zero hops yet -- see the same
-     * guard in mesh_rx_data_uplink. */
-    mesh_note_relay(h->src, h->hops == MESH_DEFAULT_TTL);
+    /* last_hop is always our true one-hop neighbour here, the same as in
+     * mesh_rx_data_uplink -- h->src stays the frame's logical origin
+     * through every relay, but last_hop is set fresh at each one. */
+    mesh_note_relay(h->last_hop, true);
+    if (h->last_hop != h->src &&
+        h->src >= MESH_FIRST_NONROOT_ADDR && h->src <= MESH_ADDR_MAX) {
+        /* This claim/topology report also proves h->src is currently
+         * reachable via last_hop -- same reasoning as the uplink case. */
+        s_child_bm[h->last_hop]   |= (uint16_t)(1u << h->src);
+        s_child_bm_ms[h->last_hop] = millis();
+        mesh_child_bm_claim(h->last_hop, (uint16_t)(1u << h->src), true);
+    }
     if (h->hops <= 1) {
         return;                         /* TTL exhausted */
     }
@@ -2498,6 +2604,9 @@ static void mesh_rx_topology(const mesh_header_t *h, const uint8_t *payload, uin
     if (h->dst == MESH_ADDR_NONE) {
         if (mesh_at_root()) {
             mesh_apply_topology(h->src, payload, plen);
+            /* last_hop is whichever of our own direct children actually
+             * handed us this report -- same reasoning as mesh_root_apply_claim. */
+            mesh_cover_claim(h->src, h->last_hop);
         }
         mesh_relay_flood(h, payload, plen);
         return;
@@ -2508,6 +2617,7 @@ static void mesh_rx_topology(const mesh_header_t *h, const uint8_t *payload, uin
     /* We are a hop on the reporter's rootward path: absorb its row. */
     mesh_apply_topology(h->src, payload, plen);
     if (mesh_at_root()) {
+        mesh_cover_claim(h->src, h->last_hop);
         return;                         /* the root does not forward; a standby is silent */
     }
     mesh_forward_rootward(h, payload, plen);
@@ -2624,14 +2734,25 @@ static void mesh_rx_alive(const mesh_header_t *h, const uint8_t *payload, uint8_
 
     if (mesh_at_root()) {
         uint32_t now = millis();
+        uint16_t protected_mask;
+
         if (c < MESH_FIRST_NONROOT_ADDR || c > MESH_ADDR_MAX) {
             return;
         }
         s_child_heard_ms[c] = now;      /* c is a known direct child */
+        /* A periodic snapshot's own reported bits never get to override a
+         * still-fresh, directly-proven cover claim for the same address --
+         * see mesh_cover_claim / mesh_bm_protected_elsewhere. */
+        protected_mask = mesh_bm_protected_elsewhere(c, bm);
         for (uint8_t a = MESH_FIRST_NONROOT_ADDR; a <= MESH_ADDR_MAX; a++) {
-            if (bm & (uint16_t)(1u << a)) {
-                s_heard_ms[a] = now;
-                s_cover[a]    = c;      /* a is covered by branch c */
+            uint16_t bit = (uint16_t)(1u << a);
+
+            if (!(bm & bit)) {
+                continue;
+            }
+            s_heard_ms[a] = now;         /* alive regardless of which branch */
+            if (!(protected_mask & bit)) {
+                s_cover[a] = c;          /* a is covered by branch c */
             }
         }
         return;
@@ -2639,11 +2760,14 @@ static void mesh_rx_alive(const mesh_header_t *h, const uint8_t *payload, uint8_
     if (c >= MESH_FIRST_NONROOT_ADDR && c <= MESH_ADDR_MAX) {
         mesh_note_relay(c, true);       /* refresh child + our relay status;
                                           * single-hop aggregate, always direct */
-        s_child_bm[c]    = bm;          /* adopt the richer subtree bitmap  */
+        /* Adopt the richer subtree bitmap -- except any bit a fresher,
+         * directly-proven claim elsewhere still protects; a periodic
+         * snapshot does not get to re-litigate that. */
+        s_child_bm[c]    = (uint16_t)(bm & ~mesh_bm_protected_elsewhere(c, bm));
         s_child_bm_ms[c] = millis();
-        /* Every address c just vouched for is now exclusively covered by
-         * c -- drop it from any other child's bitmap immediately. */
-        mesh_child_bm_claim(c, bm);
+        /* Every other address c just vouched for is now exclusively
+         * covered by c -- drop it from any other child's bitmap immediately. */
+        mesh_child_bm_claim(c, bm, false);
     }
 }
 
@@ -2822,9 +2946,6 @@ void mesh_handle_rx(const uint8_t *buf, uint16_t len, int16_t rssi, int8_t snr)
         return;
     }
     mesh_wire_decode(buf, &h);
-    if (h.version != MESH_WIRE_VERSION) {
-        return;
-    }
     if (h.type >= MESH_TYPE_COUNT) {
         return;
     }

@@ -6,18 +6,23 @@
  *
  *  Fixed header: 3 bytes (24 bits), written MSB-first.
  *
- *   bits  field    meaning
- *   ----  -------  --------------------------------------------------
- *     4   type     MESH_TYPE_* (see below)
- *     4   version  protocol version
- *     4   src      source 4-bit address
- *     4   dst      destination 4-bit address
- *     3   hops     beacon: hop-count to root; data: TTL
- *     5   seq      dedup key (src,seq)
+ *   bits  field      meaning
+ *   ----  ---------  --------------------------------------------------
+ *     4   type       MESH_TYPE_* (see below)
+ *     4   last_hop   whoever physically transmitted THIS copy -- always
+ *                     the sender's own address, set fresh at every hop,
+ *                     unlike `src` (the frame's logical origin, preserved
+ *                     unchanged through every relay). Lets a relay learn
+ *                     its true one-hop neighbour regardless of how many
+ *                     hops `src` is actually from it.
+ *     4   src        source 4-bit address (logical origin, see above)
+ *     4   dst        destination 4-bit address
+ *     3   hops       beacon: hop-count to root; data: TTL
+ *     5   seq        dedup key (src,seq)
  *
- *   byte0 = type<<4 | version
- *   byte1 = src<<4  | dst
- *   byte2 = hops<<5 | seq
+ *   byte0 = type<<4     | last_hop
+ *   byte1 = src<<4      | dst
+ *   byte2 = hops<<5     | seq
  */
 
 #ifndef INC_MESH_WIRE_H_
@@ -26,7 +31,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define MESH_WIRE_VERSION   1
 #define MESH_HEADER_SIZE    3
 
 /* Message type (4 bits). Includes the count so it doubles as "invalid" bound. */
@@ -48,7 +52,7 @@ typedef enum {
 
 typedef struct {
     uint8_t type;       /* 4 bits */
-    uint8_t version;    /* 4 bits */
+    uint8_t last_hop;   /* 4 bits -- direct sender of this copy, see above */
     uint8_t src;        /* 4 bits */
     uint8_t dst;        /* 4 bits */
     uint8_t hops;       /* 3 bits */
