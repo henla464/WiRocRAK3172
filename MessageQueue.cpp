@@ -11,6 +11,20 @@
 
 struct MessageQueue incomingMessageQueue = { .MessageQueue_front = -1, .MessageQueue_rear = -1 };
 struct LoraMessage lastMessage;
+static volatile bool s_topoDirty = false;
+
+/* LORA_IRQ is shared: HIGH while a host message is queued OR a topology
+ * change is unread, LOW only once both are clear. */
+static void MessageQueue_updateIrq(struct MessageQueue * queue)
+{
+	digitalWrite(LORA_IRQ, (!MessageQueue_isEmpty(queue) || s_topoDirty) ? HIGH : LOW);
+}
+
+void MessageQueue_setTopoDirty(bool dirty)
+{
+	s_topoDirty = dirty;
+	MessageQueue_updateIrq(&incomingMessageQueue);
+}
 // Check if the queue is full
 uint8_t MessageQueue_getNoOfItems(struct MessageQueue * queue)
 {
@@ -87,7 +101,7 @@ uint8_t MessageQueue_enQueue(struct MessageQueue * queue, LoraMeessage_t * msg)
 		queue->MessageQueue_rear = (queue->MessageQueue_rear + 1) % MESSAGEQUEUE_SIZE;
 		queue->MessageQueue_items[queue->MessageQueue_rear] = *msg;
 		lastMessage = *msg;
-		digitalWrite(LORA_IRQ, HIGH);
+		MessageQueue_updateIrq(queue);
 		return ENQUEUESUCCESS;
 	}
 }
@@ -104,7 +118,7 @@ bool MessageQueue_deQueue(struct MessageQueue * queue, LoraMeessage_t * msg)
 		if (queue->MessageQueue_front == queue->MessageQueue_rear) {
 			queue->MessageQueue_front = -1;
 			queue->MessageQueue_rear = -1;
-			digitalWrite(LORA_IRQ, LOW);
+			MessageQueue_updateIrq(queue);
 		}
 		else
 		{
@@ -138,7 +152,7 @@ bool MessageQueue_pop(struct MessageQueue * queue)
 		if (queue->MessageQueue_front == queue->MessageQueue_rear) {
 			queue->MessageQueue_front = -1;
 			queue->MessageQueue_rear = -1;
-			digitalWrite(LORA_IRQ, LOW);
+			MessageQueue_updateIrq(queue);
 		}
 		else
 		{

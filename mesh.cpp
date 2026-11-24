@@ -307,6 +307,7 @@ static void mesh_reclaim_backoff(void);
 static void mesh_send_alive(void);
 static void mesh_send_topology(void);
 static void mesh_monitor_tick(uint32_t now);
+static void mesh_topo_notify_host(void);
 
 /* Defined in the M7 section below; used by the timer. */
 static void mesh_standby_tick(uint32_t now);
@@ -1096,6 +1097,7 @@ void mesh_set_enabled(bool enabled)
     } else if (!enabled && was) {
         mesh_timer_stop();
         mesh_state_clear();
+        MessageQueue_setTopoDirty(false); /* nothing left to notify the host about */
     }
 }
 
@@ -1884,12 +1886,36 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
             if (mesh_at_root()) {
                 mesh_cover_claim(h->src, h->src);
             }
+            /* Same reasoning for the topology map's own tree edge: its
+             * parent is confirmed as US right now, so re-assert that too --
+             * otherwise only a fresh claim/topology report (event-driven
+             * once, then a 5-minute backstop, with no retry of either) can
+             * ever repair a row the else-branch below just wiped, even
+             * though the live beacon link was never actually the problem. */
+            if (s_topo_parent[h->src] != mesh_get_address()) {
+                mesh_topo_notify_host();
+            }
+            s_topo_parent[h->src] = mesh_get_address();
+            s_topo_age_ms[h->src] = now;
         } else {
             s_child_heard_ms[h->src] = 0;
             s_child_bm[h->src]       = 0;
             s_child_bm_ms[h->src]    = 0;
+            if (s_topo_parent[h->src] != MESH_ADDR_NONE) {
+                mesh_topo_notify_host();
+            }
             s_topo_parent[h->src]    = MESH_ADDR_NONE;
             s_topo_age_ms[h->src]    = 0;
+            /* Mirror of the mesh_cover_claim self-assertion above: we are no
+             * longer covering it ourselves, so release that claim too --
+             * otherwise it is a stale self-reference the eviction sweep can
+             * never reach (it only revisits a *tracked* child's covered
+             * set, and s_child_heard_ms[h->src] was just zeroed above, so
+             * h->src drops out of that sweep's own candidate list). */
+            if (mesh_at_root()) {
+                s_cover[h->src]        = MESH_ADDR_NONE;
+                s_direct_owner[h->src] = MESH_ADDR_NONE;
+            }
             /* We just stopped covering it, but whoever sits above us still
              * holds our last (stale, still-including-it) aggregate -- the
              * mirror of mesh_note_relay's prompt publish on *gaining* a
@@ -2255,6 +2281,18 @@ static void mesh_rx_data_downlink(const mesh_header_t *h, const uint8_t *payload
 /*  M5: recovery / robustness                                             */
 /* ======================================================================= */
 
+/* Raise the host topology-changed IRQ -- but only while mesh is actually
+ * enabled.  mesh_handle_rx() has no mesh_is_enabled() gate of its own (so a
+ * frame already in flight when the host disables mesh can still land and
+ * mutate s_topo_parent[]/s_topo_link[]), and a disabled node's host has no
+ * reason to be woken for a map it did not ask to keep using. */
+static void mesh_topo_notify_host(void)
+{
+    if (mesh_is_enabled()) {
+        MessageQueue_setTopoDirty(true);
+    }
+}
+
 /* Record one node's reported parent (the tree edge).  Shared by the root (a
  * claim it absorbs) and by any relay on a claim's rootward path, so every node
  * learns its descendants' tree edges, not just the root. */
@@ -2266,6 +2304,9 @@ static void mesh_topo_note_parent(uint8_t addr, uint8_t parent)
     parent = (uint8_t)(parent & MESH_ADDR_MASK);
     if (parent == addr) {
         parent = MESH_ADDR_NONE;        /* a node is never its own parent */
+    }
+    if (s_topo_parent[addr] != parent) {
+        mesh_topo_notify_host();
     }
     s_topo_parent[addr] = parent;
     s_topo_age_ms[addr] = millis();
@@ -2565,12 +2606,14 @@ static void mesh_rx_addr_claim(const mesh_header_t *h, const uint8_t *payload, u
  * report) and each relay ancestor (which sees its own descendants). */
 static void mesh_apply_topology(uint8_t src, const uint8_t *payload, uint8_t plen)
 {
-    uint8_t n;
+    uint8_t  n;
+    uint16_t old_link;
 
     if (src < MESH_FIRST_NONROOT_ADDR || src > MESH_ADDR_MAX || plen < 1) {
         return;
     }
     mesh_topo_note_parent(src, payload[0]);
+    old_link = s_topo_link[src];
     s_topo_link[src] = 0;
     memset(s_topo_cost[src], MESH_TOPO_NO_LINK, sizeof(s_topo_cost[src]));
 
@@ -2592,6 +2635,12 @@ static void mesh_apply_topology(uint8_t src, const uint8_t *payload, uint8_t ple
     if (s_topo_parent[src] >= MESH_FIRST_NONROOT_ADDR &&
         s_topo_parent[src] <= MESH_ADDR_MAX) {
         s_topo_link[src] |= (uint16_t)(1u << s_topo_parent[src]);
+    }
+    /* ponytail: dirty on membership change only, not a same-neighbour cost
+     * drift -- every periodic report nudges cost with SNR, which would
+     * otherwise keep the host IRQ asserted almost continuously. */
+    if (s_topo_link[src] != old_link) {
+        mesh_topo_notify_host();
     }
 }
 

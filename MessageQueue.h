@@ -44,4 +44,10 @@ bool MessageQueue_deQueue(struct MessageQueue * queue, LoraMeessage_t * msg);
 bool MessageQueue_peek(struct MessageQueue * queue, LoraMeessage_t * msg);
 bool MessageQueue_pop(struct MessageQueue * queue);
 
+/* LORA_IRQ also reports "a fresh/changed topology row exists for the host" --
+ * set true by mesh.cpp whenever its served topology map changes, cleared by
+ * the ATC+MESHTOPO handler once the host has read it.  The pin stays HIGH
+ * while either this or the message queue is non-empty. */
+void MessageQueue_setTopoDirty(bool dirty);
+
 #endif /* INC_MessageQueue_H_ */

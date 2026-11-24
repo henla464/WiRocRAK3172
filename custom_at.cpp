@@ -448,6 +448,12 @@ int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param)
  *        knows no rows prints the empty reply 'ATC+MESHTOPO='.  A row ages out
  *        after MESH_TOPO_HOLD_MS; the reports are best-effort, refreshed
  *        event-driven and by a slow backstop.
+ *
+ *        LORA_IRQ also goes HIGH when a tree-edge or link-membership change
+ *        lands in this map (not on every report -- same-neighbour cost
+ *        drift alone does not assert it), so the host can wait for the pin
+ *        instead of polling.  Reading this command clears that condition
+ *        (though the pin stays HIGH if a host message is still queued too).
  */
 int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
@@ -473,6 +479,7 @@ int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param)
 			}
 		}
 		atcmd_printf("\r\n");
+		MessageQueue_setTopoDirty(false); /* host has the latest map now */
 		return AT_NO_STATUS;
 	}
 	return AT_PARAM_ERROR;
