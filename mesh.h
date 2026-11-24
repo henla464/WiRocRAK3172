@@ -123,6 +123,13 @@ bool    mesh_config_save(void);
  * addressed to it, a liveness aggregate, or a known child's beacon), which is
  * the only signal that another node has selected it as its parent. */
 #define MESH_BEACON_LEAF_MULT   3       /* leaf beacon interval multiplier     */
+/* The real worst-case gap between two beacons from ANY neighbour -- a leaf's,
+ * not just a relay's.  Observed-gap tracking and the staleness bound both
+ * need this, not MESH_BEACON_MAX_MS alone: capping either at the relay-only
+ * ceiling makes a leaf's own, perfectly on-time (and then jittered) beacon
+ * indistinguishable from a real loss, since its true period already runs up
+ * to this multiple of that ceiling. */
+#define MESH_BEACON_LEAF_MAX_MS (MESH_BEACON_MAX_MS * MESH_BEACON_LEAF_MULT)
 #define MESH_RELAY_HOLD_MS      400000  /* "recently forwarded for a child"    */
 /* How long a directly-proven path (data traffic's own last_hop, or a
  * child's own single-hop ADDR_ALIVE) outweighs that same aggregate's

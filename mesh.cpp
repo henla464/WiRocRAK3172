@@ -1720,7 +1720,12 @@ static void mesh_check_parent_staleness(uint32_t now)
      * it could trip before the very next beacon was even due. Projecting the
      * next two gaps (capped at the backoff ceiling, same as the sender's own
      * cap) tracks what two actual misses look like at any point in that
-     * ramp, not just once it is fully backed off. */
+     * ramp, not just once it is fully backed off.  That ceiling is the LEAF
+     * one, not the relay one: we cannot tell a leaf neighbour from a relay
+     * neighbour in advance, and a leaf's own interval legitimately runs up
+     * to MESH_BEACON_LEAF_MAX_MS -- capping at the relay ceiling instead
+     * would make a leaf's perfectly on-time beacon indistinguishable from a
+     * real loss. */
     for (i = 0; i < MESH_NEIGHBOR_MAX; i++) {
         mesh_route_neighbor_t *n = &s_neigh[i];
         uint32_t next1, next2, stale;
@@ -1728,13 +1733,13 @@ static void mesh_check_parent_staleness(uint32_t now)
         if (n->addr == MESH_ADDR_NONE) {
             continue;
         }
-        next1 = (n->ivl_ms != 0) ? n->ivl_ms * 2 : MESH_BEACON_MAX_MS;
-        if (next1 > MESH_BEACON_MAX_MS) {
-            next1 = MESH_BEACON_MAX_MS;
+        next1 = (n->ivl_ms != 0) ? n->ivl_ms * 2 : MESH_BEACON_LEAF_MAX_MS;
+        if (next1 > MESH_BEACON_LEAF_MAX_MS) {
+            next1 = MESH_BEACON_LEAF_MAX_MS;
         }
         next2 = next1 * 2;
-        if (next2 > MESH_BEACON_MAX_MS) {
-            next2 = MESH_BEACON_MAX_MS;
+        if (next2 > MESH_BEACON_LEAF_MAX_MS) {
+            next2 = MESH_BEACON_LEAF_MAX_MS;
         }
         /* Each gap is itself jittered up to MESH_BEACON_JITTER_PCT by the
          * sender (mesh_emit_beacon's scheduling), so a beacon that is not
@@ -1848,8 +1853,8 @@ static void mesh_rx_beacon(const mesh_header_t *h, const uint8_t *payload, uint8
     if (n->last_ms != 0) {
         uint32_t delta = now - n->last_ms;
 
-        if (delta > MESH_BEACON_MAX_MS) {
-            delta = MESH_BEACON_MAX_MS;
+        if (delta > MESH_BEACON_LEAF_MAX_MS) {
+            delta = MESH_BEACON_LEAF_MAX_MS;
         }
         /* Jump straight to a slower spacing, decay slowly: a burst right after
          * a topology change must not shrink the silence we allow this peer. */
