@@ -103,6 +103,20 @@ int main(void)
     mesh_route_select(n, NEIGH_MAX, &cur, 9, MESH_PARENT_HYSTERESIS, &out);
     CHECK(out.parent_addr == 3);            /* kept: no strict improvement */
 
+    /* --- hysteresis keeps the parent but must still refresh its live cost,
+     * not freeze self_cost at whatever it was the last time this parent was
+     * actually (re)selected: a stale struct copy here previously let an
+     * improving or worsening link go unreported indefinitely. */
+    std::memset(n, 0, sizeof(n));
+    put(n, 0, 3, -50, 0, 1);  /* same parent, link now poor: 3 + 0 = 3 */
+    cur.parent_addr = 3;
+    cur.self_cost   = 1;      /* stale: was cost 1 when last (re)selected */
+    cur.self_hops   = 2;
+    mesh_route_select(n, NEIGH_MAX, &cur, 9, MESH_PARENT_HYSTERESIS, &out);
+    CHECK(out.parent_addr == 3);
+    CHECK(out.self_cost == 3);              /* refreshed, not frozen at 1 */
+    CHECK(out.self_hops == 2);
+
     /* --- a strictly better path (by >= margin) does move the parent ----- */
     std::memset(n, 0, sizeof(n));
     put(n, 0, 3, 80, 3, 2);    /* 1 + 3 = 4 (current) */

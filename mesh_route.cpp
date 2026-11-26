@@ -55,6 +55,7 @@ void mesh_route_select(const mesh_route_neighbor_t *n, uint8_t count,
                        uint8_t hysteresis, mesh_route_t *out)
 {
     const mesh_route_neighbor_t *best = NULL;
+    const mesh_route_neighbor_t *cur_n = NULL;
     uint8_t best_total = 0xFF;
     uint8_t cur_total = 0xFF;
     uint8_t i;
@@ -92,15 +93,23 @@ void mesh_route_select(const mesh_route_neighbor_t *n, uint8_t count,
                  * hysteresis below cannot keep us attached to it. */
                 if (mesh_parent_eligible(&n[i], self_addr)) {
                     cur_total = (uint8_t)(n[i].link_cost + n[i].cost);
+                    cur_n     = &n[i];
                 }
                 break;
             }
         }
     }
-    /* Keep the current parent unless the new best beats it by the margin. */
+    /* Keep the current parent unless the new best beats it by the margin --
+     * but still refresh cost/hops from the live neighbour entry. Copying
+     * *cur* verbatim would freeze self_cost at whatever it was the last time
+     * a parent was actually (re)selected, never tracking real SNR swings on
+     * an otherwise-stable link. */
     if (cur->parent_addr != MESH_ADDR_NONE && cur_total != 0xFF &&
         (uint8_t)(best_total + hysteresis) > cur_total) {
-        *out = *cur;
+        out->parent_addr = cur_n->addr;
+        out->parent_cost = cur_n->cost;
+        out->self_cost   = cur_total;
+        out->self_hops   = (uint8_t)(cur_n->hops + 1);
         return;
     }
 
