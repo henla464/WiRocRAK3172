@@ -394,14 +394,20 @@ int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param)
  *                               0..100 (100 == no data frames at all)
  *          - <ackms>            derived per-hop ACK timeout (datarate dependent)
  *          - <standby>          1 when this node is a passive standby root (M7)
+ *        ...followed by the usual tx/rx counters, then a trailing
+ *        '<devid>' -- this node's own 6-byte device id as 12 hex chars (the
+ *        same value ATC+MESHNODEDEVICEID reports), so a host that only polls
+ *        MESHSTATE can still self-identify without a second command.
  */
 int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param)
 {
 	if ((param->argc == 1 && !strcmp(param->argv[0], "?")) || param->argc == 0)
 	{
 		mesh_counters_t c;
+		uint8_t device_id[MESH_NODE_DEVICE_ID_LEN];
 		mesh_get_counters(&c);
-		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d", cmd,
+		mesh_get_node_device_id(device_id);
+		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:", cmd,
 					 mesh_is_enabled() ? 1 : 0,
 					 mesh_is_root() ? 1 : 0,
 					 mesh_get_address(),
@@ -424,6 +430,7 @@ int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param)
 					 c.rx_assign,
 					 c.adopt,
 					 (int)c.last_type);
+		p2p_printf_hex(device_id, sizeof(device_id));
 		return AT_NO_STATUS;
 	}
 	return AT_PARAM_ERROR;
