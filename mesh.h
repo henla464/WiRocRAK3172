@@ -155,6 +155,13 @@ bool    mesh_is_attached(void);
 /* Number of addresses currently allocated by the root (diagnostics). */
 uint8_t mesh_root_alloc_count(void);
 
+/* Monotonic counter bumped on every real change to the root's allocation
+ * table (diagnostics, reported by ATC+MESHSTATE). Two polls of MESHSTATE and
+ * MESHTOPO taken moments apart can legitimately disagree on counts if the
+ * table changed between them; a differing version number says that is why,
+ * rather than looking like a bug. */
+uint16_t mesh_root_alloc_version(void);
+
 /* Routing diagnostics. */
 uint8_t mesh_get_parent(void);          /* current parent address (0 = none)  */
 uint8_t mesh_get_hops(void);            /* hop-count to the root            */
@@ -236,14 +243,17 @@ uint32_t mesh_get_link_ack_timeout_ms(void);
 #define MESH_TOPO_HOLD_MS       900000  /* drop a node's map row when this old */
 #define MESH_TOPO_MAX_NEIGH     MESH_NEIGHBOR_MAX
 
-/* One row of the topology map: a node, its reported parent, and the neighbours
- * it reported hearing with their link costs (0 = none). */
+/* One row of the topology map: a node, its reported parent, the neighbours
+ * it reported hearing with their link costs (0 = none), and how long ago
+ * this row was last refreshed (0 for our own row, always live; UINT32_MAX
+ * when the address is merely allocated and has never reported in at all). */
 typedef struct {
-    uint8_t addr;
-    uint8_t parent;
-    uint8_t count;
-    uint8_t neighbor[MESH_TOPO_MAX_NEIGH + 1];  /* +1: parent may not be listed */
-    uint8_t cost[MESH_TOPO_MAX_NEIGH + 1];
+    uint8_t  addr;
+    uint8_t  parent;
+    uint8_t  count;
+    uint8_t  neighbor[MESH_TOPO_MAX_NEIGH + 1];  /* +1: parent may not be listed */
+    uint8_t  cost[MESH_TOPO_MAX_NEIGH + 1];
+    uint32_t age_ms;
 } mesh_topo_row_t;
 
 /* Topology map: number of rows available and the row at `index` (0-based).

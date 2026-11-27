@@ -371,7 +371,7 @@ int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param)
 /**
  * @brief Get mesh state. Usage: ATC+MESHSTATE=?
  *        Returns
- *        '<enabled>:<is root>:<own addr>:<txq>:<state>:<alloc>:<parent addr>:<hops>:<path cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>'
+ *        '<enabled>:<is root>:<own addr>:<txq>:<state>:<alloc>:<alloc ver>:<parent addr>:<hops>:<path cost>:<neighbour-count>:<epoch>:<overhead%>:<ackms>:<standby>'
  *        with fields:
  *          - <enabled>          1 when mesh mode is on
  *          - <is root>        1 on the gateway
@@ -381,6 +381,10 @@ int meshnodedeviceid_handler(SERIAL_PORT port, char *cmd, stParam *param)
  *                               so new frames are dropped)
  *          - <state>            0=unassigned 1=joining 2=joined
  *          - <alloc>            number of addresses the root has allocated
+ *          - <alloc ver>        bumped on every real change to the allocation table --
+ *                               compare across two polls (or against MESHTOPO's own
+ *                               read) to tell a real table change from two snapshots
+ *                               just landing on different sides of one
  *          - <parent addr>      current parent address (0 = none)
  *          - <hops>/<path cost> route to the root
  *          - <neighbour-count>  live neighbour count
@@ -397,13 +401,14 @@ int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param)
 	{
 		mesh_counters_t c;
 		mesh_get_counters(&c);
-		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d", cmd,
+		atcmd_printf("%s=%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d", cmd,
 					 mesh_is_enabled() ? 1 : 0,
 					 mesh_is_root() ? 1 : 0,
 					 mesh_get_address(),
 					 mesh_tx_queue_count(),
 					 (int)mesh_get_state(),
 					 mesh_root_alloc_count(),
+					 mesh_root_alloc_version(),
 					 mesh_get_parent(),
 					 mesh_get_hops(),
 					 mesh_get_path_cost(),
@@ -434,7 +439,7 @@ int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param)
  *        rootward.  The root node, being the root, covers the whole network;
  *        any other node sees only the part of the tree it is on the path for.
  *        Each row is
- *        '<node addr>:<parent addr>:<btaddr>:<neighbour addr>=<link cost>,...'
+ *        '<node addr>:<parent addr>:<btaddr>:<age ms>:<neighbour addr>=<link cost>,...'
  *        with fields:
  *          - <node addr>    the node the row describes (your own address, or a
  *                           descendant's whose report passed through you)
@@ -442,6 +447,10 @@ int meshstate_handler(SERIAL_PORT port, char *cmd, stParam *param)
  *          - <btaddr>       that node's full 6-byte device id as 12 hex chars
  *                           (resolved for its own row by any node and for every row
  *                           by the root; six zero bytes when unknown)
+ *          - <age ms>       how long ago this row was last refreshed by a claim,
+ *                           topology report or beacon depth-match; 0 for your own
+ *                           row (always live); 4294967295 (UINT32_MAX) for an
+ *                           address that is allocated but has never reported in
  *          - trailing list  the neighbours it hears, with their link costs
  *                           (omitted when none)
  *        Successive rows are joined with '|' on one output line; a node that
@@ -471,6 +480,7 @@ int meshtopo_handler(SERIAL_PORT port, char *cmd, stParam *param)
 			mesh_lookup_device_id(row.addr, bt);
 			atcmd_printf("%s%d:%d:", first ? "" : "|", row.addr, row.parent);
 			p2p_printf_hex(bt, sizeof(bt));
+			atcmd_printf(":%lu", (unsigned long)row.age_ms);
 			first = false;
 			for (uint8_t j = 0; j < row.count; j++)
 			{

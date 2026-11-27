@@ -1287,6 +1287,11 @@ uint8_t mesh_root_alloc_count(void)
     return mesh_alloc_count();
 }
 
+uint16_t mesh_root_alloc_version(void)
+{
+    return mesh_alloc_version();
+}
+
 /* ======================================================================= */
 /*  M2: join / address assignment                                         */
 /* ======================================================================= */
@@ -1659,7 +1664,9 @@ bool mesh_topo_row(uint8_t index, mesh_topo_row_t *out)
         memset(out, 0, sizeof(*out));
         out->addr = a;
         if (a == mesh_get_address()) {
-            /* Our own row: live parent and links from the neighbour table. */
+            /* Our own row: live parent and links from the neighbour table,
+             * so it is always current. */
+            out->age_ms = 0;
             out->parent = (a == MESH_ROOT_ADDR) ? MESH_ADDR_NONE
                                                   : mesh_get_parent();
             for (uint8_t i = 0; i < MESH_NEIGHBOR_MAX; i++) {
@@ -1671,6 +1678,9 @@ bool mesh_topo_row(uint8_t index, mesh_topo_row_t *out)
                 out->count++;
             }
         } else {
+            /* Merely-allocated, never-reported address: no age to report. */
+            out->age_ms = (s_topo_age_ms[a] != 0) ? (now - s_topo_age_ms[a])
+                                                   : UINT32_MAX;
             out->parent = s_topo_parent[a];
             for (uint8_t b = MESH_FIRST_NONROOT_ADDR;
                  b <= MESH_ADDR_MAX && out->count <= MESH_TOPO_MAX_NEIGH; b++) {
